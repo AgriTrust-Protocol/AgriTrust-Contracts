@@ -1,176 +1,273 @@
 #![cfg(test)]
 
-use super::*;
+use super::{Error, GrantContract, GrantContractClient, GrantStatus};
+use soroban_sdk::{
+    testutils::{Address as _, AuthorizedFunction, Ledger},
+    Address, Env, InvokeError,
+};
+
+fn set_timestamp(env: &Env, timestamp: u64) {
+    env.ledger().with_mut(|li| {
+        li.timestamp = timestamp;
+    });
+}
+
+fn assert_contract_error<T, C>(
+    result: Result<Result<T, C>, Result<Error, InvokeError>>,
+    expected: Error,
+) {
+    assert!(matches!(result, Err(Ok(err)) if err == expected));
 }
 
 #[test]
-fn test_multiple_milestones() {
+fn test_update_rate_settles_before_changing_rate() {
     let env = Env::default();
     let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
+    let recipient = Address::generate(&env);
 
-    let contract_id = env.register(GrantContract, ());
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant
-    let grant_id = Symbol::new(&env, "grant_multi");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000).unwrap();
+    let grant_id: u64 = 1;
+    let rate_1: i128 = 10;
+    let rate_2: i128 = 25;
 
-    // Add multiple milestones
-    let milestone_1 = Symbol::new(&env, "m1");
-    let milestone_2 = Symbol::new(&env, "m2");
-    let milestone_3 = Symbol::new(&env, "m3");
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &rate_1);
 
-    client.add_milestone(&grant_id, &milestone_1, &250_000, &String::from_str(&env, "Phase 1")).unwrap();
-    client.add_milestone(&grant_id, &milestone_2, &350_000, &String::from_str(&env, "Phase 2")).unwrap();
-    client.add_milestone(&grant_id, &milestone_3, &400_000, &String::from_str(&env, "Phase 3")).unwrap();
+    set_timestamp(&env, 1_100);
+    assert_eq!(client.claimable(&grant_id), 1_000);
 
-    // Approve first milestone
-    client.approve_milestone(&grant_id, &milestone_1).unwrap();
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.3, 250_000);
+    client.mock_all_auths().update_rate(&grant_id, &rate_2);
 
-    // Approve second milestone
-    client.approve_milestone(&grant_id, &milestone_2).unwrap();
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.3, 600_000);
+    let grant_after_update = client.get_grant(&grant_id);
+    assert_eq!(grant_after_update.claimable, 1_000);
+    assert_eq!(grant_after_update.flow_rate, rate_2);
+    assert_eq!(grant_after_update.last_update_ts, 1_100);
+    assert_eq!(grant_after_update.rate_updated_at, 1_100);
 
-    // Approve third milestone
-    client.approve_milestone(&grant_id, &milestone_3).unwrap();
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.3, 1_000_000);
+    set_timestamp(&env, 1_140);
+    assert_eq!(client.claimable(&grant_id), 1_000 + (40 * rate_2));
+
+    client.mock_all_auths().withdraw(&grant_id, &700);
+    assert_eq!(client.claimable(&grant_id), 1_000 + (40 * rate_2) - 700);
+
+    set_timestamp(&env, 1_150);
+    assert_eq!(client.claimable(&grant_id), 1_000 + (50 * rate_2) - 700);
 }
 
 #[test]
-fn test_double_release_prevention() {
+fn test_update_rate_requires_admin_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
+    let recipient = Address::generate(&env);
 
-    let contract_id = env.register(GrantContract, ());
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant and milestone
-    let grant_id = Symbol::new(&env, "grant_double");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000).unwrap();
+    let grant_id: u64 = 2;
 
-    let milestone_id = Symbol::new(&env, "milestone_double");
-    client.add_milestone(
-        &grant_id,
-        &milestone_id,
-        &500_000,
-        &String::from_str(&env, "Test"),
-    ).unwrap();
+    set_timestamp(&env, 100);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &5);
 
-    // Approve once
-    client.approve_milestone(&grant_id, &milestone_id).unwrap();
+    client.mock_all_auths().update_rate(&grant_id, &7_i128);
 
-    // Try to approve again - should fail
-    let result = client.approve_milestone(&grant_id, &milestone_id);
-    assert!(result.is_err());
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, admin);
+    assert!(matches!(
+        auths[0].1.function,
+        AuthorizedFunction::Contract((_, _, _))
+    ));
 }
 
 #[test]
-fn test_get_remaining_amount() {
+fn test_update_rate_immediately_after_creation() {
     let env = Env::default();
     let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
+    let recipient = Address::generate(&env);
 
-    let contract_id = env.register(GrantContract, ());
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant
-    let grant_id = Symbol::new(&env, "grant_remaining");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000).unwrap();
+    let grant_id: u64 = 3;
 
-    // Check remaining amount before any releases
-    let remaining = client.get_remaining_amount(&grant_id).unwrap();
-    assert_eq!(remaining, 1_000_000);
+    set_timestamp(&env, 2_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000, &4);
 
-    // Add and approve a milestone
-    let milestone_id = Symbol::new(&env, "m1");
-    client.add_milestone(&grant_id, &milestone_id, &400_000, &String::from_str(&env, "Phase 1")).unwrap();
-    client.approve_milestone(&grant_id, &milestone_id).unwrap();
+    client.mock_all_auths().update_rate(&grant_id, &9);
 
-    // Check remaining amount after release
-    let remaining = client.get_remaining_amount(&grant_id).unwrap();
-    assert_eq!(remaining, 600_000);
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.claimable, 0);
+    assert_eq!(grant.flow_rate, 9);
+    assert_eq!(grant.last_update_ts, 2_000);
+
+    set_timestamp(&env, 2_010);
+    assert_eq!(client.claimable(&grant_id), 90);
 }
 
 #[test]
-fn test_exceed_total_grant_amount() {
+fn test_update_rate_multiple_times_with_time_gaps() {
     let env = Env::default();
     let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
+    let recipient = Address::generate(&env);
 
-    let contract_id = env.register(GrantContract, ());
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant with 1M total
-    let grant_id = Symbol::new(&env, "grant_exceed");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000).unwrap();
+    let grant_id: u64 = 4;
 
-    // Add milestone for 600K
-    let milestone_1 = Symbol::new(&env, "m1");
-    client.add_milestone(&grant_id, &milestone_1, &600_000, &String::from_str(&env, "Phase 1")).unwrap();
-    client.approve_milestone(&grant_id, &milestone_1).unwrap();
+    set_timestamp(&env, 10);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &3);
 
-    // Add milestone for 500K (would exceed total)
-    let milestone_2 = Symbol::new(&env, "m2");
-    client.add_milestone(&grant_id, &milestone_2, &500_000, &String::from_str(&env, "Phase 2")).unwrap();
+    set_timestamp(&env, 20);
+    client.mock_all_auths().update_rate(&grant_id, &5);
 
-    // Trying to approve should fail
-    let result = client.approve_milestone(&grant_id, &milestone_2);
-    assert!(result.is_err());
+    set_timestamp(&env, 40);
+    client.mock_all_auths().update_rate(&grant_id, &2);
+
+    set_timestamp(&env, 70);
+    assert_eq!(client.claimable(&grant_id), 30 + 100 + 60);
 }
 
 #[test]
-fn test_grant_simulation_10_years() {
-    // 10 years in seconds
-    let duration: u64 = 315_360_000;
+fn test_update_rate_pause_then_resume() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
 
-    // Total grant amount
-    let total: u128 = 1_000_000_000u128;
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
 
-    // Use a realistic large timestamp to catch overflow issues
-    let start: u64 = 1_700_000_000;
+    let grant_id: u64 = 5;
 
-    // --------------------------------------------------
-    // ✔ Start: nothing should be claimable
-    // --------------------------------------------------
-    let claim0 =
-        grant::compute_claimable_balance(total, start, start, duration);
-    assert_eq!(claim0, 0);
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &20_000, &4);
 
-    // --------------------------------------------------
-    // ✔ Year 5: exactly 50%
-    // --------------------------------------------------
-    let year5 = start + duration / 2;
-    let claim5 =
-        grant::compute_claimable_balance(total, start, year5, duration);
+    set_timestamp(&env, 1_050);
+    client.mock_all_auths().update_rate(&grant_id, &0);
+    assert_eq!(client.claimable(&grant_id), 200);
 
-    assert_eq!(claim5, total / 2);
+    set_timestamp(&env, 1_250);
+    assert_eq!(client.claimable(&grant_id), 200);
 
-    // --------------------------------------------------
-    // ✔ Year 10: 100% vested
-    // --------------------------------------------------
-    let year10 = start + duration;
-    let claim10 =
-        grant::compute_claimable_balance(total, start, year10, duration);
+    client.mock_all_auths().update_rate(&grant_id, &6);
 
-    assert_eq!(claim10, total);
+    set_timestamp(&env, 1_300);
+    assert_eq!(client.claimable(&grant_id), 200 + (50 * 6));
+}
 
-    // --------------------------------------------------
-    // ✔ After expiry: must remain capped at total
-    // --------------------------------------------------
-    let after = year10 + 1_000_000;
-    let claim_after =
-        grant::compute_claimable_balance(total, start, after, duration);
+#[test]
+fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
 
-    assert_eq!(claim_after, total);
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
 
-    // --------------------------------------------------
-    // ✔ Verify constant equals 10-year duration
-    // --------------------------------------------------
-    assert_eq!(duration, 315_360_000u64);
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+
+    let negative_rate_grant: u64 = 6;
+    client
+        .mock_all_auths()
+        .create_grant(&negative_rate_grant, &recipient, &1_000, &5);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_update_rate(&negative_rate_grant, &-1_i128),
+        Error::InvalidRate,
+    );
+
+    let cancelled_grant: u64 = 7;
+    client
+        .mock_all_auths()
+        .create_grant(&cancelled_grant, &recipient, &1_000, &5);
+    client.mock_all_auths().cancel_grant(&cancelled_grant);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_update_rate(&cancelled_grant, &8_i128),
+        Error::InvalidState,
+    );
+
+    let completed_grant: u64 = 8;
+    client
+        .mock_all_auths()
+        .create_grant(&completed_grant, &recipient, &100, &10);
+    set_timestamp(&env, 10);
+    client.mock_all_auths().withdraw(&completed_grant, &100);
+
+    let completed = client.get_grant(&completed_grant);
+    assert_eq!(completed.status, GrantStatus::Completed);
+
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_update_rate(&completed_grant, &4_i128),
+        Error::InvalidState,
+    );
+}
+
+#[test]
+fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 9;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &10);
+
+    set_timestamp(&env, 20);
+    client.mock_all_auths().update_rate(&grant_id, &5);
+
+    set_timestamp(&env, 60);
+    assert_eq!(client.claimable(&grant_id), 400);
+
+    client.mock_all_auths().withdraw(&grant_id, &400);
+    assert_eq!(client.claimable(&grant_id), 0);
+
+    assert_contract_error(
+        client.mock_all_auths().try_withdraw(&grant_id, &1),
+        Error::InvalidAmount,
+    );
+
+    set_timestamp(&env, 180);
+    assert_eq!(client.claimable(&grant_id), 600);
+
+    client.mock_all_auths().withdraw(&grant_id, &600);
+    assert_eq!(client.claimable(&grant_id), 0);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.withdrawn, 1_000);
+    assert_eq!(grant.status, GrantStatus::Completed);
+
+    assert_contract_error(
+        client.mock_all_auths().try_withdraw(&grant_id, &1),
+        Error::InvalidAmount,
+    );
 }
