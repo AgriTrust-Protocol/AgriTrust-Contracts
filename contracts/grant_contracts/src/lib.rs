@@ -29,6 +29,8 @@ pub struct Grant {
     pub status: GrantStatus,
     pub council_members: Vec<Address>, // For DAO governance
     pub voting_threshold: u32, // Number of votes required for milestone approval
+    pub flow_rate: u128, // tokens per second streamed for this grant (0 if not used)
+    pub last_settled_at: u64, // timestamp of last settlement for streaming flows
 }
 
 #[contracttype]
@@ -132,6 +134,8 @@ impl GrantContract {
             status: GrantStatus::Proposed,
             council_members: council_members.clone(),
             voting_threshold,
+            flow_rate: 0,
+            last_settled_at: env.ledger().timestamp(),
         };
 
         env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
@@ -393,6 +397,46 @@ impl GrantContract {
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
         }
+    }
+
+    pub fn slash_flow_rate(env: Env, grant_id: Symbol, reduction_percentage: u32) {
+        let grant_key = DataKey::Grant(grant_id.clone());
+        let mut grant: Grant = env.storage().instance()
+            .get::<_, Grant>(&grant_key)
+            .unwrap_optimized();
+
+        grant.admin.require_auth();
+
+        if reduction_percentage > 100 {
+            panic_with_error!(&env, GrantError::InvalidAmount);
+        }
+
+        // Settle the current owed balance based on flow_rate and time elapsed
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(grant.last_settled_at);
+
+        if elapsed > 0 && grant.flow_rate > 0 {
+            let owed = grant.flow_rate.saturating_mul(elapsed as u128);
+
+            let new_released = grant.released_amount.checked_add(owed)
+                .unwrap_or_else(|| panic_with_error!(&env, GrantError::ExceedsTotalAmount));
+
+            if new_released > grant.total_amount {
+                panic_with_error!(&env, GrantError::ExceedsTotalAmount);
+            }
+
+            grant.released_amount = new_released;
+            grant.last_settled_at = now;
+        }
+
+        // Apply reduction to future flow rate
+        let new_rate = (grant.flow_rate.saturating_mul((100u128 - reduction_percentage as u128))) / 100u128;
+        grant.flow_rate = new_rate;
+
+        env.storage().instance().set(&grant_key, &grant);
+
+        // Emit event: GrantSlashed(grant_id, new_rate)
+        env.events().publish((Symbol::short("GrantSlashed"),), (grant_id, new_rate));
     }
 
     pub fn get_grant(env: Env, grant_id: Symbol) -> Grant {
