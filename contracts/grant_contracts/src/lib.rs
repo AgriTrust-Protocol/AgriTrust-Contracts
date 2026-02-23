@@ -7,7 +7,7 @@ use soroban_sdk::{
 #[contract]
 pub struct GrantContract;
 
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+
 #[contracttype]
 pub enum GrantStatus {
     Active,
@@ -70,11 +70,7 @@ fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
         .ok_or(Error::GrantNotFound)
 }
 
-fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage()
-        .instance()
-        .set(&DataKey::Grant(grant_id), grant);
-}
+
 
 fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts {
@@ -258,8 +254,7 @@ impl GrantContract {
             grant.status = GrantStatus::Completed;
         }
 
-        write_grant(&env, grant_id, &grant);
-        Ok(())
+
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
