@@ -1,0 +1,1 @@
+/Users/apple/Desktop/contracts/contracts/grant_contracts/target/debug/libgrant_contracts.rlib: /Users/apple/Desktop/contracts/contracts/grant_contracts/src/lib.rs /Users/apple/Desktop/contracts/contracts/grant_contracts/src/test.rs
