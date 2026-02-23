@@ -2,9 +2,9 @@ name: Grant Smart Contract Tests
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -31,6 +31,8 @@ jobs:
 
       - name: Build Contract
         run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: contracts/grant_contracts
 
       - name: Run Unit Tests
         run: cargo test
+        working-directory: contracts/grant_contracts
