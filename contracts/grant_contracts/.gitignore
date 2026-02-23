@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Soroban/WASM artifacts
+*.wasm
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and backups
+*.log
+*.bak
+*.backup
+
+# Test artifacts
+/tests/target/
