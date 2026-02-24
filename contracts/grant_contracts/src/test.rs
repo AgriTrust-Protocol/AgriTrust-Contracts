@@ -36,7 +36,7 @@ fn test_update_rate_settles_before_changing_rate() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &10_000, &rate_1);
+        .create_grant(&grant_id, &recipient, &10_000, &rate_1, &0);
 
     set_timestamp(&env, 1_100);
     assert_eq!(client.claimable(&grant_id), 1_000);
@@ -74,7 +74,7 @@ fn test_update_rate_requires_admin_auth() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &1_000, &5);
+        .create_grant(&grant_id, &recipient, &1_000, &5, &0);
 
     client.mock_all_auths().update_rate(&grant_id, &7_i128);
 
@@ -102,7 +102,7 @@ fn test_update_rate_immediately_after_creation() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &5_000, &4);
+        .create_grant(&grant_id, &recipient, &5_000, &4, &0);
 
     client.mock_all_auths().update_rate(&grant_id, &9);
 
@@ -130,7 +130,7 @@ fn test_update_rate_multiple_times_with_time_gaps() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &10_000, &3);
+        .create_grant(&grant_id, &recipient, &10_000, &3, &0);
 
     set_timestamp(&env, 20);
     client.mock_all_auths().update_rate(&grant_id, &5);
@@ -157,7 +157,7 @@ fn test_update_rate_pause_then_resume() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &20_000, &4);
+        .create_grant(&grant_id, &recipient, &20_000, &4, &0);
 
     set_timestamp(&env, 1_050);
     client.mock_all_auths().update_rate(&grant_id, &0);
@@ -187,7 +187,7 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let negative_rate_grant: u64 = 6;
     client
         .mock_all_auths()
-        .create_grant(&negative_rate_grant, &recipient, &1_000, &5);
+        .create_grant(&negative_rate_grant, &recipient, &1_000, &5, &0);
     assert_contract_error(
         client
             .mock_all_auths()
@@ -198,7 +198,7 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let cancelled_grant: u64 = 7;
     client
         .mock_all_auths()
-        .create_grant(&cancelled_grant, &recipient, &1_000, &5);
+        .create_grant(&cancelled_grant, &recipient, &1_000, &5, &0);
     client.mock_all_auths().cancel_grant(&cancelled_grant);
     assert_contract_error(
         client
@@ -210,7 +210,7 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let completed_grant: u64 = 8;
     client
         .mock_all_auths()
-        .create_grant(&completed_grant, &recipient, &100, &10);
+        .create_grant(&completed_grant, &recipient, &100, &10, &0);
     set_timestamp(&env, 10);
     client.mock_all_auths().withdraw(&completed_grant, &100);
 
@@ -240,7 +240,7 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
-        .create_grant(&grant_id, &recipient, &1_000, &10);
+        .create_grant(&grant_id, &recipient, &1_000, &10, &0);
 
     set_timestamp(&env, 20);
     client.mock_all_auths().update_rate(&grant_id, &5);
@@ -270,4 +270,114 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
         client.mock_all_auths().try_withdraw(&grant_id, &1),
         Error::InvalidAmount,
     );
+}
+
+#[test]
+fn test_warmup_period_linear_scaling() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 100;
+    let flow_rate: i128 = 100; // 100 tokens per second at full rate
+    let warmup_duration: u64 = 30; // 30 seconds warmup
+
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &100_000, &flow_rate, &warmup_duration);
+
+    // At start (t=0 of warmup): should be 25% of flow rate
+    set_timestamp(&env, 1_000);
+    assert_eq!(client.claimable(&grant_id), 0);
+
+    // After 1 second: 25% rate = 25 tokens
+    set_timestamp(&env, 1_001);
+    assert_eq!(client.claimable(&grant_id), 25);
+
+    // At midpoint (t=15): should be ~62.5% of flow rate
+    // 15 seconds at ramping rate
+    set_timestamp(&env, 1_015);
+    let claimable_at_15 = client.claimable(&grant_id);
+    // Expected: roughly 25% for 0s + ramp from 25% to 62.5% over 15s
+    // Approximate: (25 + 62.5) / 2 * 15 = 656.25
+    assert!(claimable_at_15 >= 650 && claimable_at_15 <= 660);
+
+    // After warmup period (t=30): should be at 100% rate
+    set_timestamp(&env, 1_030);
+    let claimable_at_30 = client.claimable(&grant_id);
+    // Expected: average rate over 30s warmup ≈ (25% + 100%) / 2 = 62.5% avg
+    // 30 * 100 * 0.625 = 1875
+    assert!(claimable_at_30 >= 1850 && claimable_at_30 <= 1900);
+
+    // After warmup (t=40): should accrue at full 100% rate
+    set_timestamp(&env, 1_040);
+    let claimable_at_40 = client.claimable(&grant_id);
+    // Previous + 10 seconds at 100% = claimable_at_30 + 1000
+    assert!(claimable_at_40 >= claimable_at_30 + 1000);
+}
+
+#[test]
+fn test_no_warmup_period() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 101;
+    let flow_rate: i128 = 50;
+
+    set_timestamp(&env, 2_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &flow_rate, &0);
+
+    // With warmup_duration = 0, should accrue at full rate immediately
+    set_timestamp(&env, 2_010);
+    assert_eq!(client.claimable(&grant_id), 500);
+
+    set_timestamp(&env, 2_020);
+    assert_eq!(client.claimable(&grant_id), 1_000);
+}
+
+#[test]
+fn test_warmup_with_withdrawal() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 102;
+    let flow_rate: i128 = 100;
+    let warmup_duration: u64 = 20;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &50_000, &flow_rate, &warmup_duration);
+
+    // Accrue during warmup
+    set_timestamp(&env, 10);
+    let claimable_at_10 = client.claimable(&grant_id);
+    assert!(claimable_at_10 > 0);
+
+    // Withdraw during warmup
+    client.mock_all_auths().withdraw(&grant_id, &claimable_at_10);
+    assert_eq!(client.claimable(&grant_id), 0);
+
+    // Continue accruing after warmup
+    set_timestamp(&env, 30);
+    let claimable_at_30 = client.claimable(&grant_id);
+    // 10 seconds at full rate = 1000
+    assert_eq!(claimable_at_30, 1_000);
 }

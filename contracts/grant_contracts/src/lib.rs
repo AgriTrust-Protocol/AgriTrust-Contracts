@@ -26,6 +26,8 @@ pub struct Grant {
     pub last_update_ts: u64,
     pub rate_updated_at: u64,
     pub status: GrantStatus,
+    pub start_time: u64,
+    pub warmup_duration: u64,
 }
 
 #[derive(Clone)]
@@ -70,7 +72,36 @@ fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
         .ok_or(Error::GrantNotFound)
 }
 
+fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Grant(grant_id), grant);
+}
 
+
+
+fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
+    if grant.warmup_duration == 0 {
+        return 10000; // 100% in basis points
+    }
+
+    let warmup_end = grant.start_time + grant.warmup_duration;
+    
+    if now >= warmup_end {
+        return 10000; // 100% after warmup period
+    }
+
+    if now <= grant.start_time {
+        return 2500; // 25% at start
+    }
+
+    // Linear interpolation from 25% to 100% over warmup_duration
+    let elapsed_warmup = now - grant.start_time;
+    let progress = (elapsed_warmup as i128 * 10000) / (grant.warmup_duration as i128);
+    
+    // 25% + (75% * progress)
+    2500 + (7500 * progress / 10000)
+}
 
 fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts {
@@ -89,9 +120,19 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     }
 
     let elapsed_i128 = i128::from(elapsed);
-    let accrued = grant
+    
+    // Calculate accrued amount with warmup multiplier
+    let base_accrued = grant
         .flow_rate
         .checked_mul(elapsed_i128)
+        .ok_or(Error::MathOverflow)?;
+
+    // Apply warmup multiplier if within warmup period
+    let multiplier = calculate_warmup_multiplier(grant, now);
+    let accrued = base_accrued
+        .checked_mul(multiplier)
+        .ok_or(Error::MathOverflow)?
+        .checked_div(10000)
         .ok_or(Error::MathOverflow)?;
 
     let accounted = grant
@@ -154,6 +195,7 @@ impl GrantContract {
         recipient: Address,
         total_amount: i128,
         flow_rate: i128,
+        warmup_duration: u64,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
@@ -180,6 +222,8 @@ impl GrantContract {
             last_update_ts: now,
             rate_updated_at: now,
             status: GrantStatus::Active,
+            start_time: now,
+            warmup_duration,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -254,7 +298,8 @@ impl GrantContract {
             grant.status = GrantStatus::Completed;
         }
 
-
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
