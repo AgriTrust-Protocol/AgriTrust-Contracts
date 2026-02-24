@@ -307,3 +307,109 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
     set_timestamp(&env, 110);
     assert_eq!(client.claimable(&grant_id), 1_300);
 }
+
+#[test]
+fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+
+    let invalid_multiplier_grant: u64 = 11;
+    client
+        .mock_all_auths()
+        .create_grant(&invalid_multiplier_grant, &recipient, &1_000, &5);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_apply_kpi_multiplier(&invalid_multiplier_grant, &0_i128),
+        Error::InvalidRate,
+    );
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_apply_kpi_multiplier(&invalid_multiplier_grant, &-1_i128),
+        Error::InvalidRate,
+    );
+
+    let cancelled_grant: u64 = 12;
+    client
+        .mock_all_auths()
+        .create_grant(&cancelled_grant, &recipient, &1_000, &5);
+    client.mock_all_auths().cancel_grant(&cancelled_grant);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_apply_kpi_multiplier(&cancelled_grant, &2_i128),
+        Error::InvalidState,
+    );
+
+    let completed_grant: u64 = 13;
+    client
+        .mock_all_auths()
+        .create_grant(&completed_grant, &recipient, &100, &10);
+    set_timestamp(&env, 10);
+    client.mock_all_auths().withdraw(&completed_grant, &100);
+
+    let completed = client.get_grant(&completed_grant);
+    assert_eq!(completed.status, GrantStatus::Completed);
+
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_apply_kpi_multiplier(&completed_grant, &2_i128),
+        Error::InvalidState,
+    );
+}
+
+#[test]
+fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundaries() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 14;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &500_000_000, &10);
+
+    set_timestamp(&env, 100);
+    client.mock_all_auths().propose_rate_change(&grant_id, &20);
+
+    set_timestamp(&env, 150);
+    client.mock_all_auths().apply_kpi_multiplier(&grant_id, &2);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.claimable, 1_500);
+    assert_eq!(grant.flow_rate, 20);
+    assert_eq!(grant.pending_rate, 40);
+    assert_eq!(grant.last_update_ts, 150);
+    assert_eq!(
+        grant.effective_timestamp,
+        100 + RATE_INCREASE_TIMELOCK_SECS
+    );
+
+    let just_before_activation = grant.effective_timestamp - 1;
+    set_timestamp(&env, just_before_activation);
+    let expected_before = 1_500 + (i128::from(just_before_activation - 150) * 20);
+    assert_eq!(client.claimable(&grant_id), expected_before);
+
+    set_timestamp(&env, grant.effective_timestamp + 10);
+    let expected_after = 1_500
+        + (i128::from(grant.effective_timestamp - 150) * 20)
+        + (i128::from(10_u64) * 40);
+    assert_eq!(client.claimable(&grant_id), expected_after);
+}
