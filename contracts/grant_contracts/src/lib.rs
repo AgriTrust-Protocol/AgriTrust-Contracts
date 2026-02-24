@@ -21,6 +21,9 @@ pub enum GrantStatus {
     Cancelled,
 }
 
+/// 90 days in seconds (inactivity threshold for slash_inactive_grant).
+const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60; // 7_776_000
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Grant {
@@ -31,6 +34,8 @@ pub struct Grant {
     pub flow_rate: i128,
     pub last_update_ts: u64,
     pub rate_updated_at: u64,
+    /// Last time the grantee withdrew (or grant creation if never claimed). Used for inactivity slash.
+    pub last_claim_time: u64,
     pub status: GrantStatus,
 }
 
@@ -40,6 +45,8 @@ enum DataKey {
     Admin,
     /// Token used for grants; allocated funds are measured in this token.
     GrantToken,
+    /// DAO treasury; slashed funds are sent here.
+    Treasury,
     /// All grant IDs ever created (for computing total_allocated_funds).
     GrantIds,
     Grant(u64),
@@ -60,6 +67,8 @@ pub enum Error {
     MathOverflow = 9,
     /// Rescue amount would leave less than total allocated funds in the contract.
     RescueWouldViolateAllocated = 10,
+    /// Grant has been active (claimed) within the inactivity threshold; cannot slash yet.
+    GrantNotInactive = 11,
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -90,6 +99,13 @@ fn read_grant_token(env: &Env) -> Result<Address, Error> {
     env.storage()
         .instance()
         .get(&DataKey::GrantToken)
+        .ok_or(Error::NotInitialized)
+}
+
+fn read_treasury(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Treasury)
         .ok_or(Error::NotInitialized)
 }
 
@@ -188,13 +204,19 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
 
 #[contractimpl]
 impl GrantContract {
-    pub fn initialize(env: Env, admin: Address, grant_token: Address) -> Result<(), Error> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        grant_token: Address,
+        treasury: Address,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage()
             .instance()
             .set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
@@ -232,6 +254,7 @@ impl GrantContract {
             flow_rate,
             last_update_ts: now,
             rate_updated_at: now,
+            last_claim_time: now,
             status: GrantStatus::Active,
         };
 
@@ -310,7 +333,49 @@ impl GrantContract {
             grant.status = GrantStatus::Completed;
         }
 
+        grant.last_claim_time = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
+
+    /// Anyone may call. Cancel an active grant if the grantee has not claimed in 90+ days; return remaining funds to treasury.
+    pub fn slash_inactive_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+
+        if grant.status != GrantStatus::Active {
+            return Err(Error::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        settle_grant(&mut grant, now)?;
+
+        if grant.status != GrantStatus::Active {
+            write_grant(&env, grant_id, &grant);
+            return Err(Error::InvalidState);
+        }
+
+        let inactive_secs = now.saturating_sub(grant.last_claim_time);
+        if inactive_secs < INACTIVITY_THRESHOLD_SECS {
+            return Err(Error::GrantNotInactive);
+        }
+
+        let remaining = grant
+            .total_amount
+            .checked_sub(grant.withdrawn)
+            .ok_or(Error::MathOverflow)?;
+
+        grant.flow_rate = 0;
+        grant.status = GrantStatus::Cancelled;
+        write_grant(&env, grant_id, &grant);
+
+        if remaining > 0 {
+            let contract = env.current_contract_address();
+            let token = read_grant_token(&env)?;
+            let treasury = read_treasury(&env)?;
+            let client = token::Client::new(&env, &token);
+            client.transfer(&contract, &treasury, remaining);
+        }
+
         Ok(())
     }
 
