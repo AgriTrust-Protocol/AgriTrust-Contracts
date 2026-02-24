@@ -4,10 +4,16 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
 };
 
+/// Scaling factor for high-precision flow rate calculations.
+/// This prevents zero flow rates when dealing with low-decimal tokens.
+/// Flow rates are stored as scaled values (multiplied by this factor).
+pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+
 #[contract]
 pub struct GrantContract;
 
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+
+#[derive(Clone, PartialEq, Debug)]
 #[contracttype]
 pub enum GrantStatus {
     Active,
@@ -93,6 +99,8 @@ fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
         .instance()
         .set(&DataKey::Grant(grant_id), grant);
 }
+
+
 
 fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts {
