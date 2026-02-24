@@ -25,6 +25,7 @@ fn assert_contract_error<T, C>(
 fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
@@ -33,7 +34,7 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     let grant_id: u64 = 1;
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
@@ -61,6 +62,7 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
 fn test_withdraw_respects_timelock_for_rate_increases() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
@@ -69,7 +71,7 @@ fn test_withdraw_respects_timelock_for_rate_increases() {
     let grant_id: u64 = 2;
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &5_000_000, &1);
@@ -100,6 +102,7 @@ fn test_withdraw_respects_timelock_for_rate_increases() {
 fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
@@ -108,7 +111,7 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     let grant_id: u64 = 3;
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
@@ -134,6 +137,7 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
 fn test_propose_rate_change_requires_admin_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
@@ -142,7 +146,7 @@ fn test_propose_rate_change_requires_admin_auth() {
     let grant_id: u64 = 4;
 
     set_timestamp(&env, 100);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &1_000, &5);
@@ -164,13 +168,14 @@ fn test_propose_rate_change_requires_admin_auth() {
 fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &oracle);
 
     let negative_rate_grant: u64 = 5;
     client
@@ -217,6 +222,7 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
 fn test_update_rate_uses_timelocked_behavior() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
@@ -225,7 +231,7 @@ fn test_update_rate_uses_timelocked_behavior() {
     let grant_id: u64 = 8;
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &5_000_000, &2);
@@ -240,4 +246,64 @@ fn test_update_rate_uses_timelocked_behavior() {
 
     set_timestamp(&env, 20);
     assert_eq!(client.claimable(&grant_id), 40);
+}
+
+#[test]
+fn test_apply_kpi_multiplier_requires_oracle_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 9;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000_000, &2);
+
+    set_timestamp(&env, 10);
+    client.mock_all_auths().apply_kpi_multiplier(&grant_id, &2);
+
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, oracle);
+    assert!(matches!(
+        auths[0].1.function,
+        AuthorizedFunction::Contract((_, _, _))
+    ));
+}
+
+#[test]
+fn test_apply_kpi_multiplier_settles_before_updating_rate() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 10;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &50_000_000, &10);
+
+    set_timestamp(&env, 100);
+    client.mock_all_auths().apply_kpi_multiplier(&grant_id, &3);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.claimable, 1_000);
+    assert_eq!(grant.flow_rate, 30);
+    assert_eq!(grant.last_update_ts, 100);
+
+    set_timestamp(&env, 110);
+    assert_eq!(client.claimable(&grant_id), 1_300);
 }

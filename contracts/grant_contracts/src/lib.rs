@@ -34,6 +34,7 @@ pub struct Grant {
 #[contracttype]
 enum DataKey {
     Admin,
+    Oracle,
     Grant(u64),
 }
 
@@ -61,9 +62,22 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)
 }
 
+fn read_oracle(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Oracle)
+        .ok_or(Error::NotInitialized)
+}
+
 fn require_admin_auth(env: &Env) -> Result<(), Error> {
     let admin = read_admin(env)?;
     admin.require_auth();
+    Ok(())
+}
+
+fn require_oracle_auth(env: &Env) -> Result<(), Error> {
+    let oracle = read_oracle(env)?;
+    oracle.require_auth();
     Ok(())
 }
 
@@ -191,12 +205,15 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
 
 #[contractimpl]
 impl GrantContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+    pub fn initialize(env: Env, admin: Address, oracle_address: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Oracle, &oracle_address);
         Ok(())
     }
 
@@ -369,6 +386,50 @@ impl GrantContract {
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
         Self::propose_rate_change(env, grant_id, new_rate)
+    }
+
+    pub fn apply_kpi_multiplier(env: Env, grant_id: u64, multiplier: i128) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+
+        if multiplier <= 0 {
+            return Err(Error::InvalidRate);
+        }
+
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active {
+            return Err(Error::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        settle_grant(&mut grant, now)?;
+
+        if grant.status != GrantStatus::Active {
+            write_grant(&env, grant_id, &grant);
+            return Err(Error::InvalidState);
+        }
+
+        let old_rate = grant.flow_rate;
+        grant.flow_rate = grant
+            .flow_rate
+            .checked_mul(multiplier)
+            .ok_or(Error::MathOverflow)?;
+        grant.rate_updated_at = now;
+
+        if grant.pending_rate > 0 {
+            grant.pending_rate = grant
+                .pending_rate
+                .checked_mul(multiplier)
+                .ok_or(Error::MathOverflow)?;
+        }
+
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish(
+            (symbol_short!("kpimul"), grant_id),
+            (old_rate, grant.flow_rate, multiplier),
+        );
+
+        Ok(())
     }
 }
 
