@@ -24,6 +24,7 @@ fn test_update_rate_settles_before_changing_rate() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
@@ -33,7 +34,7 @@ fn test_update_rate_settles_before_changing_rate() {
     let rate_2: i128 = 25;
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &10_000, &rate_1);
@@ -64,6 +65,7 @@ fn test_update_rate_requires_admin_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
@@ -71,7 +73,7 @@ fn test_update_rate_requires_admin_auth() {
     let grant_id: u64 = 2;
 
     set_timestamp(&env, 100);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &1_000, &5);
@@ -92,6 +94,7 @@ fn test_update_rate_immediately_after_creation() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
@@ -99,7 +102,7 @@ fn test_update_rate_immediately_after_creation() {
     let grant_id: u64 = 3;
 
     set_timestamp(&env, 2_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &5_000, &4);
@@ -120,6 +123,7 @@ fn test_update_rate_multiple_times_with_time_gaps() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
@@ -127,7 +131,7 @@ fn test_update_rate_multiple_times_with_time_gaps() {
     let grant_id: u64 = 4;
 
     set_timestamp(&env, 10);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &10_000, &3);
@@ -147,6 +151,7 @@ fn test_update_rate_pause_then_resume() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
@@ -154,7 +159,7 @@ fn test_update_rate_pause_then_resume() {
     let grant_id: u64 = 5;
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &20_000, &4);
@@ -177,12 +182,13 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
 
     let negative_rate_grant: u64 = 6;
     client
@@ -230,6 +236,7 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
 
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
@@ -237,7 +244,7 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
     let grant_id: u64 = 9;
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &1_000, &10);
@@ -268,6 +275,46 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
 
     assert_contract_error(
         client.mock_all_auths().try_withdraw(&grant_id, &1),
+        Error::InvalidAmount,
+    );
+}
+
+#[test]
+fn test_rescue_tokens_requires_admin_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin, &grant_token);
+    // Calling rescue_tokens without admin auth must fail (auth or NotAuthorized).
+    assert!(client.try_rescue_tokens(&grant_token, &100, &to).is_err());
+}
+
+#[test]
+fn test_rescue_tokens_rejects_invalid_amount() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin, &grant_token);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_rescue_tokens(&grant_token, &0, &to),
+        Error::InvalidAmount,
+    );
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_rescue_tokens(&grant_token, &-1_i128, &to),
         Error::InvalidAmount,
     );
 }

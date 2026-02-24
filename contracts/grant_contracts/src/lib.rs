@@ -1,7 +1,13 @@
 #![no_std]
 
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
+    Vec,
 };
 
 #[contract]
@@ -32,6 +38,10 @@ pub struct Grant {
 #[contracttype]
 enum DataKey {
     Admin,
+    /// Token used for grants; allocated funds are measured in this token.
+    GrantToken,
+    /// All grant IDs ever created (for computing total_allocated_funds).
+    GrantIds,
     Grant(u64),
 }
 
@@ -48,6 +58,8 @@ pub enum Error {
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
+    /// Rescue amount would leave less than total allocated funds in the contract.
+    RescueWouldViolateAllocated = 10,
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -68,6 +80,43 @@ fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
         .instance()
         .get(&DataKey::Grant(grant_id))
         .ok_or(Error::GrantNotFound)
+}
+
+fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+}
+
+fn read_grant_token(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantToken)
+        .ok_or(Error::NotInitialized)
+}
+
+fn read_grant_ids(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantIds)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Sum of (total_amount - withdrawn) for all active grants. Represents tokens that must remain in the contract.
+fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
+    let mut total = 0_i128;
+    let ids = read_grant_ids(env);
+    for i in 0..ids.len() {
+        let grant_id = ids.get(i).unwrap();
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+            if grant.status == GrantStatus::Active {
+                let remaining = grant
+                    .total_amount
+                    .checked_sub(grant.withdrawn)
+                    .ok_or(Error::MathOverflow)?;
+                total = total.checked_add(remaining).ok_or(Error::MathOverflow)?;
+            }
+        }
+    }
+    Ok(total)
 }
 
 
@@ -139,12 +188,16 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
 
 #[contractimpl]
 impl GrantContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+    pub fn initialize(env: Env, admin: Address, grant_token: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         Ok(())
     }
 
@@ -183,6 +236,9 @@ impl GrantContract {
         };
 
         env.storage().instance().set(&key, &grant);
+        let mut ids = read_grant_ids(&env);
+        ids.push_back(grant_id);
+        env.storage().instance().set(&DataKey::GrantIds, &ids);
         Ok(())
     }
 
@@ -254,7 +310,8 @@ impl GrantContract {
             grant.status = GrantStatus::Completed;
         }
 
-
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -288,6 +345,40 @@ impl GrantContract {
             (old_rate, new_rate, grant.rate_updated_at),
         );
 
+        Ok(())
+    }
+
+    /// Rescue stray tokens sent directly to the contract. Admin-only. Ensures contract_balance - amount >= total_allocated_funds for the grant token.
+    pub fn rescue_tokens(
+        env: Env,
+        token_address: Address,
+        amount: i128,
+        to: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let contract = env.current_contract_address();
+        let client = token::Client::new(&env, &token_address);
+        let contract_balance = client.balance(&contract);
+
+        let total_allocated = if token_address == read_grant_token(&env)? {
+            total_allocated_funds(&env)?
+        } else {
+            0
+        };
+
+        let after_rescue = contract_balance
+            .checked_sub(amount)
+            .ok_or(Error::MathOverflow)?;
+        if after_rescue < total_allocated {
+            return Err(Error::RescueWouldViolateAllocated);
+        }
+
+        client.transfer(&contract, &to, amount);
         Ok(())
     }
 }
