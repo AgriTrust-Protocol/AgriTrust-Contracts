@@ -10,10 +10,16 @@ use soroban_sdk::{
     Vec,
 };
 
+/// Scaling factor for high-precision flow rate calculations.
+/// This prevents zero flow rates when dealing with low-decimal tokens.
+/// Flow rates are stored as scaled values (multiplied by this factor).
+pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+
 #[contract]
 pub struct GrantContract;
 
 
+#[derive(Clone, PartialEq, Debug)]
 #[contracttype]
 pub enum GrantStatus {
     Active,
@@ -117,6 +123,9 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
         }
     }
     Ok(total)
+    env.storage()
+        .instance()
+        .set(&DataKey::Grant(grant_id), grant);
 }
 
 
@@ -138,9 +147,14 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     }
 
     let elapsed_i128 = i128::from(elapsed);
-    let accrued = grant
+    // Flow rate is stored as a scaled value, so we divide by SCALING_FACTOR
+    // to get the actual accrued amount in token units
+    let scaled_accrued = grant
         .flow_rate
         .checked_mul(elapsed_i128)
+        .ok_or(Error::MathOverflow)?;
+    let accrued = scaled_accrued
+        .checked_div(SCALING_FACTOR)
         .ok_or(Error::MathOverflow)?;
 
     let accounted = grant
