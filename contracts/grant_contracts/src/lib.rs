@@ -11,5 +11,3 @@ pub use optimized::{
     has_status, set_status, clear_status, toggle_status,
 };
 
-#[cfg(test)]
-pub use test_optimized::*;

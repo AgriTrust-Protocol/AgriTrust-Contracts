@@ -30,6 +30,29 @@ stateDiagram-v2
     note right of Cancelled : Grant terminated<br/>No further actions
 ```
 
+## Grant Lifecycle State Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> Proposed : create_grant()
+    Proposed --> Active : activate_grant()
+    Proposed --> Cancelled : cancel_grant()
+    Active --> Cliff : enter_cliff()
+    Cliff --> Streaming : start_stream()
+    Streaming --> Paused/Slashed : pause_or_slash()
+    Paused/Slashed --> Streaming : resume_stream()
+    Streaming --> Completed : finish_stream()
+    Streaming --> Cancelled : cancel_during_stream()
+
+    note right of Proposed : Admin can create\nAdmin can cancel
+    note right of Active : Admin can activate\nMay enter cliff
+    note right of Cliff : System moves to streaming
+    note right of Streaming : Admin / Oracle actions
+    note right of Paused/Slashed : Admin/Oracle
+    note right of Completed : Grants done
+    note right of Cancelled : Grant terminated
+
+
 ## State Transitions and Permissions
 
 | From State | To State | Trigger | Who Can Trigger |
