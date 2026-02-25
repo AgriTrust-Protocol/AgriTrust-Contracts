@@ -1,9 +1,10 @@
 #![cfg(test)]
 
+use super::{Error, GrantContract, GrantContractClient, GrantStatus, StreamType};
 use super::{Error, GrantContract, GrantContractClient, GrantStatus, SCALING_FACTOR};
 use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, Ledger},
-    Address, Env, InvokeError,
+    token, Address, Env, InvokeError,
 };
 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
@@ -34,6 +35,12 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 1;
+    let rate_1: i128 = 10;
+    let rate_2: i128 = 25;
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &native_token);
     // Flow rates are now scaled by SCALING_FACTOR
     let rate_1: i128 = 10 * SCALING_FACTOR;
     let rate_2: i128 = 25 * SCALING_FACTOR;
@@ -131,6 +138,11 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let grant_id: u64 = 2;
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 100);
+    client.mock_all_auths().initialize(&admin, &native_token);
     let grant_id: u64 = 3;
 
     set_timestamp(&env, 100);
@@ -169,6 +181,11 @@ fn test_propose_rate_change_requires_admin_auth() {
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let grant_id: u64 = 3;
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 2_000);
+    client.mock_all_auths().initialize(&admin, &native_token);
     let grant_id: u64 = 4;
 
     set_timestamp(&env, 0);
@@ -316,6 +333,11 @@ fn test_update_rate_uses_timelocked_behavior() {
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let grant_id: u64 = 4;
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 10);
+    client.mock_all_auths().initialize(&admin, &native_token);
     let grant_id: u64 = 8;
 
     set_timestamp(&env, 10);
@@ -368,6 +390,8 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let grant_id: u64 = 5;
+    let native_token = Address::generate(&env);
     let grant_id: u64 = 9;
 
     client
@@ -378,6 +402,7 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, admin);
     set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client.mock_all_auths().initialize(&admin, &grant_token);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
     set_timestamp(&env, 0);
@@ -455,7 +480,9 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let native_token = Address::generate(&env);
     set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client.mock_all_auths().initialize(&admin, &grant_token);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
     client.mock_all_auths().initialize(&admin, &oracle);
@@ -537,6 +564,11 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let grant_id: u64 = 9;
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &native_token);
     let grant_id: u64 = 8;
     let grant_id: u64 = 14;
 
@@ -1157,6 +1189,10 @@ fn test_sbt_minting_and_metadata() {
 
     let grant_id_1: u64 = 101;
     let total_amount_1: i128 = 1000;
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin, &native_token);
 
     set_timestamp(&env, 1000);
     client.mock_all_auths().initialize(&admin);
@@ -1187,10 +1223,12 @@ fn test_extreme_network_congestion_6_months() {
     let grant_id: u64 = 42;
     let total_amount: i128 = 1_000_000_000_000_000; // 100M tokens
     let flow_rate: i128 = 10_000_000; // 1 token/sec
+    let native_token = Address::generate(&env);
 
     let start_ts = 1_000_000;
     set_timestamp(&env, start_ts);
 
+    client.mock_all_auths().initialize(&admin, &native_token);
     client.mock_all_auths().initialize(&admin);
     client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
 
@@ -1223,6 +1261,10 @@ fn test_streaming_to_staking_redirect() {
 
     set_timestamp(&env, 1000);
     client.mock_all_auths().initialize(&admin);
+    let native_token = Address::generate(&env);
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
 
     // Set redirect
@@ -1246,4 +1288,76 @@ fn test_streaming_to_staking_redirect() {
     client.mock_all_auths().set_redirect(&grant_id, &None);
     let grant_cleared = client.get_grant(&grant_id);
     assert_eq!(grant_cleared.redirect, None);
+}
+
+#[test]
+fn test_minimum_balance_fail_safe() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // 1. Setup native token (XLM) and mint to contract
+    let native_token_id = env.register_stellar_asset_contract(Address::generate(&env));
+    let native_token_client = token::Client::new(&env, &native_token_id);
+
+    const XLM_DECIMALS: u32 = 7;
+    const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
+    let initial_balance = 10 * 10i128.pow(XLM_DECIMALS); // 10 XLM
+
+    // Initialize contract
+    client.initialize(&admin, &native_token_id);
+
+    // Fund the contract
+    native_token_client.mint(&contract_id, &initial_balance);
+    assert_eq!(native_token_client.balance(&contract_id), initial_balance);
+
+    // 2. Try to withdraw more than allowed (breaching reserve)
+    let excessive_withdraw_amount = initial_balance - RENT_RESERVE_XLM + 1; // withdraw 5 XLM + 1 stroop
+    let result = client.try_admin_withdraw(&excessive_withdraw_amount);
+    assert_contract_error(result, Error::InsufficientReserve);
+
+    // 3. Withdraw up to the limit
+    let valid_withdraw_amount = initial_balance - RENT_RESERVE_XLM; // withdraw 5 XLM
+    client.admin_withdraw(&valid_withdraw_amount);
+
+    // 4. Verify balances
+    assert_eq!(native_token_client.balance(&contract_id), RENT_RESERVE_XLM);
+    assert_eq!(native_token_client.balance(&admin), valid_withdraw_amount);
+
+    // 5. Try to withdraw anything more, should fail
+    let result_after = client.try_admin_withdraw(&1);
+    assert_contract_error(result_after, Error::InsufficientReserve);
+}
+
+#[test]
+fn test_fixed_end_date_stream() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let native_token = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 200;
+    let flow_rate: i128 = 100;
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin, &native_token);
+
+    let end_ts = 1000 + 3600; // 1 hour later
+
+    client.mock_all_auths().create_grant_until(&grant_id, &recipient, &flow_rate, &end_ts);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.stream_type, StreamType::FixedEndDate);
+    assert_eq!(grant.total_amount, 3600 * 100);
+
+    // Check claiming
+    set_timestamp(&env, 1000 + 10);
+    let claimable = client.claimable(&grant_id);
+    assert_eq!(claimable, 1000);
 }
