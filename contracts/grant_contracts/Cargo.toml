@@ -23,4 +23,3 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
