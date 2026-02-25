@@ -126,7 +126,6 @@ fn test_withdraw_respects_timelock_for_rate_increases() {
 }
 
 #[test]
-fn test_withdraw_respects_timelock_for_rate_increases() {
 fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -226,7 +225,6 @@ fn test_propose_rate_change_requires_admin_auth() {
 }
 
 #[test]
-fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
 fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -321,7 +319,6 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
 }
 
 #[test]
-fn test_propose_rate_change_requires_admin_auth() {
 fn test_update_rate_uses_timelocked_behavior() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -555,7 +552,6 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
 }
 
 #[test]
-fn test_update_rate_uses_timelocked_behavior() {
 fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundaries() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -630,7 +626,6 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
         + (i128::from(grant.effective_timestamp - 150) * 20)
         + (i128::from(10_u64) * 40);
     assert_eq!(client.claimable(&grant_id), expected_after);
-}
 
 #[test]
 fn test_rescue_tokens_requires_admin_auth() {
@@ -668,48 +663,6 @@ fn test_rescue_tokens_rejects_invalid_amount() {
     );
 }
 
-#[test]
-fn test_rescue_tokens_requires_admin_auth() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grant_token = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    let contract_id = env.register_contract(None, GrantContract);
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    client.mock_all_auths().initialize(&admin, &grant_token);
-    // Calling rescue_tokens without admin auth must fail (auth or NotAuthorized).
-    assert!(client.try_rescue_tokens(&grant_token, &100, &to).is_err());
-}
-
-#[test]
-fn test_rescue_tokens_rejects_invalid_amount() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grant_token = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    let contract_id = env.register_contract(None, GrantContract);
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    client.mock_all_auths().initialize(&admin, &grant_token);
-    assert_contract_error(
-        client
-            .mock_all_auths()
-            .try_rescue_tokens(&grant_token, &0, &to),
-        Error::InvalidAmount,
-    );
-    assert_contract_error(
-        client
-            .mock_all_auths()
-            .try_rescue_tokens(&grant_token, &-1_i128, &to),
-        Error::InvalidAmount,
-    );
-}
-
-#[test]
-fn test_warmup_period_linear_scaling() {
 /// Tests for low-decimal tokens (Issue #18: High-Precision Flow Rates)
 /// These tests verify that the scaling factor prevents zero flow rates
 /// when dealing with tokens that have few decimal places.

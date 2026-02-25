@@ -359,6 +359,13 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     // Calculate accrued amount with warmup multiplier
     // Flow rate is stored as a scaled value, so we divide by SCALING_FACTOR
     // to get the actual accrued amount in token units
+    let scaled_accrued = grant
+        .flow_rate
+        .checked_mul(elapsed_i128)
+        .ok_or(Error::MathOverflow)?;
+    let base_accrued = scaled_accrued
+        .checked_div(SCALING_FACTOR)
+        .ok_or(Error::MathOverflow)?;
     let scaled_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
     let accrued = scaled_accrued.checked_div(SCALING_FACTOR).ok_or(Error::MathOverflow)?;
 
@@ -419,6 +426,7 @@ impl GrantContract {
         admin: Address,
         grant_token: Address,
         treasury: Address,
+        oracle_address: Address,
         oracle_address: Address
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -431,6 +439,9 @@ impl GrantContract {
         env.storage().instance().set(&DataKey::GrantToken, &grant_token);
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage()
+            .instance()
+            .set(&DataKey::Oracle, &oracle_address);
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Oracle, &oracle_address);
         Ok(())
@@ -629,6 +640,10 @@ impl GrantContract {
 
         grant.last_claim_time = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
+
+        // Try to notify the recipient; silently ignore errors based on interface expectation
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+
         Ok(())
     }
 
@@ -777,6 +792,7 @@ impl GrantContract {
 
         env.events().publish(
             (symbol_short!("reasign"), grant_id),
+            (old, new, env.ledger().timestamp()),
             (old, new, env.ledger().timestamp())
         );
         Ok(())
@@ -871,6 +887,16 @@ impl GrantContract {
 
         Ok(())
     }
+}
+
+fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
+    use soroban_sdk::{IntoVal, Symbol};
+    let args = (grant_id, amount).into_val(env);
+    let _: Result<Result<(), _>, _> = env.try_invoke_contract(
+        recipient,
+        &Symbol::new(env, "on_withdraw"),
+        args,
+    );
 }
 
 mod test;
