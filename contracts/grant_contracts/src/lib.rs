@@ -1,7 +1,14 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+pub mod optimized;
+pub mod benchmarks;
+
+// Re-export the optimized implementation
+pub use optimized::{
+    GrantContract, Grant, Error, DataKey,
+    STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED,
+    STATUS_REVOCABLE, STATUS_MILESTONE_BASED, STATUS_AUTO_RENEW, STATUS_EMERGENCY_PAUSE,
+    has_status, set_status, clear_status, toggle_status,
 };
 
 /// Scaling factor for high-precision flow rate calculations.
