@@ -3,7 +3,7 @@
 use super::{Error, GrantContract, GrantContractClient, GrantStatus};
 use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, Ledger},
-    Address, Env, InvokeError,
+    token, Address, Env, InvokeError,
 };
 
 fn set_timestamp(env: &Env, timestamp: u64) {
@@ -31,9 +31,10 @@ fn test_update_rate_settles_before_changing_rate() {
     let grant_id: u64 = 1;
     let rate_1: i128 = 10;
     let rate_2: i128 = 25;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &10_000, &rate_1);
@@ -69,9 +70,10 @@ fn test_update_rate_requires_admin_auth() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 2;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 100);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &1_000, &5);
@@ -97,9 +99,10 @@ fn test_update_rate_immediately_after_creation() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 3;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 2_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &5_000, &4);
@@ -125,9 +128,10 @@ fn test_update_rate_multiple_times_with_time_gaps() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 4;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 10);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &10_000, &3);
@@ -152,9 +156,10 @@ fn test_update_rate_pause_then_resume() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 5;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &20_000, &4);
@@ -181,8 +186,9 @@ fn test_update_rate_rejects_invalid_rate_and_inactive_states() {
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let native_token = Address::generate(&env);
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
 
     let negative_rate_grant: u64 = 6;
     client
@@ -235,9 +241,10 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 9;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &1_000, &10);
@@ -283,9 +290,10 @@ fn test_sbt_minting_and_metadata() {
 
     let grant_id_1: u64 = 101;
     let total_amount_1: i128 = 1000;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 1000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
 
     // Create first grant
     client.mock_all_auths().create_grant(&grant_id_1, &recipient, &total_amount_1, &10);
@@ -313,11 +321,12 @@ fn test_extreme_network_congestion_6_months() {
     let grant_id: u64 = 42;
     let total_amount: i128 = 1_000_000_000_000_000; // 100M tokens
     let flow_rate: i128 = 10_000_000; // 1 token/sec
+    let native_token = Address::generate(&env);
 
     let start_ts = 1_000_000;
     set_timestamp(&env, start_ts);
 
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
 
     // Simulate 6 months gap (182 days = 15,724,800 seconds)
@@ -346,9 +355,10 @@ fn test_streaming_to_staking_redirect() {
     let grant_id: u64 = 50;
     let total_amount: i128 = 1000;
     let flow_rate: i128 = 10;
+    let native_token = Address::generate(&env);
 
     set_timestamp(&env, 1000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &native_token);
     client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
 
     // Set redirect
@@ -372,4 +382,46 @@ fn test_streaming_to_staking_redirect() {
     client.mock_all_auths().set_redirect(&grant_id, &None);
     let grant_cleared = client.get_grant(&grant_id);
     assert_eq!(grant_cleared.redirect, None);
+}
+
+#[test]
+fn test_minimum_balance_fail_safe() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    // 1. Setup native token (XLM) and mint to contract
+    let native_token_id = env.register_stellar_asset_contract(Address::generate(&env));
+    let native_token_client = token::Client::new(&env, &native_token_id);
+
+    const XLM_DECIMALS: u32 = 7;
+    const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
+    let initial_balance = 10 * 10i128.pow(XLM_DECIMALS); // 10 XLM
+
+    // Initialize contract
+    client.initialize(&admin, &native_token_id);
+
+    // Fund the contract
+    native_token_client.mint(&contract_id, &initial_balance);
+    assert_eq!(native_token_client.balance(&contract_id), initial_balance);
+
+    // 2. Try to withdraw more than allowed (breaching reserve)
+    let excessive_withdraw_amount = initial_balance - RENT_RESERVE_XLM + 1; // withdraw 5 XLM + 1 stroop
+    let result = client.try_admin_withdraw(&excessive_withdraw_amount);
+    assert_contract_error(result, Error::InsufficientReserve);
+
+    // 3. Withdraw up to the limit
+    let valid_withdraw_amount = initial_balance - RENT_RESERVE_XLM; // withdraw 5 XLM
+    client.admin_withdraw(&valid_withdraw_amount);
+
+    // 4. Verify balances
+    assert_eq!(native_token_client.balance(&contract_id), RENT_RESERVE_XLM);
+    assert_eq!(native_token_client.balance(&admin), valid_withdraw_amount);
+
+    // 5. Try to withdraw anything more, should fail
+    let result_after = client.try_admin_withdraw(&1);
+    assert_contract_error(result_after, Error::InsufficientReserve);
 }

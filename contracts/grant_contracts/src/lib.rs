@@ -1,8 +1,12 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec, vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    vec,
 };
+
+const XLM_DECIMALS: u32 = 7;
+const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
 
 #[contract]
 pub struct GrantContract;
@@ -35,6 +39,7 @@ enum DataKey {
     Admin,
     Grant(u64),
     RecipientGrants(Address),
+    NativeToken,
 }
 
 #[contracterror]
@@ -50,6 +55,7 @@ pub enum Error {
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
+    InsufficientReserve = 10,
 }
 
 fn read_admin(env: &Env) -> Result<Address, Error> {
@@ -72,7 +78,9 @@ fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
         .ok_or(Error::GrantNotFound)
 }
 
-
+fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+}
 
 fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts {
@@ -141,12 +149,14 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
 
 #[contractimpl]
 impl GrantContract {
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+    pub fn initialize(env: Env, admin: Address, native_token: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+
         Ok(())
     }
 
@@ -268,7 +278,14 @@ impl GrantContract {
             grant.status = GrantStatus::Completed;
         }
 
+        write_grant(&env, grant_id, &grant);
 
+        // In a real implementation with token support, we would transfer 'amount' to:
+        // let target = grant.redirect.unwrap_or(grant.recipient);
+        // let token_client = token::Client::new(&env, &token_address);
+        // token_client.transfer(&env.current_contract_address(), &target, &amount);
+
+        Ok(())
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -321,6 +338,31 @@ impl GrantContract {
             .instance()
             .get(&key)
             .unwrap_or(vec![&env])
+    }
+
+    pub fn admin_withdraw(env: Env, amount: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let native_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::NativeToken)
+            .ok_or(Error::NotInitialized)?;
+        let token_client = token::Client::new(&env, &native_token);
+        let balance = token_client.balance(&env.current_contract_address());
+
+        if balance.checked_sub(amount).ok_or(Error::MathOverflow)? < RENT_RESERVE_XLM {
+            return Err(Error::InsufficientReserve);
+        }
+
+        let admin = read_admin(&env)?;
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+
+        Ok(())
     }
 }
 
