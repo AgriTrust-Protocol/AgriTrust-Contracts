@@ -6,6 +6,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec, vec,
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
     Vec,
 pub mod optimized;
@@ -111,6 +112,7 @@ enum DataKey {
     GrantIds,
     Oracle,
     Grant(u64),
+    RecipientGrants(Address),
 }
 
 #[contracterror]
@@ -443,6 +445,17 @@ impl GrantContract {
         };
 
         env.storage().instance().set(&key, &grant);
+
+        // Mint SBT: Associate grant with recipient
+        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let mut user_grants: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
         let mut ids = read_grant_ids(&env);
         ids.push_back(grant_id);
         env.storage().instance().set(&DataKey::GrantIds, &ids);
@@ -620,6 +633,12 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn get_recipient_grants(env: Env, recipient: Address) -> Vec<u64> {
+        let key = DataKey::RecipientGrants(recipient);
+        env.storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(vec![&env])
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
         Self::propose_rate_change(env, grant_id, new_rate)
     }
