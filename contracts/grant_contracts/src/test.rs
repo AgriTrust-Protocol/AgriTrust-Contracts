@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{Error, GrantContract, GrantContractClient, GrantStatus};
+use super::{Error, GrantContract, GrantContractClient, GrantStatus, StreamType};
 use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, Ledger},
     token, Address, Env, InvokeError,
@@ -424,4 +424,34 @@ fn test_minimum_balance_fail_safe() {
     // 5. Try to withdraw anything more, should fail
     let result_after = client.try_admin_withdraw(&1);
     assert_contract_error(result_after, Error::InsufficientReserve);
+}
+
+#[test]
+fn test_fixed_end_date_stream() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let native_token = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 200;
+    let flow_rate: i128 = 100;
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin, &native_token);
+
+    let end_ts = 1000 + 3600; // 1 hour later
+
+    client.mock_all_auths().create_grant_until(&grant_id, &recipient, &flow_rate, &end_ts);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.stream_type, StreamType::FixedEndDate);
+    assert_eq!(grant.total_amount, 3600 * 100);
+
+    // Check claiming
+    set_timestamp(&env, 1000 + 10);
+    let claimable = client.claimable(&grant_id);
+    assert_eq!(claimable, 1000);
 }
