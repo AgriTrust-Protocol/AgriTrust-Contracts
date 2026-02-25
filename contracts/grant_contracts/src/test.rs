@@ -25,7 +25,10 @@ fn assert_contract_error<T, C>(
 fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
@@ -36,7 +39,8 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     let rate_2: i128 = 25 * SCALING_FACTOR;
 
     set_timestamp(&env, 1_000);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
@@ -58,17 +62,48 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     set_timestamp(&env, just_before_activation);
     let expected = 1_000 + (i128::from(just_before_activation - 1_100) * 10);
     assert_eq!(client.claimable(&grant_id), expected);
+}
+
+#[test]
+fn test_withdraw_respects_timelock_for_rate_increases() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 2;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000_000, &1);
     // 100 seconds * 10 tokens/sec = 1000 tokens
     assert_eq!(client.claimable(&grant_id), 1_000);
 
-    client.mock_all_auths().update_rate(&grant_id, &rate_2);
+    set_timestamp(&env, 10);
+    client.mock_all_auths().propose_rate_change(&grant_id, &5);
 
-    let grant_after_update = client.get_grant(&grant_id);
-    assert_eq!(grant_after_update.claimable, 1_000);
-    assert_eq!(grant_after_update.flow_rate, rate_2);
-    assert_eq!(grant_after_update.last_update_ts, 1_100);
-    assert_eq!(grant_after_update.rate_updated_at, 1_100);
+    set_timestamp(&env, 20);
+    assert_eq!(client.claimable(&grant_id), 20);
 
+    assert_contract_error(
+        client.mock_all_auths().try_withdraw(&grant_id, &21),
+        Error::InvalidAmount,
+    );
+    client.mock_all_auths().withdraw(&grant_id, &20);
+
+    let effective_timestamp = 10 + RATE_INCREASE_TIMELOCK_SECS;
+    set_timestamp(&env, effective_timestamp - 1);
+    let before_effective = i128::from((effective_timestamp - 1) - 20);
+    assert_eq!(client.claimable(&grant_id), before_effective);
+
+    set_timestamp(&env, effective_timestamp + 10);
+    let after_effective = i128::from(effective_timestamp - 20) + (10 * 5);
+    assert_eq!(client.claimable(&grant_id), after_effective);
     set_timestamp(&env, 1_140);
     // 1000 + (40 seconds * 25 tokens/sec) = 1000 + 1000 = 2000
     assert_eq!(client.claimable(&grant_id), 1_000 + 40 * 25);
@@ -83,17 +118,59 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
 
 #[test]
 fn test_withdraw_respects_timelock_for_rate_increases() {
+fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
-    let grant_id: u64 = 2;
+    let grant_id: u64 = 3;
+
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &50_000_000, &10);
+
+    set_timestamp(&env, 1_100);
+    client.mock_all_auths().propose_rate_change(&grant_id, &20);
+
+    set_timestamp(&env, 1_200);
+    client.mock_all_auths().propose_rate_change(&grant_id, &4);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.flow_rate, 4);
+    assert_eq!(grant.pending_rate, 0);
+    assert_eq!(grant.effective_timestamp, 0);
+    assert_eq!(grant.rate_updated_at, 1_200);
+    assert_eq!(grant.claimable, 2_000);
+
+    set_timestamp(&env, 1_210);
+    assert_eq!(client.claimable(&grant_id), 2_040);
+}
+
+#[test]
+fn test_propose_rate_change_requires_admin_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 4;
 
     set_timestamp(&env, 0);
     client.mock_all_auths().initialize(&admin);
+    set_timestamp(&env, 100);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &5_000_000, &1);
@@ -102,6 +179,9 @@ fn test_withdraw_respects_timelock_for_rate_increases() {
     client.mock_all_auths().propose_rate_change(&grant_id, &5);
         .create_grant(&grant_id, &recipient, &1_000, &(5 * SCALING_FACTOR));
 
+    client
+        .mock_all_auths()
+        .propose_rate_change(&grant_id, &7_i128);
     client.mock_all_auths().update_rate(&grant_id, &(7 * SCALING_FACTOR));
 
     set_timestamp(&env, 20);
@@ -125,14 +205,19 @@ fn test_withdraw_respects_timelock_for_rate_increases() {
 
 #[test]
 fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
+fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
-    let grant_id: u64 = 3;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
 
     set_timestamp(&env, 1_000);
     client.mock_all_auths().initialize(&admin);
@@ -155,6 +240,47 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
 
     set_timestamp(&env, 1_210);
     assert_eq!(client.claimable(&grant_id), 2_040);
+    set_timestamp(&env, 2_000);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    let negative_rate_grant: u64 = 5;
+    client
+        .mock_all_auths()
+        .create_grant(&negative_rate_grant, &recipient, &1_000, &5);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_propose_rate_change(&negative_rate_grant, &-1_i128),
+        Error::InvalidRate,
+    );
+
+    let cancelled_grant: u64 = 6;
+    client
+        .mock_all_auths()
+        .create_grant(&cancelled_grant, &recipient, &1_000, &5);
+    client.mock_all_auths().cancel_grant(&cancelled_grant);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_propose_rate_change(&cancelled_grant, &8_i128),
+        Error::InvalidState,
+    );
+
+    let completed_grant: u64 = 7;
+    client
+        .mock_all_auths()
+        .create_grant(&completed_grant, &recipient, &100, &10);
+    set_timestamp(&env, 10);
+    client.mock_all_auths().withdraw(&completed_grant, &100);
+
+    let completed = client.get_grant(&completed_grant);
+    assert_eq!(completed.status, GrantStatus::Completed);
+
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_propose_rate_change(&completed_grant, &4_i128),
+        Error::InvalidState,
+    );
         .create_grant(&grant_id, &recipient, &5_000, &(4 * SCALING_FACTOR));
 
     client.mock_all_auths().update_rate(&grant_id, &(9 * SCALING_FACTOR));
@@ -171,20 +297,42 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
 
 #[test]
 fn test_propose_rate_change_requires_admin_auth() {
+fn test_update_rate_uses_timelocked_behavior() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
-    let grant_id: u64 = 4;
+    let grant_id: u64 = 8;
 
     set_timestamp(&env, 100);
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &1_000, &5);
+    set_timestamp(&env, 10);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000_000, &2);
+
+    set_timestamp(&env, 10);
+    client.mock_all_auths().update_rate(&grant_id, &6);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.flow_rate, 2);
+    assert_eq!(grant.pending_rate, 6);
+    assert_eq!(grant.effective_timestamp, 10 + RATE_INCREASE_TIMELOCK_SECS);
+
+    set_timestamp(&env, 20);
+    assert_eq!(client.claimable(&grant_id), 40);
         .create_grant(&grant_id, &recipient, &10_000, &(3 * SCALING_FACTOR));
 
     set_timestamp(&env, 20);
@@ -194,20 +342,22 @@ fn test_propose_rate_change_requires_admin_auth() {
     client.mock_all_auths().update_rate(&grant_id, &(2 * SCALING_FACTOR));
 
     set_timestamp(&env, 70);
-    // (10 sec * 3) + (20 sec * 5) + (30 sec * 2) = 30 + 100 + 60 = 190
     assert_eq!(client.claimable(&grant_id), 30 + 100 + 60);
 }
 
 #[test]
-fn test_update_rate_pause_then_resume() {
+fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
-    let grant_id: u64 = 5;
+    let grant_id: u64 = 9;
 
     client
         .mock_all_auths()
@@ -216,44 +366,91 @@ fn test_update_rate_pause_then_resume() {
     let auths = env.auths();
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, admin);
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000_000, &2);
+
+    set_timestamp(&env, 10);
+    client.mock_all_auths().apply_kpi_multiplier(&grant_id, &2);
+
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, oracle);
     assert!(matches!(
         auths[0].1.function,
         AuthorizedFunction::Contract((_, _, _))
     ));
+}
+
+#[test]
+fn test_apply_kpi_multiplier_settles_before_updating_rate() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 10;
+
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &oracle);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &50_000_000, &10);
+
+    set_timestamp(&env, 100);
+    client.mock_all_auths().apply_kpi_multiplier(&grant_id, &3);
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.claimable, 1_000);
+    assert_eq!(grant.flow_rate, 30);
+    assert_eq!(grant.last_update_ts, 100);
+
+    set_timestamp(&env, 110);
+    assert_eq!(client.claimable(&grant_id), 1_300);
         .create_grant(&grant_id, &recipient, &20_000, &(4 * SCALING_FACTOR));
 
     set_timestamp(&env, 1_050);
-    // Pause by setting rate to 0
     client.mock_all_auths().update_rate(&grant_id, &0);
-    // 50 seconds * 4 tokens/sec = 200 tokens
     assert_eq!(client.claimable(&grant_id), 200);
 
     set_timestamp(&env, 1_250);
-    // Still 200 since rate is 0
     assert_eq!(client.claimable(&grant_id), 200);
 
     client.mock_all_auths().update_rate(&grant_id, &(6 * SCALING_FACTOR));
 
     set_timestamp(&env, 1_300);
-    // 200 + (50 seconds * 6 tokens/sec) = 200 + 300 = 500
     assert_eq!(client.claimable(&grant_id), 200 + 50 * 6);
 }
 
 #[test]
 fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
+fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client.mock_all_auths().initialize(&admin, &oracle);
 
     let negative_rate_grant: u64 = 5;
+    let invalid_multiplier_grant: u64 = 11;
     client
         .mock_all_auths()
+        .create_grant(&invalid_multiplier_grant, &recipient, &1_000, &5);
         .create_grant(&negative_rate_grant, &recipient, &1_000, &(5 * SCALING_FACTOR));
     assert_contract_error(
         client
@@ -263,6 +460,17 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     );
 
     let cancelled_grant: u64 = 6;
+            .try_apply_kpi_multiplier(&invalid_multiplier_grant, &0_i128),
+        Error::InvalidRate,
+    );
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_apply_kpi_multiplier(&invalid_multiplier_grant, &-1_i128),
+        Error::InvalidRate,
+    );
+
+    let cancelled_grant: u64 = 12;
     client
         .mock_all_auths()
         .create_grant(&cancelled_grant, &recipient, &1_000, &(5 * SCALING_FACTOR));
@@ -275,6 +483,11 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     );
 
     let completed_grant: u64 = 7;
+            .try_apply_kpi_multiplier(&cancelled_grant, &2_i128),
+        Error::InvalidState,
+    );
+
+    let completed_grant: u64 = 13;
     client
         .mock_all_auths()
         .create_grant(&completed_grant, &recipient, &100, &(10 * SCALING_FACTOR));
@@ -289,26 +502,37 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
         client
             .mock_all_auths()
             .try_propose_rate_change(&completed_grant, &4_i128),
+            .try_apply_kpi_multiplier(&completed_grant, &2_i128),
         Error::InvalidState,
     );
 }
 
 #[test]
 fn test_update_rate_uses_timelocked_behavior() {
+fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundaries() {
     let env = Env::default();
     let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
     let grant_id: u64 = 8;
+    let grant_id: u64 = 14;
 
     set_timestamp(&env, 0);
-    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
         .create_grant(&grant_id, &recipient, &5_000_000, &2);
+        .create_grant(&grant_id, &recipient, &500_000_000, &10);
+
+    set_timestamp(&env, 100);
+    client.mock_all_auths().propose_rate_change(&grant_id, &20);
         .create_grant(&grant_id, &recipient, &1_000, &(10 * SCALING_FACTOR));
 
     set_timestamp(&env, 20);
@@ -317,16 +541,23 @@ fn test_update_rate_uses_timelocked_behavior() {
     set_timestamp(&env, 60);
     assert_eq!(client.claimable(&grant_id), 400);
 
-    client.mock_all_auths().withdraw(&grant_id, &400);
-    assert_eq!(client.claimable(&grant_id), 0);
+    set_timestamp(&env, 150);
+    client.mock_all_auths().apply_kpi_multiplier(&grant_id, &2);
 
-    assert_contract_error(
-        client.mock_all_auths().try_withdraw(&grant_id, &1),
-        Error::InvalidAmount,
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.claimable, 1_500);
+    assert_eq!(grant.flow_rate, 20);
+    assert_eq!(grant.pending_rate, 40);
+    assert_eq!(grant.last_update_ts, 150);
+    assert_eq!(
+        grant.effective_timestamp,
+        100 + RATE_INCREASE_TIMELOCK_SECS
     );
 
-    set_timestamp(&env, 180);
-    assert_eq!(client.claimable(&grant_id), 600);
+    let just_before_activation = grant.effective_timestamp - 1;
+    set_timestamp(&env, just_before_activation);
+    let expected_before = 1_500 + (i128::from(just_before_activation - 150) * 20);
+    assert_eq!(client.claimable(&grant_id), expected_before);
 
     set_timestamp(&env, 10);
     client.mock_all_auths().update_rate(&grant_id, &6);
@@ -340,6 +571,52 @@ fn test_update_rate_uses_timelocked_behavior() {
     assert_eq!(client.claimable(&grant_id), 40);
 }
 
+    set_timestamp(&env, grant.effective_timestamp + 10);
+    let expected_after = 1_500
+        + (i128::from(grant.effective_timestamp - 150) * 20)
+        + (i128::from(10_u64) * 40);
+    assert_eq!(client.claimable(&grant_id), expected_after);
+}
+
+#[test]
+fn test_rescue_tokens_requires_admin_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    // Calling rescue_tokens without admin auth must fail (auth or NotAuthorized).
+    assert!(client.try_rescue_tokens(&grant_token, &100, &to).is_err());
+}
+
+#[test]
+fn test_rescue_tokens_rejects_invalid_amount() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_rescue_tokens(&grant_token, &0, &to),
+        Error::InvalidAmount,
+    );
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_rescue_tokens(&grant_token, &-1_i128, &to),
+        Error::InvalidAmount,
 /// Tests for low-decimal tokens (Issue #18: High-Precision Flow Rates)
 /// These tests verify that the scaling factor prevents zero flow rates
 /// when dealing with tokens that have few decimal places.
@@ -350,7 +627,7 @@ fn test_low_decimal_token_2_decimals_1_year() {
     // Without scaling: 10000 / 31536000 = 0 (integer division)
     // With scaling: (10000 * 1e7) / 31536000 = 3170 scaled rate
     // This allows proper accrual over time
-    
+
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
@@ -361,11 +638,11 @@ fn test_low_decimal_token_2_decimals_1_year() {
     let grant_id: u64 = 100;
     let total_amount: i128 = 10_000; // 100 tokens with 2 decimals = 10000 base units
     let duration_seconds: u64 = 31_536_000; // 1 year in seconds
-    
+
     // Calculate scaled flow rate: (amount * SCALING_FACTOR) / duration
     // This gives us a non-zero rate even for small amounts over long durations
     let scaled_flow_rate: i128 = (total_amount * SCALING_FACTOR) / (duration_seconds as i128);
-    
+
     // Verify the scaled rate is non-zero (this would be 0 without scaling)
     assert!(scaled_flow_rate > 0, "Scaled flow rate should be non-zero");
 
@@ -378,7 +655,7 @@ fn test_low_decimal_token_2_decimals_1_year() {
     // After 6 months (half the duration), should have ~50% vested
     let six_months: u64 = duration_seconds / 2;
     set_timestamp(&env, six_months);
-    
+
     let claimable_at_6_months = client.claimable(&grant_id);
     // Allow some tolerance due to integer division
     let expected_half = total_amount / 2;
@@ -403,10 +680,61 @@ fn test_low_decimal_token_2_decimals_1_year() {
 }
 
 #[test]
+fn test_slash_inactive_grant_reverts_if_less_than_90_days() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 10;
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000, &10);
+
+    // 89 days later (less than 90) – slash should revert
+    const SECS_89_DAYS: u64 = 89 * 24 * 60 * 60;
+    set_timestamp(&env, 1_000 + SECS_89_DAYS);
+    assert_contract_error(
+        client.try_slash_inactive_grant(&grant_id),
+        Error::GrantNotInactive,
+    );
+
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.status, GrantStatus::Active);
+}
+
+#[test]
+fn test_slash_inactive_grant_reverts_if_not_active() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 11;
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &5);
+    client.mock_all_auths().cancel_grant(&grant_id);
+
+    assert_contract_error(
+        client.try_slash_inactive_grant(&grant_id),
+        Error::InvalidState,
 fn test_low_decimal_token_very_small_amount() {
     // Scenario: 1 token with 2 decimals (100 base units) over 1 day
     // Tests precision with very small amounts
-    
+
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
@@ -417,7 +745,7 @@ fn test_low_decimal_token_very_small_amount() {
     let grant_id: u64 = 101;
     let total_amount: i128 = 100; // 1 token with 2 decimals
     let duration_seconds: u64 = 86_400; // 1 day in seconds
-    
+
     let scaled_flow_rate: i128 = (total_amount * SCALING_FACTOR) / (duration_seconds as i128);
     assert!(scaled_flow_rate > 0, "Scaled flow rate should be non-zero");
 
@@ -450,7 +778,7 @@ fn test_low_decimal_token_very_small_amount() {
 fn test_high_precision_long_duration_10_years() {
     // Scenario: Large grant over 10 years
     // Tests that precision is maintained over very long durations
-    
+
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
@@ -461,7 +789,7 @@ fn test_high_precision_long_duration_10_years() {
     let grant_id: u64 = 102;
     let total_amount: i128 = 1_000_000_000; // 1 billion base units
     let duration_seconds: u64 = 315_360_000; // 10 years in seconds
-    
+
     let scaled_flow_rate: i128 = (total_amount * SCALING_FACTOR) / (duration_seconds as i128);
 
     set_timestamp(&env, 0);
@@ -495,10 +823,37 @@ fn test_high_precision_long_duration_10_years() {
 }
 
 #[test]
+fn test_slash_inactive_grant_updates_last_claim_time_on_withdraw() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 12;
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &10);
+
+    set_timestamp(&env, 1_100);
+    client.mock_all_auths().withdraw(&grant_id, &1_000);
+
+    // 89 days after the withdraw (so last_claim_time = 1_100) – still not 90 days inactive
+    const SECS_89_DAYS: u64 = 89 * 24 * 60 * 60;
+    set_timestamp(&env, 1_100 + SECS_89_DAYS);
+    assert_contract_error(
+        client.try_slash_inactive_grant(&grant_id),
+        Error::GrantNotInactive,
+    );
 fn test_withdraw_converts_to_correct_decimals() {
     // Verify that withdraw returns amounts in correct token decimals
     // (not scaled values)
-    
+
     let env = Env::default();
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
@@ -508,7 +863,7 @@ fn test_withdraw_converts_to_correct_decimals() {
 
     let grant_id: u64 = 103;
     let total_amount: i128 = 1_000; // 10 tokens with 2 decimals
-    
+
     // Simple rate: 10 tokens per second (scaled)
     let scaled_flow_rate: i128 = 10 * SCALING_FACTOR;
 
@@ -524,7 +879,7 @@ fn test_withdraw_converts_to_correct_decimals() {
 
     // Withdraw 300 base units
     client.mock_all_auths().withdraw(&grant_id, &300);
-    
+
     let grant = client.get_grant(&grant_id);
     // Withdrawn should be in original token units, not scaled
     assert_eq!(grant.withdrawn, 300);
@@ -532,8 +887,114 @@ fn test_withdraw_converts_to_correct_decimals() {
 
     // Withdraw remaining
     client.mock_all_auths().withdraw(&grant_id, &200);
-    
+
     let grant_after = client.get_grant(&grant_id);
     assert_eq!(grant_after.withdrawn, 500);
     assert_eq!(grant_after.claimable, 0);
+}
+
+// ── Issue #30 ── Non-Transferable Grantee Roles ─────────────────────────────
+//
+// Criterion 1: there is no transfer_grant / assign_grantee function exposed
+// to the grantee. This is a compile-time guarantee — the GrantContractClient
+// exposes no such methods. The tests below further confirm that withdraw() is
+// strictly bound to the *current* grant.recipient and that only the Admin can
+// change that address via reassign_grantee().
+//
+// Criterion 2: reassign_grantee() is restricted to the DAO Admin.
+
+#[test]
+fn test_reassign_grantee_requires_admin_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 200;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &(5 * SCALING_FACTOR));
+
+    // Call succeeds under mock_all_auths; verify the recorded authorisation
+    // is the Admin — not the recipient, not the attacker.
+    client
+        .mock_all_auths()
+        .reassign_grantee(&grant_id, &recipient, &attacker);
+
+    let auths = env.auths();
+    // Only one auth should have been required
+    assert_eq!(auths.len(), 1);
+    // That auth must belong to the admin
+    assert_eq!(auths[0].0, admin);
+}
+
+#[test]
+fn test_reassign_grantee_rejects_wrong_old_address() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let wrong_old = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 201;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &(5 * SCALING_FACTOR));
+
+    // Passing a `wrong_old` that doesn't match the stored recipient must fail
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_reassign_grantee(&grant_id, &wrong_old, &new_recipient),
+        Error::GranteeMismatch,
+    );
+
+    // Original recipient is untouched
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.recipient, recipient);
+}
+
+#[test]
+fn test_reassign_grantee_transfers_withdraw_right_to_new_recipient() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let original = Address::generate(&env);
+    let new_recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 202;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &original, &1_000, &(10 * SCALING_FACTOR));
+
+    set_timestamp(&env, 10);
+    // 100 tokens have accrued; reassign before any withdrawal
+    client
+        .mock_all_auths()
+        .reassign_grantee(&grant_id, &original, &new_recipient);
+
+    // grant.recipient is now new_recipient
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.recipient, new_recipient);
+
+    // new_recipient can withdraw the accrued amount
+    // (mock_all_auths satisfies the new recipient.require_auth() inside withdraw)
+    client.mock_all_auths().withdraw(&grant_id, &100);
+
+    let after = client.get_grant(&grant_id);
+    assert_eq!(after.withdrawn, 100);
 }
