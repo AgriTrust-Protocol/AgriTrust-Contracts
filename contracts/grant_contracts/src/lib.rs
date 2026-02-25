@@ -82,6 +82,12 @@ pub enum GrantStatus {
     Cancelled,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamType {
+    FixedAmount,
+    FixedEndDate,
+}
 /// 90 days in seconds (inactivity threshold for slash_inactive_grant).
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60; // 7_776_000
 
@@ -101,6 +107,7 @@ pub struct Grant {
     pub effective_timestamp: u64,
     pub status: GrantStatus,
     pub redirect: Option<Address>,
+    pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
 }
@@ -384,6 +391,17 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
     Ok(preview)
 }
 
+fn mint_sbt(env: &Env, recipient: Address, grant_id: u64) {
+    let recipient_key = DataKey::RecipientGrants(recipient);
+    let mut user_grants: Vec<u64> = env
+        .storage()
+        .instance()
+        .get(&recipient_key)
+        .unwrap_or(vec![env]);
+    user_grants.push_back(grant_id);
+    env.storage().instance().set(&recipient_key, &user_grants);
+}
+
 #[contractimpl]
 impl GrantContract {
     pub fn initialize(env: Env, admin: Address, native_token: Address) -> Result<(), Error> {
@@ -453,11 +471,61 @@ impl GrantContract {
             effective_timestamp: 0,
             status: GrantStatus::Active,
             redirect: None,
+            stream_type: StreamType::FixedAmount,
         };
 
         env.storage().instance().set(&key, &grant);
 
         // Mint SBT: Associate grant with recipient
+        mint_sbt(&env, recipient, grant_id);
+
+        Ok(())
+    }
+
+    pub fn create_grant_until(
+        env: Env,
+        grant_id: u64,
+        recipient: Address,
+        flow_rate: i128,
+        end_timestamp: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        if flow_rate < 0 {
+            return Err(Error::InvalidRate);
+        }
+
+        let now = env.ledger().timestamp();
+        if end_timestamp <= now {
+            return Err(Error::InvalidAmount);
+        }
+
+        let duration = end_timestamp - now;
+        let total_amount = flow_rate
+            .checked_mul(duration as i128)
+            .ok_or(Error::MathOverflow)?;
+
+        let key = DataKey::Grant(grant_id);
+        if env.storage().instance().has(&key) {
+            return Err(Error::GrantAlreadyExists);
+        }
+
+        let grant = Grant {
+            recipient: recipient.clone(),
+            total_amount,
+            withdrawn: 0,
+            claimable: 0,
+            flow_rate,
+            last_update_ts: now,
+            rate_updated_at: now,
+            status: GrantStatus::Active,
+            redirect: None,
+            stream_type: StreamType::FixedEndDate,
+        };
+
+        env.storage().instance().set(&key, &grant);
+
+        mint_sbt(&env, recipient, grant_id);
         let recipient_key = DataKey::RecipientGrants(recipient.clone());
         let mut user_grants: Vec<u64> = env
             .storage()
