@@ -3,6 +3,7 @@
 pub mod optimized;
 pub mod benchmarks;
 pub mod self_terminate;
+pub mod multi_token;
 
 // Re-export optimized implementation
 pub use optimized::{
@@ -19,7 +20,15 @@ pub use self_terminate::{
     validate_self_terminate_transition,
 };
 
+// Re-export multi-token implementation
+pub use multi_token::{
+    GrantContract as MultiTokenContract, TokenBalance, TokenWithdrawal, MultiTokenWithdrawResult,
+    MultiTokenGrant, MultiTokenError, create_token_balance, create_token_withdrawal,
+};
+
 #[cfg(test)]
 pub use test_optimized::*;
 #[cfg(test)]
 pub use test_self_terminate::*;
+#[cfg(test)]
+pub use test_multi_token::*;
