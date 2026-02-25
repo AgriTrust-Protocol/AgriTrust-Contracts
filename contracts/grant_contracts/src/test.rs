@@ -1194,6 +1194,9 @@ fn test_sbt_minting_and_metadata() {
     set_timestamp(&env, 1000);
     client.mock_all_auths().initialize(&admin, &native_token);
 
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin);
+
     // Create first grant
     client.mock_all_auths().create_grant(&grant_id_1, &recipient, &total_amount_1, &10);
 
@@ -1226,6 +1229,7 @@ fn test_extreme_network_congestion_6_months() {
     set_timestamp(&env, start_ts);
 
     client.mock_all_auths().initialize(&admin, &native_token);
+    client.mock_all_auths().initialize(&admin);
     client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
 
     // Simulate 6 months gap (182 days = 15,724,800 seconds)

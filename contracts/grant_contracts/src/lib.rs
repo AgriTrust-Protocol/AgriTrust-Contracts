@@ -12,6 +12,7 @@ use soroban_sdk::{
 
 const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec, vec,
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
     Vec,
 pub mod optimized;
@@ -525,12 +526,31 @@ impl GrantContract {
         env.storage().instance().set(&key, &grant);
 
         mint_sbt(&env, recipient, grant_id);
+        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let mut user_grants: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
 
             start_time: now,
             warmup_duration,
         };
 
         env.storage().instance().set(&key, &grant);
+
+        // Mint SBT: Associate grant with recipient
+        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let mut user_grants: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
         let mut ids = read_grant_ids(&env);
         ids.push_back(grant_id);
         env.storage().instance().set(&DataKey::GrantIds, &ids);
