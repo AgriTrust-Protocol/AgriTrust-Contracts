@@ -271,3 +271,32 @@ fn test_withdraw_after_rate_updates_no_extra_withdrawal() {
         Error::InvalidAmount,
     );
 }
+
+#[test]
+fn test_sbt_minting_and_metadata() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id_1: u64 = 101;
+    let total_amount_1: i128 = 1000;
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin);
+
+    // Create first grant
+    client.mock_all_auths().create_grant(&grant_id_1, &recipient, &total_amount_1, &10);
+
+    // Verify SBT minted (grant ID in recipient's list)
+    let grants = client.get_recipient_grants(&recipient);
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants.get(0).unwrap(), grant_id_1);
+
+    // Verify Metadata (via get_grant)
+    let grant_info = client.get_grant(&grant_id_1);
+    assert_eq!(grant_info.total_amount, total_amount_1);
+    assert_eq!(grant_info.status, GrantStatus::Active);
+}
