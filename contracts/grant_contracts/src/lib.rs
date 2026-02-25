@@ -62,6 +62,8 @@ enum DataKey {
     Admin,
     /// Token used for grants; allocated funds are measured in this token.
     GrantToken,
+    /// All grant IDs ever created (for computing total_allocated_funds).
+    GrantIds,
     /// DAO treasury; slashed funds are sent here.
     Treasury,
     /// All grant IDs ever created (for computing total_allocated_funds).
@@ -83,6 +85,8 @@ pub enum Error {
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
+    /// Rescue amount would leave less than total allocated funds in the contract.
+    RescueWouldViolateAllocated = 10,
     GranteeMismatch = 10,
     /// Rescue amount would leave less than total allocated funds in the contract.
     RescueWouldViolateAllocated = 10,
@@ -295,6 +299,7 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
 
 #[contractimpl]
 impl GrantContract {
+    pub fn initialize(env: Env, admin: Address, grant_token: Address) -> Result<(), Error> {
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -308,6 +313,9 @@ impl GrantContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage()
             .instance()

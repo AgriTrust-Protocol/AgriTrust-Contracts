@@ -39,6 +39,7 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     let rate_2: i128 = 25 * SCALING_FACTOR;
 
     set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
     client.mock_all_auths().initialize(&admin, &oracle);
     client
@@ -131,6 +132,8 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
 
     let grant_id: u64 = 3;
 
+    set_timestamp(&env, 100);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     set_timestamp(&env, 1_000);
     client.mock_all_auths().initialize(&admin, &oracle);
     client
@@ -219,6 +222,8 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     set_timestamp(&env, 0);
     client.mock_all_auths().initialize(&admin, &oracle);
 
+    set_timestamp(&env, 2_000);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     set_timestamp(&env, 1_000);
     client.mock_all_auths().initialize(&admin);
     client
@@ -310,6 +315,8 @@ fn test_update_rate_uses_timelocked_behavior() {
 
     let grant_id: u64 = 8;
 
+    set_timestamp(&env, 10);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     set_timestamp(&env, 100);
     client.mock_all_auths().initialize(&admin);
     client
@@ -367,6 +374,7 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     assert_eq!(auths.len(), 1);
     assert_eq!(auths[0].0, admin);
     set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
     set_timestamp(&env, 0);
     client.mock_all_auths().initialize(&admin, &oracle);
@@ -443,6 +451,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let client = GrantContractClient::new(&env, &contract_id);
 
     set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
     client.mock_all_auths().initialize(&admin, &oracle);
 
@@ -524,6 +533,7 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     let grant_id: u64 = 14;
 
     set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin, &grant_token);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
     client.mock_all_auths().initialize(&admin, &oracle);
     client
@@ -612,11 +622,47 @@ fn test_rescue_tokens_rejects_invalid_amount() {
             .try_rescue_tokens(&grant_token, &0, &to),
         Error::InvalidAmount,
     );
+}
+
+#[test]
+fn test_rescue_tokens_requires_admin_auth() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin, &grant_token);
+    // Calling rescue_tokens without admin auth must fail (auth or NotAuthorized).
+    assert!(client.try_rescue_tokens(&grant_token, &100, &to).is_err());
+}
+
+#[test]
+fn test_rescue_tokens_rejects_invalid_amount() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let grant_token = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    client.mock_all_auths().initialize(&admin, &grant_token);
+    assert_contract_error(
+        client
+            .mock_all_auths()
+            .try_rescue_tokens(&grant_token, &0, &to),
+        Error::InvalidAmount,
+    );
     assert_contract_error(
         client
             .mock_all_auths()
             .try_rescue_tokens(&grant_token, &-1_i128, &to),
         Error::InvalidAmount,
+    );
+}
 /// Tests for low-decimal tokens (Issue #18: High-Precision Flow Rates)
 /// These tests verify that the scaling factor prevents zero flow rates
 /// when dealing with tokens that have few decimal places.
