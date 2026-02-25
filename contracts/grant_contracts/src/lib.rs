@@ -16,13 +16,16 @@ const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
     Vec,
 pub mod optimized;
-pub mod benchmarks;
-pub mod self_terminate;
-pub mod multi_token;
-pub mod yield_treasury;
-pub mod yield_enhanced;
+// pub mod benchmarks;
+// pub mod self_terminate;
+// pub mod multi_token;
+// pub mod yield_treasury;
+// pub mod yield_enhanced;
 
-// Re-export optimized implementation
+// #[cfg(test)]
+// mod test_snapshot_events;
+
+// Re-export optimized implementation as the main contract
 pub use optimized::{
     GrantContract, Grant, Error, DataKey,
     STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED,

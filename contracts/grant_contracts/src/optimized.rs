@@ -1,5 +1,3 @@
-#![no_std]
-
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
 };
@@ -71,33 +69,31 @@ pub enum Error {
     InvalidStatusTransition = 10, // New error for invalid status transitions
 }
 
-fn read_admin(env: &Env) -> Result<Address, Error> {
+pub fn read_admin(env: &Env) -> Result<Address, Error> {
     env.storage()
         .instance()
         .get(&DataKey::Admin)
         .ok_or(Error::NotInitialized)
 }
 
-fn require_admin_auth(env: &Env) -> Result<(), Error> {
+pub fn require_admin_auth(env: &Env) -> Result<(), Error> {
     let admin = read_admin(env)?;
     admin.require_auth();
     Ok(())
 }
 
-fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
+pub fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
     env.storage()
         .instance()
         .get(&DataKey::Grant(grant_id))
         .ok_or(Error::GrantNotFound)
 }
 
-fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+pub fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
     env.storage().instance().set(&DataKey::Grant(grant_id), grant);
 }
 
-// Status transition validation using bitwise operations
-fn validate_status_transition(current_mask: u32, new_mask: u32) -> Result<(), Error> {
-    // Can't transition from completed or cancelled states
+pub fn validate_status_transition(current_mask: u32, new_mask: u32) -> Result<(), Error> {
     if has_status(current_mask, STATUS_COMPLETED) || has_status(current_mask, STATUS_CANCELLED) {
         return Err(Error::InvalidStatusTransition);
     }
@@ -129,7 +125,7 @@ fn validate_status_transition(current_mask: u32, new_mask: u32) -> Result<(), Er
     }
 }
 
-fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
+pub fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts {
         return Err(Error::InvalidState);
     }
@@ -197,6 +193,13 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
     Ok(preview)
 }
 
+fn emit_grant_snapshot(env: &Env, grant_id: u64, grant: &Grant) {
+    env.events().publish(
+        (symbol_short!("snapshot"), grant_id),
+        (grant.flow_rate, grant.claimable, grant.status_mask, grant.last_update_ts),
+    );
+}
+
 #[contractimpl]
 impl GrantContract {
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
@@ -247,6 +250,7 @@ impl GrantContract {
         };
 
         env.storage().instance().set(&key, &grant);
+        emit_grant_snapshot(&env, grant_id, &grant);
         Ok(())
     }
 
@@ -265,6 +269,7 @@ impl GrantContract {
         grant.flow_rate = 0; // Stop flow rate
 
         write_grant(&env, grant_id, &grant);
+        emit_grant_snapshot(&env, grant_id, &grant);
         Ok(())
     }
 
@@ -279,13 +284,14 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        let new_mask = set_status(current_mask, STATUS_PAUSED);
+        let mut new_mask = set_status(current_mask, STATUS_PAUSED);
         new_mask = clear_status(new_mask, STATUS_ACTIVE);
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
         grant.status_mask = new_mask;
 
         write_grant(&env, grant_id, &grant);
+        emit_grant_snapshot(&env, grant_id, &grant);
         Ok(())
     }
 
@@ -300,13 +306,14 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        let new_mask = set_status(current_mask, STATUS_ACTIVE);
+        let mut new_mask = set_status(current_mask, STATUS_ACTIVE);
         new_mask = clear_status(new_mask, STATUS_PAUSED);
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
         grant.status_mask = new_mask;
 
         write_grant(&env, grant_id, &grant);
+        emit_grant_snapshot(&env, grant_id, &grant);
         Ok(())
     }
 
@@ -412,6 +419,7 @@ impl GrantContract {
         }
 
         write_grant(&env, grant_id, &grant);
+        Ok(())
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -446,6 +454,7 @@ impl GrantContract {
             (symbol_short!("rateupdt"), grant_id),
             (old_rate, new_rate, grant.rate_updated_at),
         );
+        emit_grant_snapshot(&env, grant_id, &grant);
 
         Ok(())
     }
