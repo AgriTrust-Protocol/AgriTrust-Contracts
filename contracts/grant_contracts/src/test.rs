@@ -469,6 +469,9 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
 
 #[test]
 fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
+}
+
+#[test]
 fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -1258,6 +1261,9 @@ fn test_streaming_to_staking_redirect() {
     let grant_id: u64 = 50;
     let total_amount: i128 = 1000;
     let flow_rate: i128 = 10;
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin);
     let native_token = Address::generate(&env);
 
     set_timestamp(&env, 1000);

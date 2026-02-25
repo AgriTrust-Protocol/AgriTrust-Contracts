@@ -8,8 +8,15 @@ use soroban_sdk::{
 use super::optimized::{
     GrantContract, Grant, Error, DataKey, read_grant, write_grant, settle_grant,
     STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED,
-    has_status, set_status, clear_status, read_admin,
+    has_status, set_status, clear_status, read_admin, require_admin_auth,
 };
+
+fn emit_multi_token_snapshot(env: &Env, grant_id: u64, grant: &MultiTokenGrant) {
+    env.events().publish(
+        (symbol_short!("mt_snapshot"), grant_id),
+        (grant.tokens.len(), grant.status_mask, grant.last_update_ts),
+    );
+}
 
 /// Token balance structure for multi-token support
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +125,7 @@ impl GrantContract {
             (symbol_short!("multi_create"), grant_id),
             (recipient, multi_token_grant.tokens.len(), now),
         );
+        emit_multi_token_snapshot(&env, grant_id, &multi_token_grant);
 
         Ok(())
     }
@@ -253,6 +261,7 @@ impl GrantContract {
             (symbol_short!("multi_rateupdt"), grant_id),
             (token_updates.len(), grant.rate_updated_at),
         );
+        emit_multi_token_snapshot(&env, grant_id, &grant);
 
         Ok(())
     }

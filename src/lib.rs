@@ -1,7 +1,1 @@
-#![allow(unexpected_cfgs)]
-#![no_std]
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// This file is intentionally left empty as the main contract logic is in contracts/grant_contracts/src/lib.rs
