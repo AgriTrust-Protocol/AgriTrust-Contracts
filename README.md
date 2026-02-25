@@ -1,5 +1,3 @@
-# Grant Contract
-
 ## Deployed Contract
 
 - **Network:** Stellar Testnet

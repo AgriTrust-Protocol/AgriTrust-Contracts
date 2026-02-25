@@ -237,6 +237,16 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             .checked_add(post_accrued)
             .ok_or(Error::MathOverflow)?;
     }
+    let elapsed_i128 = i128::from(elapsed);
+    // Flow rate is stored as a scaled value, so we divide by SCALING_FACTOR
+    // to get the actual accrued amount in token units
+    let scaled_accrued = grant
+        .flow_rate
+        .checked_mul(elapsed_i128)
+        .ok_or(Error::MathOverflow)?;
+    let accrued = scaled_accrued
+        .checked_div(SCALING_FACTOR)
+        .ok_or(Error::MathOverflow)?;
 
     let accounted = grant
         .withdrawn
@@ -523,6 +533,9 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
+        Self::propose_rate_change(env, grant_id, new_rate)
+    }
     /// Emergency function: DAO Admin can reassign a grantee's recipient address.
 /// Strictly restricted to the Admin — grantees have zero access to this.
 /// Intended only for key-loss recovery scenarios.
