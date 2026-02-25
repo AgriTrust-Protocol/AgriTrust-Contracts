@@ -16,6 +16,14 @@ use soroban_sdk::{
     vec,
     Address,
     Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    vec,
+};
+
+const XLM_DECIMALS: u32 = 7;
+const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec, vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
     Vec,
 };
 
@@ -26,8 +34,16 @@ pub mod multi_token;
 pub mod yield_treasury;
 pub mod yield_enhanced;
 pub mod governance;
+// pub mod benchmarks;
+// pub mod self_terminate;
+// pub mod multi_token;
+// pub mod yield_treasury;
+// pub mod yield_enhanced;
 
-// Re-export optimized implementation
+// #[cfg(test)]
+// mod test_snapshot_events;
+
+// Re-export optimized implementation as the main contract
 pub use optimized::{
     GrantContract,
     Grant,
@@ -132,6 +148,12 @@ pub enum GrantStatus {
     Cancelled,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamType {
+    FixedAmount,
+    FixedEndDate,
+}
 /// 90 days in seconds (inactivity threshold for slash_inactive_grant).
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60; // 7_776_000
 
@@ -150,6 +172,8 @@ pub struct Grant {
     pub pending_rate: i128,
     pub effective_timestamp: u64,
     pub status: GrantStatus,
+    pub redirect: Option<Address>,
+    pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
 }
@@ -166,6 +190,8 @@ enum DataKey {
     Treasury,
     Oracle,
     Grant(u64),
+    RecipientGrants(Address),
+    NativeToken,
 }
 
 #[contracterror]
@@ -181,6 +207,7 @@ pub enum Error {
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
+    InsufficientReserve = 10,
     /// Rescue amount would leave less than total allocated funds in the contract.
     RescueWouldViolateAllocated = 10,
     GranteeMismatch = 11,
@@ -372,8 +399,21 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
     Ok(preview)
 }
 
+fn mint_sbt(env: &Env, recipient: Address, grant_id: u64) {
+    let recipient_key = DataKey::RecipientGrants(recipient);
+    let mut user_grants: Vec<u64> = env
+        .storage()
+        .instance()
+        .get(&recipient_key)
+        .unwrap_or(vec![env]);
+    user_grants.push_back(grant_id);
+    env.storage().instance().set(&recipient_key, &user_grants);
+}
+
 #[contractimpl]
 impl GrantContract {
+    pub fn initialize(env: Env, admin: Address, native_token: Address) -> Result<(), Error> {
+    pub fn initialize(env: Env, admin: Address, grant_token: Address) -> Result<(), Error> {
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -386,6 +426,8 @@ impl GrantContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+
         env.storage().instance().set(&DataKey::GrantToken, &grant_token);
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Treasury, &treasury);
@@ -430,11 +472,87 @@ impl GrantContract {
             pending_rate: 0,
             effective_timestamp: 0,
             status: GrantStatus::Active,
+            redirect: None,
+            stream_type: StreamType::FixedAmount,
+        };
+
+        env.storage().instance().set(&key, &grant);
+
+        // Mint SBT: Associate grant with recipient
+        mint_sbt(&env, recipient, grant_id);
+
+        Ok(())
+    }
+
+    pub fn create_grant_until(
+        env: Env,
+        grant_id: u64,
+        recipient: Address,
+        flow_rate: i128,
+        end_timestamp: u64,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        if flow_rate < 0 {
+            return Err(Error::InvalidRate);
+        }
+
+        let now = env.ledger().timestamp();
+        if end_timestamp <= now {
+            return Err(Error::InvalidAmount);
+        }
+
+        let duration = end_timestamp - now;
+        let total_amount = flow_rate
+            .checked_mul(duration as i128)
+            .ok_or(Error::MathOverflow)?;
+
+        let key = DataKey::Grant(grant_id);
+        if env.storage().instance().has(&key) {
+            return Err(Error::GrantAlreadyExists);
+        }
+
+        let grant = Grant {
+            recipient: recipient.clone(),
+            total_amount,
+            withdrawn: 0,
+            claimable: 0,
+            flow_rate,
+            last_update_ts: now,
+            rate_updated_at: now,
+            status: GrantStatus::Active,
+            redirect: None,
+            stream_type: StreamType::FixedEndDate,
+        };
+
+        env.storage().instance().set(&key, &grant);
+
+        mint_sbt(&env, recipient, grant_id);
+        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let mut user_grants: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
             start_time: now,
             warmup_duration,
         };
 
         env.storage().instance().set(&key, &grant);
+
+        // Mint SBT: Associate grant with recipient
+        let recipient_key = DataKey::RecipientGrants(recipient.clone());
+        let mut user_grants: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
         let mut ids = read_grant_ids(&env);
         ids.push_back(grant_id);
         env.storage().instance().set(&DataKey::GrantIds, &ids);
@@ -501,6 +619,13 @@ impl GrantContract {
         if grant.withdrawn == grant.total_amount {
             grant.status = GrantStatus::Completed;
         }
+
+        write_grant(&env, grant_id, &grant);
+
+        // In a real implementation with token support, we would transfer 'amount' to:
+        // let target = grant.redirect.unwrap_or(grant.recipient);
+        // let token_client = token::Client::new(&env, &token_address);
+        // token_client.transfer(&env.current_contract_address(), &target, &amount);
 
         grant.last_claim_time = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
@@ -598,6 +723,25 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn set_redirect(env: Env, grant_id: u64, new_redirect: Option<Address>) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        grant.redirect = new_redirect;
+        write_grant(&env, grant_id, &grant);
+
+        Ok(())
+    }
+
+    pub fn get_recipient_grants(env: Env, recipient: Address) -> Vec<u64> {
+        let key = DataKey::RecipientGrants(recipient);
+        env.storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(vec![&env])
+    }
+
+    pub fn admin_withdraw(env: Env, amount: i128) -> Result<(), Error> {
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
         Self::propose_rate_change(env, grant_id, new_rate)
     }
@@ -651,6 +795,20 @@ impl GrantContract {
             return Err(Error::InvalidAmount);
         }
 
+        let native_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::NativeToken)
+            .ok_or(Error::NotInitialized)?;
+        let token_client = token::Client::new(&env, &native_token);
+        let balance = token_client.balance(&env.current_contract_address());
+
+        if balance.checked_sub(amount).ok_or(Error::MathOverflow)? < RENT_RESERVE_XLM {
+            return Err(Error::InsufficientReserve);
+        }
+
+        let admin = read_admin(&env)?;
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
         let contract = env.current_contract_address();
         let client = token::Client::new(&env, &token_address);
         let contract_balance = client.balance(&contract);
