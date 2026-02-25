@@ -8,6 +8,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
     Vec,
+};
 pub mod optimized;
 pub mod benchmarks;
 pub mod self_terminate;
@@ -128,11 +129,9 @@ pub enum Error {
     MathOverflow = 9,
     /// Rescue amount would leave less than total allocated funds in the contract.
     RescueWouldViolateAllocated = 10,
-    GranteeMismatch = 10,
-    /// Rescue amount would leave less than total allocated funds in the contract.
-    RescueWouldViolateAllocated = 10,
+    GranteeMismatch = 11,
     /// Grant has been active (claimed) within the inactivity threshold; cannot slash yet.
-    GrantNotInactive = 11,
+    GrantNotInactive = 12,
 }
 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
@@ -212,9 +211,6 @@ fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
         }
     }
     Ok(total)
-    env.storage()
-        .instance()
-        .set(&DataKey::Grant(grant_id), grant);
 }
 
 
@@ -309,14 +305,13 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     let elapsed_i128 = i128::from(elapsed);
     
     // Calculate accrued amount with warmup multiplier
-    let base_accrued = grant
     // Flow rate is stored as a scaled value, so we divide by SCALING_FACTOR
     // to get the actual accrued amount in token units
     let scaled_accrued = grant
         .flow_rate
         .checked_mul(elapsed_i128)
         .ok_or(Error::MathOverflow)?;
-    let accrued = scaled_accrued
+    let base_accrued = scaled_accrued
         .checked_div(SCALING_FACTOR)
         .ok_or(Error::MathOverflow)?;
 
@@ -375,14 +370,13 @@ fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
 
 #[contractimpl]
 impl GrantContract {
-    pub fn initialize(env: Env, admin: Address, grant_token: Address) -> Result<(), Error> {
     pub fn initialize(
         env: Env,
         admin: Address,
         grant_token: Address,
         treasury: Address,
+        oracle_address: Address,
     ) -> Result<(), Error> {
-    pub fn initialize(env: Env, admin: Address, oracle_address: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -393,9 +387,6 @@ impl GrantContract {
             .instance()
             .set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Treasury, &treasury);
-        env.storage()
-            .instance()
-            .set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage()
             .instance()
             .set(&DataKey::Oracle, &oracle_address);
@@ -521,6 +512,10 @@ impl GrantContract {
 
         grant.last_claim_time = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
+
+        // Try to notify the recipient; silently ignore errors based on interface expectation
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+
         Ok(())
     }
 
@@ -562,8 +557,6 @@ impl GrantContract {
             client.transfer(&contract, &treasury, remaining);
         }
 
-        Ok(())
-        write_grant(&env, grant_id, &grant);
         Ok(())
     }
 
@@ -656,6 +649,10 @@ impl GrantContract {
         env.events().publish(
             (symbol_short!("reasign"), grant_id),
             (old, new, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
     /// Rescue stray tokens sent directly to the contract. Admin-only. Ensures contract_balance - amount >= total_allocated_funds for the grant token.
     pub fn rescue_tokens(
         env: Env,
@@ -687,6 +684,9 @@ impl GrantContract {
         }
 
         client.transfer(&contract, &to, amount);
+        Ok(())
+    }
+
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
         Self::propose_rate_change(env, grant_id, new_rate)
     }
@@ -734,6 +734,16 @@ impl GrantContract {
 
         Ok(())
     }
+}
+
+fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
+    use soroban_sdk::{IntoVal, Symbol};
+    let args = (grant_id, amount).into_val(env);
+    let _: Result<Result<(), _>, _> = env.try_invoke_contract(
+        recipient,
+        &Symbol::new(env, "on_withdraw"),
+        args,
+    );
 }
 
 mod test;
