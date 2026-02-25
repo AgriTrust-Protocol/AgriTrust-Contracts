@@ -28,7 +28,7 @@ pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
 pub struct GrantContract;
 
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum GrantStatus {
     Active,
@@ -83,6 +83,7 @@ pub enum Error {
     InvalidAmount = 7,
     InvalidState = 8,
     MathOverflow = 9,
+    GranteeMismatch = 10,
     /// Rescue amount would leave less than total allocated funds in the contract.
     RescueWouldViolateAllocated = 10,
     /// Grant has been active (claimed) within the inactivity threshold; cannot slash yet.
@@ -522,6 +523,39 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Emergency function: DAO Admin can reassign a grantee's recipient address.
+/// Strictly restricted to the Admin — grantees have zero access to this.
+/// Intended only for key-loss recovery scenarios.
+///
+/// # Arguments
+/// * `grant_id` — the grant whose recipient is being replaced
+/// * `old`      — must match the currently stored recipient (prevents accidental
+///                overwrites when multiple admins race on the same grant)
+/// * `new`      — the replacement address that will own all future withdrawals
+    pub fn reassign_grantee(
+        env: Env,
+        grant_id: u64,
+        old: Address,
+        new: Address,
+    ) -> Result<(), Error> {
+        // Only the DAO Admin may call this — grantees have no path to this function
+        require_admin_auth(&env)?;
+
+        let mut grant = read_grant(&env, grant_id)?;
+
+        // Verify `old` matches the actual current recipient.
+        // This acts as an optimistic-lock: prevents clobbering a grant that was
+        // already reassigned by a concurrent admin transaction.
+        if grant.recipient != old {
+            return Err(Error::GranteeMismatch);
+        }
+
+        grant.recipient = new.clone();
+        write_grant(&env, grant_id, &grant);
+
+        env.events().publish(
+            (symbol_short!("reasign"), grant_id),
+            (old, new, env.ledger().timestamp()),
     /// Rescue stray tokens sent directly to the contract. Admin-only. Ensures contract_balance - amount >= total_allocated_funds for the grant token.
     pub fn rescue_tokens(
         env: Env,
