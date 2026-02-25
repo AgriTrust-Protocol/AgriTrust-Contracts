@@ -332,3 +332,44 @@ fn test_extreme_network_congestion_6_months() {
     assert_eq!(claimable, expected);
     // Implicitly asserts loss < 0.00001% since it is 0.
 }
+
+#[test]
+fn test_streaming_to_staking_redirect() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let staking_pool = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 50;
+    let total_amount: i128 = 1000;
+    let flow_rate: i128 = 10;
+
+    set_timestamp(&env, 1000);
+    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
+
+    // Set redirect
+    client.mock_all_auths().set_redirect(&grant_id, &Some(staking_pool.clone()));
+
+    // Verify redirect is set
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.redirect, Some(staking_pool.clone()));
+
+    // Advance time and withdraw
+    set_timestamp(&env, 1050); // 50 seconds * 10 = 500 claimable
+    
+    // Withdraw should succeed (logic only in this mock)
+    client.mock_all_auths().withdraw(&grant_id, &500);
+
+    let grant_after = client.get_grant(&grant_id);
+    assert_eq!(grant_after.withdrawn, 500);
+    assert_eq!(grant_after.claimable, 0);
+    
+    // Clear redirect
+    client.mock_all_auths().set_redirect(&grant_id, &None);
+    let grant_cleared = client.get_grant(&grant_id);
+    assert_eq!(grant_cleared.redirect, None);
+}

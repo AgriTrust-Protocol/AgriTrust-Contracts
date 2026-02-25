@@ -26,6 +26,7 @@ pub struct Grant {
     pub last_update_ts: u64,
     pub rate_updated_at: u64,
     pub status: GrantStatus,
+    pub redirect: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -181,6 +182,7 @@ impl GrantContract {
             last_update_ts: now,
             rate_updated_at: now,
             status: GrantStatus::Active,
+            redirect: None,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -299,6 +301,16 @@ impl GrantContract {
             (symbol_short!("rateupdt"), grant_id),
             (old_rate, new_rate, grant.rate_updated_at),
         );
+
+        Ok(())
+    }
+
+    pub fn set_redirect(env: Env, grant_id: u64, new_redirect: Option<Address>) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        grant.redirect = new_redirect;
+        write_grant(&env, grant_id, &grant);
 
         Ok(())
     }
