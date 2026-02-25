@@ -44,6 +44,7 @@ fn test_propose_rate_change_sets_pending_rate_and_effective_timestamp() {
     client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &rate_1, &0);
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
 
     set_timestamp(&env, 1_100);
@@ -138,6 +139,7 @@ fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &5, &0);
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
 
     set_timestamp(&env, 1_100);
@@ -228,6 +230,7 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &5_000, &4, &0);
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
 
     set_timestamp(&env, 1_100);
@@ -321,6 +324,7 @@ fn test_update_rate_uses_timelocked_behavior() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &3, &0);
         .create_grant(&grant_id, &recipient, &1_000, &5);
     set_timestamp(&env, 10);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
@@ -410,6 +414,7 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
     client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &20_000, &4, &0);
         .create_grant(&grant_id, &recipient, &50_000_000, &10);
 
     set_timestamp(&env, 100);
@@ -459,6 +464,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let invalid_multiplier_grant: u64 = 11;
     client
         .mock_all_auths()
+        .create_grant(&negative_rate_grant, &recipient, &1_000, &5, &0);
         .create_grant(&invalid_multiplier_grant, &recipient, &1_000, &5);
         .create_grant(&negative_rate_grant, &recipient, &1_000, &(5 * SCALING_FACTOR));
     assert_contract_error(
@@ -482,6 +488,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let cancelled_grant: u64 = 12;
     client
         .mock_all_auths()
+        .create_grant(&cancelled_grant, &recipient, &1_000, &5, &0);
         .create_grant(&cancelled_grant, &recipient, &1_000, &(5 * SCALING_FACTOR));
     client.mock_all_auths().cancel_grant(&cancelled_grant);
     assert_contract_error(
@@ -499,6 +506,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let completed_grant: u64 = 13;
     client
         .mock_all_auths()
+        .create_grant(&completed_grant, &recipient, &100, &10, &0);
         .create_grant(&completed_grant, &recipient, &100, &(10 * SCALING_FACTOR));
     set_timestamp(&env, 10);
     // 10 seconds * 10 tokens/sec = 100 tokens (full amount)
@@ -538,6 +546,7 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     client.mock_all_auths().initialize(&admin, &oracle);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &10, &0);
         .create_grant(&grant_id, &recipient, &5_000_000, &2);
         .create_grant(&grant_id, &recipient, &500_000_000, &10);
 
@@ -663,6 +672,9 @@ fn test_rescue_tokens_rejects_invalid_amount() {
         Error::InvalidAmount,
     );
 }
+
+#[test]
+fn test_warmup_period_linear_scaling() {
 /// Tests for low-decimal tokens (Issue #18: High-Precision Flow Rates)
 /// These tests verify that the scaling factor prevents zero flow rates
 /// when dealing with tokens that have few decimal places.
@@ -678,6 +690,54 @@ fn test_low_decimal_token_2_decimals_1_year() {
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
 
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 100;
+    let flow_rate: i128 = 100; // 100 tokens per second at full rate
+    let warmup_duration: u64 = 30; // 30 seconds warmup
+
+    set_timestamp(&env, 1_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &100_000, &flow_rate, &warmup_duration);
+
+    // At start (t=0 of warmup): should be 25% of flow rate
+    set_timestamp(&env, 1_000);
+    assert_eq!(client.claimable(&grant_id), 0);
+
+    // After 1 second: 25% rate = 25 tokens
+    set_timestamp(&env, 1_001);
+    assert_eq!(client.claimable(&grant_id), 25);
+
+    // At midpoint (t=15): should be ~62.5% of flow rate
+    // 15 seconds at ramping rate
+    set_timestamp(&env, 1_015);
+    let claimable_at_15 = client.claimable(&grant_id);
+    // Expected: roughly 25% for 0s + ramp from 25% to 62.5% over 15s
+    // Approximate: (25 + 62.5) / 2 * 15 = 656.25
+    assert!(claimable_at_15 >= 650 && claimable_at_15 <= 660);
+
+    // After warmup period (t=30): should be at 100% rate
+    set_timestamp(&env, 1_030);
+    let claimable_at_30 = client.claimable(&grant_id);
+    // Expected: average rate over 30s warmup ≈ (25% + 100%) / 2 = 62.5% avg
+    // 30 * 100 * 0.625 = 1875
+    assert!(claimable_at_30 >= 1850 && claimable_at_30 <= 1900);
+
+    // After warmup (t=40): should accrue at full 100% rate
+    set_timestamp(&env, 1_040);
+    let claimable_at_40 = client.claimable(&grant_id);
+    // Previous + 10 seconds at 100% = claimable_at_30 + 1000
+    assert!(claimable_at_40 >= claimable_at_30 + 1000);
+}
+
+#[test]
+fn test_no_warmup_period() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
@@ -766,6 +826,25 @@ fn test_slash_inactive_grant_reverts_if_not_active() {
     let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
+    let grant_id: u64 = 101;
+    let flow_rate: i128 = 50;
+
+    set_timestamp(&env, 2_000);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &10_000, &flow_rate, &0);
+
+    // With warmup_duration = 0, should accrue at full rate immediately
+    set_timestamp(&env, 2_010);
+    assert_eq!(client.claimable(&grant_id), 500);
+
+    set_timestamp(&env, 2_020);
+    assert_eq!(client.claimable(&grant_id), 1_000);
+}
+
+#[test]
+fn test_warmup_with_withdrawal() {
     let grant_id: u64 = 11;
     set_timestamp(&env, 1_000);
     client.mock_all_auths().initialize(&admin, &grant_token, &treasury);
@@ -829,6 +908,12 @@ fn test_high_precision_long_duration_10_years() {
     let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
 
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 102;
+    let flow_rate: i128 = 100;
+    let warmup_duration: u64 = 20;
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(&env, &contract_id);
 
@@ -842,6 +927,22 @@ fn test_high_precision_long_duration_10_years() {
     client.mock_all_auths().initialize(&admin);
     client
         .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &50_000, &flow_rate, &warmup_duration);
+
+    // Accrue during warmup
+    set_timestamp(&env, 10);
+    let claimable_at_10 = client.claimable(&grant_id);
+    assert!(claimable_at_10 > 0);
+
+    // Withdraw during warmup
+    client.mock_all_auths().withdraw(&grant_id, &claimable_at_10);
+    assert_eq!(client.claimable(&grant_id), 0);
+
+    // Continue accruing after warmup
+    set_timestamp(&env, 30);
+    let claimable_at_30 = client.claimable(&grant_id);
+    // 10 seconds at full rate = 1000
+    assert_eq!(claimable_at_30, 1_000);
         .create_grant(&grant_id, &recipient, &total_amount, &scaled_flow_rate);
 
     // After 5 years
