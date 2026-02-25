@@ -2,9 +2,9 @@ name: Grant Smart Contract Tests
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -27,10 +27,12 @@ jobs:
         run: |
           wget https://github.com/stellar/stellar-cli/releases/download/v25.1.0/stellar-cli-25.1.0-x86_64-unknown-linux-gnu.tar.gz
           tar -xzf stellar-cli-25.1.0-x86_64-unknown-linux-gnu.tar.gz
-          sudo mv stellar-cli-25.1.0-x86_64-unknown-linux-gnu/stellar /usr/local/bin/
+          sudo mv stellar /usr/local/bin/ || sudo mv stellar-cli-25.1.0-x86_64-unknown-linux-gnu/stellar /usr/local/bin/ || (ls -la && exit 1)
 
       - name: Build Contract
         run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: contracts/grant_contracts
 
       - name: Run Unit Tests
         run: cargo test
+        working-directory: contracts/grant_contracts
