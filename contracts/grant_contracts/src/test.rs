@@ -444,7 +444,6 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
 
 #[test]
 fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
-fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let oracle = Address::generate(&env);
