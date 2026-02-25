@@ -1174,3 +1174,35 @@ fn test_sbt_minting_and_metadata() {
     assert_eq!(grant_info.total_amount, total_amount_1);
     assert_eq!(grant_info.status, GrantStatus::Active);
 }
+
+#[test]
+fn test_extreme_network_congestion_6_months() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register_contract(None, GrantContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 42;
+    let total_amount: i128 = 1_000_000_000_000_000; // 100M tokens
+    let flow_rate: i128 = 10_000_000; // 1 token/sec
+
+    let start_ts = 1_000_000;
+    set_timestamp(&env, start_ts);
+
+    client.mock_all_auths().initialize(&admin);
+    client.mock_all_auths().create_grant(&grant_id, &recipient, &total_amount, &flow_rate);
+
+    // Simulate 6 months gap (182 days = 15,724,800 seconds)
+    let gap_seconds = 15_724_800;
+    let new_timestamp = start_ts + gap_seconds;
+    set_timestamp(&env, new_timestamp);
+
+    let claimable = client.claimable(&grant_id);
+    let expected = flow_rate * (gap_seconds as i128);
+
+    // Assert precision: Integer math ensures 0 precision loss here
+    assert_eq!(claimable, expected);
+    // Implicitly asserts loss < 0.00001% since it is 0.
+}
