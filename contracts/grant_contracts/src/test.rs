@@ -1190,6 +1190,95 @@ fn test_clawback_prohibited_if_milestone_met_or_too_early() {
     );
 }
 
+// ── Issue #39 ── "Rage Quit" for Grantees ──────────────────────────────────────
+
+#[test]
+fn test_rage_quit_claims_all_claimable_when_paused() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 500;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &flow_rate);
+
+    // Let funds accrue and then pause
+    set_timestamp(&env, 50);
+    let claimable_before_pause = client.claimable(&grant_id);
+    assert!(claimable_before_pause > 0);
+
+    client.mock_all_auths().pause_grant(&grant_id);
+
+    // Rage quit as grantee; should claim all accrued
+    client.mock_all_auths().rage_quit(&grant_id);
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.withdrawn, claimable_before_pause);
+    assert_eq!(grant.claimable, 0);
+}
+
+#[test]
+fn test_rage_quit_fails_if_not_paused() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 501;
+    let flow_rate: i128 = 5 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &500, &flow_rate);
+
+    // Try to rage quit while grant is active (not paused)
+    assert_contract_error(
+        client.mock_all_auths().try_rage_quit(&grant_id),
+        Error::InvalidState,
+    );
+}
+
+#[test]
+fn test_rage_quit_prevents_admin_resume() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 502;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &flow_rate);
+
+    set_timestamp(&env, 30);
+    client.mock_all_auths().pause_grant(&grant_id);
+    client.mock_all_auths().rage_quit(&grant_id);
+
+    // Try to resume should fail because grant is now completed and rage quit
+    assert_contract_error(
+        client.mock_all_auths().try_resume_grant(&grant_id),
+        Error::InvalidState,
+    );
+
+    // Grant is now permanently closed
+    let grant = client.get_grant(&grant_id);
+    assert!(grant.status == GrantStatus::Completed);
+}
+
 // ── Issue #30 ── Non-Transferable Grantee Roles ─────────────────────────────
 //
 // Criterion 1: there is no transfer_grant / assign_grantee function exposed

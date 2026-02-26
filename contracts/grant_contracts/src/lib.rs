@@ -57,6 +57,7 @@ pub use optimized::{
     STATUS_MILESTONE_BASED,
     STATUS_AUTO_RENEW,
     STATUS_EMERGENCY_PAUSE,
+    STATUS_RAGE_QUIT,
     has_status,
     set_status,
     clear_status,
