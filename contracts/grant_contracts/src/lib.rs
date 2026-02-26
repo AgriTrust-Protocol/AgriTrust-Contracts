@@ -21,11 +21,7 @@ use soroban_sdk::{
 };
 
 const XLM_DECIMALS: u32 = 7;
-const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec, vec,
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
-    Vec,
-};
+const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
 
 pub mod optimized;
 pub mod benchmarks;

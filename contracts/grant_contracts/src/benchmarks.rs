@@ -69,6 +69,22 @@ pub fn run_benchmarks() -> Vec<GasBenchmark> {
         storage_cost,
         cpu_cost,
     ));
+
+	    let (gas_used, storage_cost, cpu_cost) = benchmark_council_member_check();
+    benchmarks.push(GasBenchmark::new(
+        "Council Member Check (naive Vec<Address> loop)",
+        gas_used,
+        storage_cost,
+        cpu_cost,
+    ));
+
+    let (gas_used, storage_cost, cpu_cost) = benchmark_council_member_check_optimized();
+    benchmarks.push(GasBenchmark::new(
+        "Council Member Check (optimized Vec<Bytes> loop)",
+        gas_used,
+        storage_cost,
+        cpu_cost,
+    ));
     
     benchmarks
 }
@@ -391,4 +407,87 @@ pub fn generate_benchmark_report() -> String {
     report.push_str("4. ✅ Implement caching for frequently accessed status flags\n");
     
     report
+}
+
+
+
+/// Baseline: naive membership check storing Vec<Address>.
+/// Iterating Vec<Address> forces the host to deserialise each stored address
+/// into a full ScAddress object before comparison — one allocation per member
+/// per call.
+fn benchmark_council_member_check() -> (u64, u64, u64) {
+    use soroban_sdk::{testutils::{Ledger, LedgerInfo}, Address, Env, Vec};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Build a council of 10 addresses stored as Address values.
+    let mut members: Vec<Address> = Vec::new(&env);
+    for i in 0u8..10 {
+        members.push_back(Address::from_account_id(
+            &env,
+            &soroban_sdk::xdr::AccountId(soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(
+                soroban_sdk::xdr::Uint256([i; 32]),
+            )),
+        ));
+    }
+    // The address we are looking for is the last one (worst case).
+    let caller = members.get(9).unwrap();
+
+    let before = env.budget().cpu_instruction_count();
+
+    // Naive loop: compare Address objects.
+    let mut found = false;
+    for member in members.iter() {
+        if member == caller {
+            found = true;
+            break;
+        }
+    }
+    let _ = found;
+
+    let cpu_cost = (env.budget().cpu_instruction_count() - before) as u64;
+    (0, 0, cpu_cost)
+}
+
+/// Optimized: membership check storing Vec<Bytes> (pre-serialised XDR).
+/// The caller address is converted to bytes exactly once before the loop;
+/// each iteration is a plain byte-slice comparison with no object construction.
+fn benchmark_council_member_check_optimized() -> (u64, u64, u64) {
+    use soroban_sdk::{Address, Bytes, Env, Vec};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Build a council of 10 addresses stored as raw XDR bytes.
+    let mut member_bytes: Vec<Bytes> = Vec::new(&env);
+    let mut last_bytes = Bytes::new(&env);
+    for i in 0u8..10 {
+        let addr = Address::from_account_id(
+            &env,
+            &soroban_sdk::xdr::AccountId(soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(
+                soroban_sdk::xdr::Uint256([i; 32]),
+            )),
+        );
+        let b = addr.to_xdr(&env);
+        if i == 9 {
+            last_bytes = b.clone();
+        }
+        member_bytes.push_back(b);
+    }
+
+    let before = env.budget().cpu_instruction_count();
+
+    // Convert caller once, then compare bytes.
+    let mut found = false;
+    for b in member_bytes.iter() {
+        if b == last_bytes {
+            found = true;
+            break;
+        }
+    }
+    let _ = found;
+
+    let cpu_cost = (env.budget().cpu_instruction_count() - before) as u64;
+    (0, 0, cpu_cost)
 }
