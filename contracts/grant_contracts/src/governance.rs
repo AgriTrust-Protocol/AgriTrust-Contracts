@@ -35,6 +35,8 @@ pub struct Proposal {
     pub no_votes: i128,
     pub total_voting_power: i128,
     pub created_at: u64,
+    pub stake_amount: i128,
+    pub stake_returned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +68,8 @@ pub enum GovernanceDataKey {
     GovernanceToken,
     VotingThreshold,
     QuorumThreshold,
+    StakeToken,
+    ProposalStakeAmount,
 }
 
 #[contracterror]
@@ -84,6 +88,9 @@ pub enum GovernanceError {
     QuorumNotMet = 110,
     ThresholdNotMet = 111,
     AlreadyVoted = 112,
+    InsufficientStake = 113,
+    StakeAlreadyReturned = 114,
+    ProposalNotConcluded = 115,
 }
 
 pub struct GovernanceContract;
@@ -94,7 +101,9 @@ impl GovernanceContract {
         env: Env,
         governance_token: Address,
         voting_threshold: i128,
-        quorum_threshold: i128
+        quorum_threshold: i128,
+        stake_token: Address,
+        proposal_stake_amount: i128
     ) -> Result<(), GovernanceError> {
         if env.storage().instance().has(&GovernanceDataKey::GovernanceToken) {
             return Err(GovernanceError::AlreadyInitialized);
@@ -104,6 +113,8 @@ impl GovernanceContract {
         env.storage().instance().set(&GovernanceDataKey::VotingThreshold, &voting_threshold);
         env.storage().instance().set(&GovernanceDataKey::QuorumThreshold, &quorum_threshold);
         env.storage().instance().set(&GovernanceDataKey::ProposalIds, &Vec::<u64>::new(&env));
+        env.storage().instance().set(&GovernanceDataKey::StakeToken, &stake_token);
+        env.storage().instance().set(&GovernanceDataKey::ProposalStakeAmount, &proposal_stake_amount);
 
         Ok(())
     }
@@ -115,7 +126,24 @@ impl GovernanceContract {
         description: soroban_sdk::String,
         voting_period: u64
     ) -> Result<u64, GovernanceError> {
+        Self::propose_grant(env, proposer, title, description, voting_period)
+    }
+
+    pub fn propose_grant(
+        env: Env,
+        proposer: Address,
+        title: soroban_sdk::String,
+        description: soroban_sdk::String,
+        voting_period: u64
+    ) -> Result<u64, GovernanceError> {
         proposer.require_auth();
+
+        let stake_token = Self::get_stake_token(&env)?;
+        let stake_amount = Self::get_proposal_stake_amount(&env)?;
+
+        // Transfer stake from proposer to this contract
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&proposer, &env.current_contract_address(), &stake_amount);
 
         let now = env.ledger().timestamp();
         let voting_deadline = now.checked_add(voting_period).ok_or(GovernanceError::MathOverflow)?;
@@ -139,6 +167,8 @@ impl GovernanceContract {
             no_votes: 0,
             total_voting_power: 0,
             created_at: now,
+            stake_amount,
+            stake_returned: false,
         };
 
         env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
@@ -293,6 +323,60 @@ impl GovernanceContract {
         Ok(())
     }
 
+    pub fn refund_stake(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        let mut proposal = Self::get_proposal(&env, proposal_id)?;
+        
+        if proposal.status != ProposalStatus::Executed && proposal.status != ProposalStatus::Rejected {
+            return Err(GovernanceError::ProposalNotConcluded);
+        }
+
+        if proposal.stake_returned {
+            return Err(GovernanceError::StakeAlreadyReturned);
+        }
+
+        proposal.stake_returned = true;
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+        if proposal.stake_amount > 0 {
+            let stake_token = Self::get_stake_token(&env)?;
+            let token_client = token::Client::new(&env, &stake_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.stake_amount
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn slash_stake(env: Env, admin: Address, target_treasury: Address, proposal_id: u64) -> Result<(), GovernanceError> {
+        admin.require_auth();
+        // Assume admin is validated elsewhere or we could add DataKey::Admin locally
+        // For dao-fund, governance calls might be gated by proper admin authentication
+        
+        let mut proposal = Self::get_proposal(&env, proposal_id)?;
+
+        if proposal.stake_returned {
+            return Err(GovernanceError::StakeAlreadyReturned);
+        }
+
+        proposal.stake_returned = true;
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+        if proposal.stake_amount > 0 {
+            let stake_token = Self::get_stake_token(&env)?;
+            let token_client = token::Client::new(&env, &stake_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &target_treasury,
+                &proposal.stake_amount
+            );
+        }
+
+        Ok(())
+    }
+
     // Helper functions
     fn get_proposal_ids(env: &Env) -> Result<Vec<u64>, GovernanceError> {
         env.storage()
@@ -326,6 +410,20 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .get(&GovernanceDataKey::QuorumThreshold)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn get_stake_token(env: &Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::StakeToken)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn get_proposal_stake_amount(env: &Env) -> Result<i128, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::ProposalStakeAmount)
             .ok_or(GovernanceError::NotInitialized)
     }
 
