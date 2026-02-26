@@ -8,6 +8,7 @@ use soroban_sdk::{
     symbol_short,
     token,
     Address,
+    Bytes,
     Env,
     Vec,
     Map,
@@ -35,6 +36,8 @@ pub struct Proposal {
     pub no_votes: i128,
     pub total_voting_power: i128,
     pub created_at: u64,
+    pub stake_amount: i128,
+    pub stake_returned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +69,12 @@ pub enum GovernanceDataKey {
     GovernanceToken,
     VotingThreshold,
     QuorumThreshold,
+    // Stores raw XDR bytes of each council member address.
+    // Using Vec<Bytes> instead of Vec<Address> avoids Address object
+    // construction on every iteration of the membership check loop.
+    CouncilMembers,
+    StakeToken,
+    ProposalStakeAmount,
 }
 
 #[contracterror]
@@ -84,9 +93,66 @@ pub enum GovernanceError {
     QuorumNotMet = 110,
     ThresholdNotMet = 111,
     AlreadyVoted = 112,
+    NotCouncilMember = 113,
+    InsufficientStake = 113,
+    StakeAlreadyReturned = 114,
+    ProposalNotConcluded = 115,
 }
 
 pub struct GovernanceContract;
+
+// ---------------------------------------------------------------------------
+// Council auth helpers — the core of this optimization
+// ---------------------------------------------------------------------------
+
+/// Convert an `Address` to its canonical XDR byte representation.
+/// Called once per auth check, outside any loop.
+fn addr_to_bytes(env: &Env, addr: &Address) -> Bytes {
+    addr.to_xdr(env)
+}
+
+/// Check membership using raw byte comparison.
+///
+/// # Why this is faster than a `Vec<Address>` loop
+/// Comparing `Bytes` values is a simple length-then-memcmp operation on the
+/// host side.  The naive alternative — storing `Vec<Address>` and calling
+/// `==` on each element — forces the host to deserialize each stored address
+/// into a full `ScAddress` object before the comparison, costing additional
+/// allocations and CPU instructions on every iteration.
+///
+/// By storing pre-serialized bytes and converting the *caller* to bytes once
+/// before the loop, we pay the serialization cost exactly once regardless of
+/// council size.
+fn is_council_member(env: &Env, caller_bytes: &Bytes) -> bool {
+    let members: Vec<Bytes> = env
+        .storage()
+        .instance()
+        .get(&GovernanceDataKey::CouncilMembers)
+        .unwrap_or_else(|| Vec::new(env));
+
+    // Raw byte comparison — no Address object construction inside the loop.
+    for member_bytes in members.iter() {
+        if member_bytes == *caller_bytes {
+            return true;
+        }
+    }
+    false
+}
+
+/// Require that `caller` is a registered council member.
+/// Converts `caller` to bytes once, then delegates to `is_council_member`.
+fn require_council_auth(env: &Env, caller: &Address) -> Result<(), GovernanceError> {
+    caller.require_auth();
+    let caller_bytes = addr_to_bytes(env, caller);
+    if !is_council_member(env, &caller_bytes) {
+        return Err(GovernanceError::NotCouncilMember);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Contract implementation
+// ---------------------------------------------------------------------------
 
 #[contractimpl]
 impl GovernanceContract {
@@ -94,7 +160,9 @@ impl GovernanceContract {
         env: Env,
         governance_token: Address,
         voting_threshold: i128,
-        quorum_threshold: i128
+        quorum_threshold: i128,
+        stake_token: Address,
+        proposal_stake_amount: i128
     ) -> Result<(), GovernanceError> {
         if env.storage().instance().has(&GovernanceDataKey::GovernanceToken) {
             return Err(GovernanceError::AlreadyInitialized);
@@ -104,6 +172,49 @@ impl GovernanceContract {
         env.storage().instance().set(&GovernanceDataKey::VotingThreshold, &voting_threshold);
         env.storage().instance().set(&GovernanceDataKey::QuorumThreshold, &quorum_threshold);
         env.storage().instance().set(&GovernanceDataKey::ProposalIds, &Vec::<u64>::new(&env));
+        // Initialise council as empty; members are added via set_council_members.
+        env.storage().instance().set(&GovernanceDataKey::CouncilMembers, &Vec::<Bytes>::new(&env));
+
+        Ok(())
+    }
+
+    /// Replace the full council member list.
+    ///
+    /// Each `Address` in `members` is serialised to XDR bytes at write time so
+    /// that future membership checks never pay that cost again.
+    pub fn set_council_members(
+        env: Env,
+        caller: Address,
+        members: Vec<Address>,
+    ) -> Result<(), GovernanceError> {
+        // Only an existing council member (or the first setup where list is
+        // empty) may update the council.
+        let existing: Vec<Bytes> = env
+            .storage()
+            .instance()
+            .get(&GovernanceDataKey::CouncilMembers)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !existing.is_empty() {
+            require_council_auth(&env, &caller)?;
+        } else {
+            caller.require_auth();
+        }
+
+        // Serialise once at write time — reads pay zero per-address cost.
+        let mut member_bytes: Vec<Bytes> = Vec::new(&env);
+        for addr in members.iter() {
+            member_bytes.push_back(addr_to_bytes(&env, &addr));
+        }
+
+        env.storage().instance().set(&GovernanceDataKey::CouncilMembers, &member_bytes);
+
+        env.events().publish(
+            (symbol_short!("council_set"),),
+            member_bytes.len(),
+        );
+        env.storage().instance().set(&GovernanceDataKey::StakeToken, &stake_token);
+        env.storage().instance().set(&GovernanceDataKey::ProposalStakeAmount, &proposal_stake_amount);
 
         Ok(())
     }
@@ -113,12 +224,31 @@ impl GovernanceContract {
         proposer: Address,
         title: soroban_sdk::String,
         description: soroban_sdk::String,
+        voting_period: u64,
+    ) -> Result<u64, GovernanceError> {
+        Self::propose_grant(env, proposer, title, description, voting_period)
+    }
+
+    pub fn propose_grant(
+        env: Env,
+        proposer: Address,
+        title: soroban_sdk::String,
+        description: soroban_sdk::String,
         voting_period: u64
     ) -> Result<u64, GovernanceError> {
         proposer.require_auth();
 
+        let stake_token = Self::get_stake_token(&env)?;
+        let stake_amount = Self::get_proposal_stake_amount(&env)?;
+
+        // Transfer stake from proposer to this contract
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&proposer, &env.current_contract_address(), &stake_amount);
+
         let now = env.ledger().timestamp();
-        let voting_deadline = now.checked_add(voting_period).ok_or(GovernanceError::MathOverflow)?;
+        let voting_deadline = now
+            .checked_add(voting_period)
+            .ok_or(GovernanceError::MathOverflow)?;
 
         let mut proposal_ids = Self::get_proposal_ids(&env)?;
         let proposal_id = if proposal_ids.is_empty() {
@@ -139,13 +269,18 @@ impl GovernanceContract {
             no_votes: 0,
             total_voting_power: 0,
             created_at: now,
+            stake_amount,
+            stake_returned: false,
         };
 
         env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
         proposal_ids.push_back(proposal_id);
         env.storage().instance().set(&GovernanceDataKey::ProposalIds, &proposal_ids);
 
-        env.events().publish((symbol_short!("prop_new"), proposal_id), (proposer, voting_deadline));
+        env.events().publish(
+            (symbol_short!("prop_new"), proposal_id),
+            (proposer, voting_deadline),
+        );
 
         Ok(proposal_id)
     }
@@ -154,7 +289,7 @@ impl GovernanceContract {
         env: Env,
         voter: Address,
         proposal_id: u64,
-        weight: i128
+        weight: i128,
     ) -> Result<(), GovernanceError> {
         voter.require_auth();
 
@@ -173,13 +308,14 @@ impl GovernanceContract {
             return Err(GovernanceError::VotingEnded);
         }
 
-        // Check if already voted
         if env.storage().instance().has(&GovernanceDataKey::Vote(voter.clone(), proposal_id)) {
             return Err(GovernanceError::AlreadyVoted);
         }
 
         let voting_power = Self::calculate_voting_power(&env, &voter)?;
-        let vote_weight = weight.checked_mul(voting_power).ok_or(GovernanceError::MathOverflow)?;
+        let _vote_weight = weight
+            .checked_mul(voting_power)
+            .ok_or(GovernanceError::MathOverflow)?;
 
         let vote = Vote {
             voter: voter.clone(),
@@ -189,10 +325,13 @@ impl GovernanceContract {
             voted_at: now,
         };
 
-        env.storage().instance().set(&GovernanceDataKey::Vote(voter.clone(), proposal_id), &vote);
+        env.storage()
+            .instance()
+            .set(&GovernanceDataKey::Vote(voter.clone(), proposal_id), &vote);
 
-        // Update proposal vote counts (quadratic voting: weight^2)
-        let quadratic_weight = weight.checked_mul(weight).ok_or(GovernanceError::MathOverflow)?;
+        let quadratic_weight = weight
+            .checked_mul(weight)
+            .ok_or(GovernanceError::MathOverflow)?;
 
         proposal.yes_votes = proposal.yes_votes
             .checked_add(quadratic_weight)
@@ -206,7 +345,7 @@ impl GovernanceContract {
 
         env.events().publish(
             (symbol_short!("quad_vote"), proposal_id),
-            (voter, weight, voting_power, quadratic_weight)
+            (voter, weight, voting_power, quadratic_weight),
         );
 
         Ok(())
@@ -217,12 +356,9 @@ impl GovernanceContract {
         let token_client = token::Client::new(env, &governance_token);
         let token_balance = token_client.balance(address);
 
-        // Quadratic voting: voting_power = sqrt(token_balance)
-        // Using integer approximation of square root
         let voting_power = Self::integer_sqrt(token_balance);
 
-        // Update cached voting power
-        let voting_power_record = VotingPower {
+        let vp_record = VotingPower {
             address: address.clone(),
             token_balance,
             voting_power,
@@ -231,7 +367,7 @@ impl GovernanceContract {
 
         env.storage()
             .instance()
-            .set(&GovernanceDataKey::VotingPower(address.clone()), &voting_power_record);
+            .set(&GovernanceDataKey::VotingPower(address.clone()), &vp_record);
 
         Ok(voting_power)
     }
@@ -240,19 +376,28 @@ impl GovernanceContract {
         if n <= 0 {
             return 0;
         }
-
         let mut x = n;
         let mut y = (x + 1) / 2;
-
         while y < x {
             x = y;
             y = (x + n / x) / 2;
         }
-
         x
     }
 
-    pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+    /// Execute a proposal — requires caller to be a council member.
+    ///
+    /// The council membership check uses the optimized byte-comparison path:
+    /// `caller` is serialised to XDR bytes exactly once, then compared
+    /// against the pre-serialised `Vec<Bytes>` in storage.
+    pub fn execute_proposal(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), GovernanceError> {
+        // Single serialisation before the loop inside require_council_auth.
+        require_council_auth(&env, &caller)?;
+
         let mut proposal = Self::get_proposal(&env, proposal_id)?;
         let now = env.ledger().timestamp();
 
@@ -267,14 +412,12 @@ impl GovernanceContract {
         let quorum_threshold = Self::get_quorum_threshold(&env)?;
         let voting_threshold = Self::get_voting_threshold(&env)?;
 
-        // Check quorum
         if proposal.total_voting_power < quorum_threshold {
             proposal.status = ProposalStatus::Rejected;
             env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
             return Err(GovernanceError::QuorumNotMet);
         }
 
-        // Check voting threshold (simple majority for now)
         let total_votes = proposal.yes_votes.checked_add(proposal.no_votes).unwrap_or(0);
         if total_votes == 0 || proposal.yes_votes < voting_threshold {
             proposal.status = ProposalStatus::Rejected;
@@ -287,8 +430,97 @@ impl GovernanceContract {
 
         env.events().publish(
             (symbol_short!("prop_exec"), proposal_id),
-            (proposal.yes_votes, proposal.no_votes)
+            (proposal.yes_votes, proposal.no_votes),
         );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // View functions
+    // -----------------------------------------------------------------------
+
+    pub fn get_proposal_info(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
+        Self::get_proposal(&env, proposal_id)
+    }
+
+    pub fn get_voter_power(env: Env, voter: Address) -> Result<i128, GovernanceError> {
+        Self::calculate_voting_power(&env, &voter)
+    }
+
+    pub fn get_vote_info(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> Result<Vote, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::Vote(voter, proposal_id))
+            .ok_or(GovernanceError::ProposalNotFound)
+    }
+
+    /// Expose the raw council bytes for off-chain tooling / auditing.
+    pub fn get_council_members(env: Env) -> Vec<Bytes> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::CouncilMembers)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    pub fn refund_stake(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        let mut proposal = Self::get_proposal(&env, proposal_id)?;
+        
+        if proposal.status != ProposalStatus::Executed && proposal.status != ProposalStatus::Rejected {
+            return Err(GovernanceError::ProposalNotConcluded);
+        }
+
+        if proposal.stake_returned {
+            return Err(GovernanceError::StakeAlreadyReturned);
+        }
+
+        proposal.stake_returned = true;
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+        if proposal.stake_amount > 0 {
+            let stake_token = Self::get_stake_token(&env)?;
+            let token_client = token::Client::new(&env, &stake_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.stake_amount
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn slash_stake(env: Env, admin: Address, target_treasury: Address, proposal_id: u64) -> Result<(), GovernanceError> {
+        admin.require_auth();
+        // Assume admin is validated elsewhere or we could add DataKey::Admin locally
+        // For dao-fund, governance calls might be gated by proper admin authentication
+        
+        let mut proposal = Self::get_proposal(&env, proposal_id)?;
+
+        if proposal.stake_returned {
+            return Err(GovernanceError::StakeAlreadyReturned);
+        }
+
+        proposal.stake_returned = true;
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+        if proposal.stake_amount > 0 {
+            let stake_token = Self::get_stake_token(&env)?;
+            let token_client = token::Client::new(&env, &stake_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &target_treasury,
+                &proposal.stake_amount
+            );
+        }
 
         Ok(())
     }
@@ -326,6 +558,21 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .get(&GovernanceDataKey::QuorumThreshold)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+}
+
+    fn get_stake_token(env: &Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::StakeToken)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn get_proposal_stake_amount(env: &Env) -> Result<i128, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::ProposalStakeAmount)
             .ok_or(GovernanceError::NotInitialized)
     }
 

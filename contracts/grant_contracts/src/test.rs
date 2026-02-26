@@ -5,9 +5,34 @@ use super::{Error, GrantContract, GrantContractClient, GrantStatus, SCALING_FACT
 use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, Ledger},
     token, Address, Env, InvokeError,
+    symbol,
 };
 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+
+// Helper contracts used by the callback tests below.
+#[derive(Clone)]
+struct NotifyContract;
+
+#[contractimpl]
+impl NotifyContract {
+    pub fn on_withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), ()> {
+        // persist the arguments so the test can verify they were received
+        env.storage().set((symbol!("last_grant"),), grant_id);
+        env.storage().set((symbol!("last_amount"),), amount);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct FailContract;
+
+#[contractimpl]
+impl FailContract {
+    pub fn on_withdraw(_env: Env, _grant_id: u64, _amount: i128) -> Result<(), ()> {
+        Err(()) // always fail to trigger fallback path
+    }
+}
 
 fn set_timestamp(env: &Env, timestamp: u64) {
     env.ledger().with_mut(|li| {
@@ -126,7 +151,6 @@ fn test_withdraw_respects_timelock_for_rate_increases() {
 }
 
 #[test]
-fn test_withdraw_respects_timelock_for_rate_increases() {
 fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -226,7 +250,6 @@ fn test_propose_rate_change_requires_admin_auth() {
 }
 
 #[test]
-fn test_propose_rate_change_decrease_applies_immediately_and_clears_pending() {
 fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -321,7 +344,6 @@ fn test_propose_rate_change_rejects_invalid_rate_and_inactive_states() {
 }
 
 #[test]
-fn test_propose_rate_change_requires_admin_auth() {
 fn test_update_rate_uses_timelocked_behavior() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -555,7 +577,6 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
 }
 
 #[test]
-fn test_update_rate_uses_timelocked_behavior() {
 fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundaries() {
     let env = Env::default();
     let admin = Address::generate(&env);
@@ -630,7 +651,6 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
         + (i128::from(grant.effective_timestamp - 150) * 20)
         + (i128::from(10_u64) * 40);
     assert_eq!(client.claimable(&grant_id), expected_after);
-}
 
 #[test]
 fn test_rescue_tokens_requires_admin_auth() {
@@ -668,48 +688,6 @@ fn test_rescue_tokens_rejects_invalid_amount() {
     );
 }
 
-#[test]
-fn test_rescue_tokens_requires_admin_auth() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grant_token = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    let contract_id = env.register_contract(None, GrantContract);
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    client.mock_all_auths().initialize(&admin, &grant_token);
-    // Calling rescue_tokens without admin auth must fail (auth or NotAuthorized).
-    assert!(client.try_rescue_tokens(&grant_token, &100, &to).is_err());
-}
-
-#[test]
-fn test_rescue_tokens_rejects_invalid_amount() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grant_token = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    let contract_id = env.register_contract(None, GrantContract);
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    client.mock_all_auths().initialize(&admin, &grant_token);
-    assert_contract_error(
-        client
-            .mock_all_auths()
-            .try_rescue_tokens(&grant_token, &0, &to),
-        Error::InvalidAmount,
-    );
-    assert_contract_error(
-        client
-            .mock_all_auths()
-            .try_rescue_tokens(&grant_token, &-1_i128, &to),
-        Error::InvalidAmount,
-    );
-}
-
-#[test]
-fn test_warmup_period_linear_scaling() {
 /// Tests for low-decimal tokens (Issue #18: High-Precision Flow Rates)
 /// These tests verify that the scaling factor prevents zero flow rates
 /// when dealing with tokens that have few decimal places.
@@ -1073,6 +1051,232 @@ fn test_withdraw_converts_to_correct_decimals() {
     let grant_after = client.get_grant(&grant_id);
     assert_eq!(grant_after.withdrawn, 500);
     assert_eq!(grant_after.claimable, 0);
+}
+
+// ── Issue #38 ── Streaming to Smart Contracts (Callbacks) ───────────────────
+
+#[test]
+fn test_withdraw_triggers_notify_contract() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let notify_id = env.register_contract(None, NotifyContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 300;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &notify_id, &1_000, &flow_rate);
+
+    set_timestamp(&env, 10);
+    // withdraw a portion to fire the callback
+    client.mock_all_auths().withdraw(&grant_id, &100);
+
+    // verify the notify contract saw the correct arguments
+    let stored_grant: u64 = env
+        .storage()
+        .get((symbol!("last_grant"),))
+        .unwrap()
+        .unwrap();
+    let stored_amount: i128 = env
+        .storage()
+        .get((symbol!("last_amount"),))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_grant, grant_id);
+    assert_eq!(stored_amount, 100);
+}
+
+#[test]
+fn test_withdraw_ignores_failing_notify_contract() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let fail_id = env.register_contract(None, FailContract);
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 301;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &fail_id, &1_000, &flow_rate);
+
+    set_timestamp(&env, 10);
+    // this should not panic even though the recipient returns Err
+    client.mock_all_auths().withdraw(&grant_id, &50);
+
+    // grant state should reflect the withdrawal as usual
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.withdrawn, 50);
+}
+
+// ── Issue #40 ── Clawback for Milestone Failure ─────────────────────────────
+
+#[test]
+fn test_clawback_after_deadline_resets_claimable() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 400;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    // create milestone-based grant and set deadline in the future
+    let flags = STATUS_ACTIVE | STATUS_MILESTONE_BASED;
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &flow_rate, &flags);
+
+    // assign a deadline at 100 seconds
+    client
+        .mock_all_auths()
+        .set_milestone_deadline(&grant_id, &100);
+
+    // advance time beyond deadline and accrue some claimable
+    set_timestamp(&env, 200);
+    let claimable_before = client.claimable(&grant_id);
+    assert!(claimable_before > 0);
+
+    // clawback should clear claimable
+    client.mock_all_auths().clawback_milestone(&grant_id);
+    assert_eq!(client.claimable(&grant_id), 0);
+}
+
+#[test]
+fn test_clawback_prohibited_if_milestone_met_or_too_early() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 401;
+    let flow_rate: i128 = 5 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    let flags = STATUS_ACTIVE | STATUS_MILESTONE_BASED;
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &500, &flow_rate, &flags);
+    client
+        .mock_all_auths()
+        .set_milestone_deadline(&grant_id, &50);
+
+    // too early should fail
+    set_timestamp(&env, 25);
+    assert_contract_error(
+        client.mock_all_auths().try_clawback_milestone(&grant_id),
+        Error::InvalidState,
+    );
+
+    // after deadline but mark met should also fail
+    set_timestamp(&env, 60);
+    client.mock_all_auths().mark_milestone_met(&grant_id);
+    assert_contract_error(
+        client.mock_all_auths().try_clawback_milestone(&grant_id),
+        Error::InvalidState,
+    );
+}
+
+// ── Issue #39 ── "Rage Quit" for Grantees ──────────────────────────────────────
+
+#[test]
+fn test_rage_quit_claims_all_claimable_when_paused() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 500;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &flow_rate);
+
+    // Let funds accrue and then pause
+    set_timestamp(&env, 50);
+    let claimable_before_pause = client.claimable(&grant_id);
+    assert!(claimable_before_pause > 0);
+
+    client.mock_all_auths().pause_grant(&grant_id);
+
+    // Rage quit as grantee; should claim all accrued
+    client.mock_all_auths().rage_quit(&grant_id);
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.withdrawn, claimable_before_pause);
+    assert_eq!(grant.claimable, 0);
+}
+
+#[test]
+fn test_rage_quit_fails_if_not_paused() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 501;
+    let flow_rate: i128 = 5 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &500, &flow_rate);
+
+    // Try to rage quit while grant is active (not paused)
+    assert_contract_error(
+        client.mock_all_auths().try_rage_quit(&grant_id),
+        Error::InvalidState,
+    );
+}
+
+#[test]
+fn test_rage_quit_prevents_admin_resume() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 502;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &flow_rate);
+
+    set_timestamp(&env, 30);
+    client.mock_all_auths().pause_grant(&grant_id);
+    client.mock_all_auths().rage_quit(&grant_id);
+
+    // Try to resume should fail because grant is now completed and rage quit
+    assert_contract_error(
+        client.mock_all_auths().try_resume_grant(&grant_id),
+        Error::InvalidState,
+    );
+
+    // Grant is now permanently closed
+    let grant = client.get_grant(&grant_id);
+    assert!(grant.status == GrantStatus::Completed);
 }
 
 // ── Issue #30 ── Non-Transferable Grantee Roles ─────────────────────────────

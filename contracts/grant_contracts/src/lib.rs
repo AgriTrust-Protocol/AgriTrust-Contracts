@@ -21,11 +21,7 @@ use soroban_sdk::{
 };
 
 const XLM_DECIMALS: u32 = 7;
-const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS); // 5 XLM
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec, vec,
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
-    Vec,
-};
+const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
 
 pub mod optimized;
 pub mod benchmarks;
@@ -64,6 +60,7 @@ pub use optimized::{
     STATUS_MILESTONE_BASED,
     STATUS_AUTO_RENEW,
     STATUS_EMERGENCY_PAUSE,
+    STATUS_RAGE_QUIT,
     has_status,
     set_status,
     clear_status,
@@ -371,6 +368,13 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     // Calculate accrued amount with warmup multiplier
     // Flow rate is stored as a scaled value, so we divide by SCALING_FACTOR
     // to get the actual accrued amount in token units
+    let scaled_accrued = grant
+        .flow_rate
+        .checked_mul(elapsed_i128)
+        .ok_or(Error::MathOverflow)?;
+    let base_accrued = scaled_accrued
+        .checked_div(SCALING_FACTOR)
+        .ok_or(Error::MathOverflow)?;
     let scaled_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
     let accrued = scaled_accrued.checked_div(SCALING_FACTOR).ok_or(Error::MathOverflow)?;
 
@@ -415,6 +419,7 @@ impl GrantContract {
         admin: Address,
         grant_token: Address,
         treasury: Address,
+        oracle_address: Address,
         oracle_address: Address
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -428,6 +433,9 @@ impl GrantContract {
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage()
+            .instance()
+            .set(&DataKey::Oracle, &oracle_address);
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Oracle, &oracle_address);
         Ok(())
@@ -595,6 +603,43 @@ impl GrantContract {
 
         // 3. Settle to ensure 100% of accrued funds are calculated up to the pause
         settle_grant(&mut grant, env.ledger().timestamp())?;
+        if grant.withdrawn == grant.total_amount {
+            grant.status = GrantStatus::Completed;
+        }
+
+        write_grant(&env, grant_id, &grant);
+
+        // In a real implementation with token support, we would transfer 'amount' to:
+        // let target = grant.redirect.unwrap_or(grant.recipient);
+        // let token_client = token::Client::new(&env, &token_address);
+        // token_client.transfer(&env.current_contract_address(), &target, &amount);
+
+        grant.last_claim_time = env.ledger().timestamp();
+        write_grant(&env, grant_id, &grant);
+
+        // Call recipient contract's `on_withdraw` hook. We ignore *all*
+        // errors from the cross-contract invocation so that a misbehaving
+        // callback cannot block the core withdrawal logic.
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+
+        Ok(())
+    }
+
+    /// Anyone may call. Cancel an active grant if the grantee has not claimed in 90+ days; return remaining funds to treasury.
+    pub fn slash_inactive_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+
+        if grant.status != GrantStatus::Active {
+            return Err(Error::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        settle_grant(&mut grant, now)?;
+
+        if grant.status != GrantStatus::Active {
+            write_grant(&env, grant_id, &grant);
+            return Err(Error::InvalidState);
+        }
 
         let claim_amount = grant.claimable;
         if claim_amount > 0 {
@@ -727,6 +772,7 @@ impl GrantContract {
 
         env.events().publish(
             (symbol_short!("reasign"), grant_id),
+            (old, new, env.ledger().timestamp()),
             (old, new, env.ledger().timestamp())
         );
         Ok(())
@@ -824,3 +870,29 @@ impl GrantContract {
         Ok(())
     }
 }
+}
+
+/// Notify a recipient contract about a withdrawal.
+///
+/// The recipient is expected to implement the interface:
+///
+/// ```ignore
+/// fn on_withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), E>
+/// ```
+///
+/// This helper uses `env.try_invoke_contract` so that *any* failure in the
+/// callback (missing contract, missing function, panic, or explicit `Err`) is
+/// swallowed. The withdrawal operation in the grant contract continues normally
+/// regardless of whether the notification succeeded or failed.
+fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
+    use soroban_sdk::{IntoVal, Symbol};
+    let args = (grant_id, amount).into_val(env);
+    // drop both outer and inner errors; nothing should block the withdraw
+    let _ = env.try_invoke_contract(
+        recipient,
+        &Symbol::new(env, "on_withdraw"),
+        args,
+    );
+}
+
+mod test;
