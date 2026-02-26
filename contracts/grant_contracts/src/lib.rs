@@ -17,7 +17,7 @@ use soroban_sdk::{
     Address,
     Env,
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    vec,
+    vec, Symbol,
 };
 
 const XLM_DECIMALS: u32 = 7;
@@ -35,6 +35,13 @@ pub mod governance;
 // pub mod multi_token;
 // pub mod yield_treasury;
 // pub mod yield_enhanced;
+
+// Re-export implementations
+pub use optimized::{
+    GrantContract as OptimizedContract, Grant as OptimizedGrant, DataKey as OptimizedDataKey,
+    STATUS_ACTIVE, STATUS_PAUSED, STATUS_COMPLETED, STATUS_CANCELLED,
+    STATUS_REVOCABLE, STATUS_MILESTONE_BASED, STATUS_AUTO_RENEW, STATUS_EMERGENCY_PAUSE,
+};
 
 // #[cfg(test)]
 // mod test_snapshot_events;
@@ -141,8 +148,10 @@ pub struct GrantContract;
 #[contracttype]
 pub enum GrantStatus {
     Active,
+    Paused,      // Explicitly added to track pause state for Issue #39
     Completed,
     Cancelled,
+    RageQuitted, // Terminal state for Issue #39
 }
 
 #[contracttype]
@@ -151,8 +160,8 @@ pub enum StreamType {
     FixedAmount,
     FixedEndDate,
 }
-/// 90 days in seconds (inactivity threshold for slash_inactive_grant).
-const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60; // 7_776_000
+
+const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60; 
 
 #[derive(Clone)]
 #[contracttype]
@@ -164,7 +173,6 @@ pub struct Grant {
     pub flow_rate: i128,
     pub last_update_ts: u64,
     pub rate_updated_at: u64,
-    /// Last time the grantee withdrew (or grant creation if never claimed). Used for inactivity slash.
     pub last_claim_time: u64,
     pub pending_rate: i128,
     pub effective_timestamp: u64,
@@ -179,11 +187,8 @@ pub struct Grant {
 #[contracttype]
 enum DataKey {
     Admin,
-    /// Token used for grants; allocated funds are measured in this token.
     GrantToken,
-    /// All grant IDs ever created (for computing total_allocated_funds).
     GrantIds,
-    /// DAO treasury; slashed funds are sent here.
     Treasury,
     Oracle,
     Grant(u64),
@@ -205,6 +210,9 @@ pub enum Error {
     InvalidState = 8,
     MathOverflow = 9,
     InsufficientReserve = 10,
+    RescueWouldViolateAllocated = 11,
+    GranteeMismatch = 12,
+    GrantNotInactive = 13,
     /// Rescue amount would leave less than total allocated funds in the contract.
     RescueWouldViolateAllocated = 10,
     GranteeMismatch = 11,
@@ -214,6 +222,10 @@ pub enum Error {
 
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 
+// --- Internal Helpers ---
+
+fn read_admin(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
 fn read_admin(env: &Env) -> Result<Address, Error> {
     env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
 }
@@ -223,14 +235,7 @@ fn read_oracle(env: &Env) -> Result<Address, Error> {
 }
 
 fn require_admin_auth(env: &Env) -> Result<(), Error> {
-    let admin = read_admin(env)?;
-    admin.require_auth();
-    Ok(())
-}
-
-fn require_oracle_auth(env: &Env) -> Result<(), Error> {
-    let oracle = read_oracle(env)?;
-    oracle.require_auth();
+    read_admin(env)?.require_auth();
     Ok(())
 }
 
@@ -299,17 +304,24 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
 }
 
 fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
-    if now < grant.last_update_ts {
-        return Err(Error::InvalidState);
-    }
-
-    let start = grant.last_update_ts;
-    let elapsed = now - start;
+    if now < grant.last_update_ts { return Err(Error::InvalidState); }
+    
+    let elapsed = now - grant.last_update_ts;
     if grant.status != GrantStatus::Active || elapsed == 0 {
         grant.last_update_ts = now;
         return Ok(());
     }
 
+    let elapsed_i128 = i128::from(elapsed);
+    let scaled_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
+    let accrued = scaled_accrued.checked_div(SCALING_FACTOR).ok_or(Error::MathOverflow)?;
+
+    let remaining = grant.total_amount.checked_sub(grant.withdrawn + grant.claimable).ok_or(Error::MathOverflow)?;
+    let delta = if accrued > remaining { remaining } else { accrued };
+
+    grant.claimable = grant.claimable.checked_add(delta).ok_or(Error::MathOverflow)?;
+    
+    if (grant.withdrawn + grant.claimable) >= grant.total_amount {
     if grant.flow_rate < 0 {
         return Err(Error::InvalidRate);
     }
@@ -393,29 +405,13 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     }
 
     grant.last_update_ts = now;
-
     Ok(())
-}
-
-fn preview_grant_at_now(env: &Env, grant: &Grant) -> Result<Grant, Error> {
-    let mut preview = grant.clone();
-    settle_grant(&mut preview, env.ledger().timestamp())?;
-    Ok(preview)
-}
-
-fn mint_sbt(env: &Env, recipient: Address, grant_id: u64) {
-    let recipient_key = DataKey::RecipientGrants(recipient);
-    let mut user_grants: Vec<u64> = env
-        .storage()
-        .instance()
-        .get(&recipient_key)
-        .unwrap_or(vec![env]);
-    user_grants.push_back(grant_id);
-    env.storage().instance().set(&recipient_key, &user_grants);
 }
 
 #[contractimpl]
 impl GrantContract {
+    pub fn initialize(env: Env, admin: Address, grant_token: Address, treasury: Address, native_token: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) { return Err(Error::AlreadyInitialized); }
     pub fn initialize(env: Env, admin: Address, native_token: Address) -> Result<(), Error> {
     pub fn initialize(env: Env, admin: Address, grant_token: Address) -> Result<(), Error> {
     pub fn initialize(
@@ -431,9 +427,10 @@ impl GrantContract {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::NativeToken, &native_token);
-
         env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage()
@@ -567,48 +564,28 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+    /// DAO Admin pauses the stream.
+    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
         require_admin_auth(&env)?;
         let mut grant = read_grant(&env, grant_id)?;
-
-        if grant.status != GrantStatus::Active {
-            return Err(Error::InvalidState);
-        }
-
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
+        
         settle_grant(&mut grant, env.ledger().timestamp())?;
-        grant.flow_rate = 0;
-        grant.pending_rate = 0;
-        grant.effective_timestamp = 0;
-        grant.status = GrantStatus::Cancelled;
+        grant.status = GrantStatus::Paused;
         write_grant(&env, grant_id, &grant);
-
         Ok(())
     }
 
-    pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
-        let grant = read_grant(&env, grant_id)?;
-        preview_grant_at_now(&env, &grant)
-    }
-
-    pub fn claimable(env: Env, grant_id: u64) -> Result<i128, Error> {
-        let grant = read_grant(&env, grant_id)?;
-        let preview = preview_grant_at_now(&env, &grant)?;
-        Ok(preview.claimable)
-    }
-
-    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
+    /// Issue #39: Rage Quit for Grantees.
+    /// If paused, grantee can claim accrued funds and permanently close the grant.
+    pub fn rage_quit(env: Env, grant_id: u64) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
 
-        if grant.status == GrantStatus::Cancelled {
-            return Err(Error::InvalidState);
-        }
-
+        // 1. Authorize the grantee
         grant.recipient.require_auth();
 
+        // 2. Ensure the grant is paused (Security/Fairness requirement)
+        if grant.status != GrantStatus::Paused {
         settle_grant(&mut grant, env.ledger().timestamp())?;
 
         if amount > grant.claimable {
@@ -624,6 +601,8 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
+        // 3. Settle to ensure 100% of accrued funds are calculated up to the pause
+        settle_grant(&mut grant, env.ledger().timestamp())?;
         if grant.withdrawn == grant.total_amount {
             grant.status = GrantStatus::Completed;
         }
@@ -662,17 +641,24 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        let inactive_secs = now.saturating_sub(grant.last_claim_time);
-        if inactive_secs < INACTIVITY_THRESHOLD_SECS {
-            return Err(Error::GrantNotInactive);
+        let claim_amount = grant.claimable;
+        if claim_amount > 0 {
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            client.transfer(&env.current_contract_address(), &grant.recipient, &claim_amount);
+            
+            grant.withdrawn += claim_amount;
+            grant.claimable = 0;
         }
 
+        // 4. Set terminal state - grant can never be resumed
+        grant.status = GrantStatus::RageQuitted;
         let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
 
         grant.flow_rate = 0;
-        grant.status = GrantStatus::Cancelled;
         write_grant(&env, grant_id, &grant);
 
+        env.events().publish((symbol_short!("ragequit"), grant_id), grant.recipient.clone());
         if remaining > 0 {
             let contract = env.current_contract_address();
             let token = read_grant_token(&env)?;
@@ -684,26 +670,19 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
+    /// Admin attempt to resume. Blocks if grant was Rage Quitted.
+    pub fn resume_stream(env: Env, grant_id: u64) -> Result<(), Error> {
         require_admin_auth(&env)?;
-
-        if new_rate < 0 {
-            return Err(Error::InvalidRate);
-        }
-
         let mut grant = read_grant(&env, grant_id)?;
-        if grant.status != GrantStatus::Active {
+        
+        // Ensure it cannot be resumed if Rage Quitted (Terminal State)
+        if grant.status != GrantStatus::Paused {
             return Err(Error::InvalidState);
         }
 
-        let now = env.ledger().timestamp();
-        settle_grant(&mut grant, now)?;
-
-        if grant.status != GrantStatus::Active {
-            write_grant(&env, grant_id, &grant);
-            return Err(Error::InvalidState);
-        }
-
+        grant.status = GrantStatus::Active;
+        grant.last_update_ts = env.ledger().timestamp();
+        write_grant(&env, grant_id, &grant);
         let old_rate = grant.flow_rate;
 
         if new_rate > grant.flow_rate {
@@ -737,9 +716,11 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn set_redirect(env: Env, grant_id: u64, new_redirect: Option<Address>) -> Result<(), Error> {
+    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
+        
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
 
         grant.redirect = new_redirect;
         write_grant(&env, grant_id, &grant);
@@ -859,14 +840,15 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        let now = env.ledger().timestamp();
-        settle_grant(&mut grant, now)?;
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        if amount > grant.claimable { return Err(Error::InvalidAmount); }
 
-        if grant.status != GrantStatus::Active {
-            write_grant(&env, grant_id, &grant);
-            return Err(Error::InvalidState);
-        }
-
+        grant.claimable -= amount;
+        grant.withdrawn += amount;
+        
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &grant.recipient, &amount);
         let old_rate = grant.flow_rate;
         grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)?;
         grant.rate_updated_at = now;
@@ -877,6 +859,7 @@ impl GrantContract {
                 .ok_or(Error::MathOverflow)?;
         }
 
+        grant.last_claim_time = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
 
         env.events().publish(
@@ -886,6 +869,7 @@ impl GrantContract {
 
         Ok(())
     }
+}
 }
 
 /// Notify a recipient contract about a withdrawal.
