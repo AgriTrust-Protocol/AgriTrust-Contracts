@@ -1117,6 +1117,79 @@ fn test_withdraw_ignores_failing_notify_contract() {
     assert_eq!(grant.withdrawn, 50);
 }
 
+// ── Issue #40 ── Clawback for Milestone Failure ─────────────────────────────
+
+#[test]
+fn test_clawback_after_deadline_resets_claimable() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 400;
+    let flow_rate: i128 = 10 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    // create milestone-based grant and set deadline in the future
+    let flags = STATUS_ACTIVE | STATUS_MILESTONE_BASED;
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &1_000, &flow_rate, &flags);
+
+    // assign a deadline at 100 seconds
+    client
+        .mock_all_auths()
+        .set_milestone_deadline(&grant_id, &100);
+
+    // advance time beyond deadline and accrue some claimable
+    set_timestamp(&env, 200);
+    let claimable_before = client.claimable(&grant_id);
+    assert!(claimable_before > 0);
+
+    // clawback should clear claimable
+    client.mock_all_auths().clawback_milestone(&grant_id);
+    assert_eq!(client.claimable(&grant_id), 0);
+}
+
+#[test]
+fn test_clawback_prohibited_if_milestone_met_or_too_early() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let contract_id = env.register(GrantContract, ());
+    let client = GrantContractClient::new(&env, &contract_id);
+
+    let grant_id: u64 = 401;
+    let flow_rate: i128 = 5 * SCALING_FACTOR;
+    set_timestamp(&env, 0);
+    client.mock_all_auths().initialize(&admin);
+    let flags = STATUS_ACTIVE | STATUS_MILESTONE_BASED;
+    client
+        .mock_all_auths()
+        .create_grant(&grant_id, &recipient, &500, &flow_rate, &flags);
+    client
+        .mock_all_auths()
+        .set_milestone_deadline(&grant_id, &50);
+
+    // too early should fail
+    set_timestamp(&env, 25);
+    assert_contract_error(
+        client.mock_all_auths().try_clawback_milestone(&grant_id),
+        Error::InvalidState,
+    );
+
+    // after deadline but mark met should also fail
+    set_timestamp(&env, 60);
+    client.mock_all_auths().mark_milestone_met(&grant_id);
+    assert_contract_error(
+        client.mock_all_auths().try_clawback_milestone(&grant_id),
+        Error::InvalidState,
+    );
+}
+
 // ── Issue #30 ── Non-Transferable Grantee Roles ─────────────────────────────
 //
 // Criterion 1: there is no transfer_grant / assign_grantee function exposed

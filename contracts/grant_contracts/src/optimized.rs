@@ -44,6 +44,9 @@ pub struct Grant {
     pub last_update_ts: u64,
     pub rate_updated_at: u64,
     pub status_mask: u32, // Replaces multiple boolean fields with single u32
+    // Milestone support (issue #40)
+    pub milestone_deadline: u64, // unix timestamp after which clawback is allowed
+    pub milestone_met: bool,     // whether milestone was approved/met by DAO
 }
 
 #[derive(Clone)]
@@ -247,6 +250,8 @@ impl GrantContract {
             last_update_ts: now,
             rate_updated_at: now,
             status_mask: initial_status_mask,
+            milestone_deadline: 0,
+            milestone_met: false,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -456,6 +461,58 @@ impl GrantContract {
         );
         emit_grant_snapshot(&env, grant_id, &grant);
 
+        Ok(())
+    }
+
+    /// Set the milestone deadline for a milestone-based grant. Deadline is a
+    /// UNIX timestamp after which the DAO may claw back unwithdrawn funds if
+    /// the milestone has not been met. Only the admin may call this, and the
+    /// grant must have the `STATUS_MILESTONE_BASED` flag.
+    pub fn set_milestone_deadline(env: Env, grant_id: u64, deadline: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
+            return Err(Error::InvalidState);
+        }
+        grant.milestone_deadline = deadline;
+        grant.milestone_met = false;
+        write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
+
+    /// Mark a milestone as met. After this call the admin can no longer claw
+    /// back the accrued balance based on deadline.
+    pub fn mark_milestone_met(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
+            return Err(Error::InvalidState);
+        }
+        grant.milestone_met = true;
+        write_grant(&env, grant_id, &grant);
+        Ok(())
+    }
+
+    /// Claw back the unwithdrawn balance of a milestone-based grant if the
+    /// deadline has passed and the milestone has not been met. This leaves the
+    /// grant in place but resets `claimable` to zero; already withdrawn funds
+    /// are unaffected.
+    pub fn clawback_milestone(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if !has_status(grant.status_mask, STATUS_MILESTONE_BASED) {
+            return Err(Error::InvalidState);
+        }
+        let now = env.ledger().timestamp();
+        if grant.milestone_deadline == 0 || now <= grant.milestone_deadline {
+            return Err(Error::InvalidState);
+        }
+        if grant.milestone_met {
+            return Err(Error::InvalidState);
+        }
+        settle_grant(&mut grant, now)?;
+        grant.claimable = 0;
+        write_grant(&env, grant_id, &grant);
         Ok(())
     }
 }
