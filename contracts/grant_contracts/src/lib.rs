@@ -57,6 +57,7 @@ pub use optimized::{
     STATUS_MILESTONE_BASED,
     STATUS_AUTO_RENEW,
     STATUS_EMERGENCY_PAUSE,
+    STATUS_RAGE_QUIT,
     has_status,
     set_status,
     clear_status,
@@ -641,7 +642,9 @@ impl GrantContract {
         grant.last_claim_time = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
 
-        // Try to notify the recipient; silently ignore errors based on interface expectation
+        // Call recipient contract's `on_withdraw` hook. We ignore *all*
+        // errors from the cross-contract invocation so that a misbehaving
+        // callback cannot block the core withdrawal logic.
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
 
         Ok(())
@@ -889,10 +892,23 @@ impl GrantContract {
     }
 }
 
+/// Notify a recipient contract about a withdrawal.
+///
+/// The recipient is expected to implement the interface:
+///
+/// ```ignore
+/// fn on_withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), E>
+/// ```
+///
+/// This helper uses `env.try_invoke_contract` so that *any* failure in the
+/// callback (missing contract, missing function, panic, or explicit `Err`) is
+/// swallowed. The withdrawal operation in the grant contract continues normally
+/// regardless of whether the notification succeeded or failed.
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
     use soroban_sdk::{IntoVal, Symbol};
     let args = (grant_id, amount).into_val(env);
-    let _: Result<Result<(), _>, _> = env.try_invoke_contract(
+    // drop both outer and inner errors; nothing should block the withdraw
+    let _ = env.try_invoke_contract(
         recipient,
         &Symbol::new(env, "on_withdraw"),
         args,
