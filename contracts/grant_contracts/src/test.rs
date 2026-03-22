@@ -16,7 +16,7 @@ fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantC
     let contract_id = env.register(GrantContract, ());
     let client = GrantContractClient::new(env, &contract_id);
 
-    client.initialize(&admin, &grant_token_addr.address(), &treasury, &oracle, &native_token_addr.address()).unwrap();
+    client.initialize(&admin, &grant_token_addr.address(), &treasury, &oracle, &native_token_addr.address());
 
     (admin, grant_token_addr.address(), treasury, oracle, native_token_addr.address(), client)
 }
@@ -47,28 +47,38 @@ fn test_pipeline() {
     // Mint tokens to contract for payout
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration).unwrap();
+    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration);
 
     // 2. Advance time and check claimable
     set_timestamp(&env, 1010); // 10 seconds later
     assert_eq!(client.claimable(&grant_id), 10 * SCALING_FACTOR);
 
     // 3. Withdraw
-    client.withdraw(&grant_id, &(5 * SCALING_FACTOR)).unwrap();
+    client.withdraw(&grant_id, &(5 * SCALING_FACTOR));
     assert_eq!(grant_token.balance(&recipient), 5 * SCALING_FACTOR);
     assert_eq!(client.claimable(&grant_id), 5 * SCALING_FACTOR);
 
     // 4. Propose Rate Increase (Timelocked)
     let new_rate = 2 * SCALING_FACTOR;
-    client.propose_rate_change(&grant_id, &new_rate).unwrap();
+    client.propose_rate_change(&grant_id, &new_rate);
     
     let grant = client.get_grant(&grant_id);
     assert_eq!(grant.pending_rate, new_rate);
-    assert_eq!(grant.effective_timestamp, 1010 + 48 * 60 * 10); // Check consistency with lib.rs
+    assert_eq!(grant.effective_timestamp, 1010 + 48 * 60 * 60);
 
     // 5. Advance time past timelock
-    // Wait! In lib.rs we might have different timelock.
-    // I'll check lib.rs constants.
+    set_timestamp(&env, 1010 + 48 * 60 * 60 + 10);
+    assert_eq!(client.claimable(&grant_id), (5 + 172800 + 20) * SCALING_FACTOR);
+
+    // 6. Complete grant
+    set_timestamp(&env, 2000 + 48 * 60 * 60); // Far in the future
+    assert_eq!(client.claimable(&grant_id), total_amount - (5 * SCALING_FACTOR));
+    
+    client.withdraw(&grant_id, &(total_amount - (5 * SCALING_FACTOR)));
+    assert_eq!(grant_token.balance(&recipient), total_amount);
+    
+    let final_grant = client.get_grant(&grant_id);
+    assert_eq!(final_grant.status, GrantStatus::Completed);
 }
 
 #[test]
@@ -83,9 +93,9 @@ fn test_warmup() {
     let flow_rate = 100 * SCALING_FACTOR;
     let warmup_duration = 100; // 100 seconds warmup
     
-    client.create_grant(&grant_id, &recipient, &(10000 * SCALING_FACTOR), &flow_rate, &warmup_duration).unwrap();
+    client.create_grant(&grant_id, &recipient, &(10000 * SCALING_FACTOR), &flow_rate, &warmup_duration);
 
-    // At t=0 (of grant), rate is 25% (scaling factor issues might arise here)
+    // After cleanup, the client will auto-panic on contract error, so we don't need .unwrap()
 }
 
 #[test]
@@ -103,12 +113,12 @@ fn test_rage_quit() {
     // Mock minting
     grant_token_admin.mint(&client.address, &total_amount);
     
-    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0).unwrap();
+    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0);
     
     set_timestamp(&env, 1100); // 100 tokens accrued
-    client.pause_stream(&grant_id).unwrap();
+    client.pause_stream(&grant_id);
     
-    client.rage_quit(&grant_id).unwrap();
+    client.rage_quit(&grant_id);
     
     // Recipient gets accrued
     assert_eq!(grant_token.balance(&recipient), 100 * SCALING_FACTOR);
@@ -127,11 +137,11 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let recipient = Address::generate(&env);
     
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0).unwrap();
+    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0);
     
     // Set source to oracle
     env.set_source_account(&oracle);
-    client.apply_kpi_multiplier(&grant_id, &2).unwrap();
+    client.apply_kpi_multiplier(&grant_id, &2);
     
     let grant = client.get_grant(&grant_id);
     assert_eq!(grant.flow_rate, 2 * SCALING_FACTOR);
@@ -146,10 +156,10 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0).unwrap();
+    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0);
     
     set_timestamp(&env, 1100); // 100 accrued
-    client.apply_kpi_multiplier(&grant_id, &2).unwrap();
+    client.apply_kpi_multiplier(&grant_id, &2);
     
     let grant = client.get_grant(&grant_id);
     assert_eq!(grant.claimable, 100 * SCALING_FACTOR);
@@ -165,9 +175,9 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let recipient = Address::generate(&env);
     
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0).unwrap();
+    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0);
     
-    // Invalid multiplier
+    // Invalid multiplier - use try_ methods for expected failures
     let res = client.try_apply_kpi_multiplier(&grant_id, &0).unwrap();
     assert_eq!(res, Err(Error::InvalidRate));
     
@@ -175,7 +185,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     assert_eq!(res, Err(Error::InvalidRate));
     
     // Inactive state (Cancelled)
-    client.cancel_grant(&grant_id).unwrap();
+    client.cancel_grant(&grant_id);
     let res = client.try_apply_kpi_multiplier(&grant_id, &2).unwrap();
     assert_eq!(res, Err(Error::InvalidState));
 }
@@ -189,15 +199,15 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0).unwrap();
+    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0);
     
     // Propose rate change
     set_timestamp(&env, 1100);
-    client.propose_rate_change(&grant_id, &(2 * SCALING_FACTOR)).unwrap();
+    client.propose_rate_change(&grant_id, &(2 * SCALING_FACTOR));
     
     // Apply KPI multiplier (2x)
     set_timestamp(&env, 1150);
-    client.apply_kpi_multiplier(&grant_id, &2).unwrap();
+    client.apply_kpi_multiplier(&grant_id, &2);
     
     let grant = client.get_grant(&grant_id);
     // flow_rate was 1, now 2
