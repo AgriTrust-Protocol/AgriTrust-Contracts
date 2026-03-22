@@ -393,6 +393,9 @@ impl GrantContract {
         
         let old_rate = grant.flow_rate;
         grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        if grant.pending_rate > 0 {
+            grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        }
         grant.rate_updated_at = env.ledger().timestamp();
 
         write_grant(&env, grant_id, &grant);
