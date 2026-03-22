@@ -428,6 +428,30 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        require_admin_auth(&env)?;
+        
+        if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        
+        let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+        grant.status = GrantStatus::Cancelled;
+        write_grant(&env, grant_id, &grant);
+
+        if remaining > 0 {
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+        }
+
+        Ok(())
+    }
+
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
         require_admin_auth(&env)?;
         if amount <= 0 { return Err(Error::InvalidAmount); }
