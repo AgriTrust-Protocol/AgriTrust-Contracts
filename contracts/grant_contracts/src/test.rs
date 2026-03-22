@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{Error, GrantContract, GrantContractClient, GrantStatus, SCALING_FACTOR};
+use super::{GrantContract, GrantContractClient, GrantStatus, SCALING_FACTOR};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env,
@@ -34,7 +34,7 @@ fn test_pipeline() {
     let (_admin, grant_token_addr, treasury, _oracle, _native, client) = setup_test(&env);
     let recipient = Address::generate(&env);
     let grant_token = token::Client::new(&env, &grant_token_addr);
-    let grant_token_admin = token::StellarAssetContractClient::new(&env, &grant_token_addr);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
 
     set_timestamp(&env, 1000);
     
@@ -107,7 +107,7 @@ fn test_rage_quit() {
     let (_admin, grant_token_addr, treasury, _oracle, _native, client) = setup_test(&env);
     let recipient = Address::generate(&env);
     let grant_token = token::Client::new(&env, &grant_token_addr);
-    let grant_token_admin = token::StellarAssetContractClient::new(&env, &grant_token_addr);
+    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
@@ -142,7 +142,7 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0);
     
     // Set source to oracle
-    // env.set_source_account(&oracle);
+    // env.set_source_account(&oracle); // Removed invalid method call for SDK 22
     client.apply_kpi_multiplier(&grant_id, &2);
     
     let grant = client.get_grant(&grant_id);
