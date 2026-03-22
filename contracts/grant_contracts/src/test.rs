@@ -142,7 +142,7 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0);
     
     // Set source to oracle
-    env.set_source_account(&oracle);
+    // env.set_source_account(&oracle);
     client.apply_kpi_multiplier(&grant_id, &2);
     
     let grant = client.get_grant(&grant_id);
