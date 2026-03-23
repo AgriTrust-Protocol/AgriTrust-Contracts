@@ -2,8 +2,15 @@
 resolver = "2"
 members = ["contracts/grant_contracts", "contracts/vesting_contracts"]
 
-[workspace.dependencies]
-soroban-sdk = "20.0.0"
+[lib]
+crate-type = ["cdylib"]
+path = "contracts/grant_contracts/src/lib.rs"
+
+[dependencies]
+soroban-sdk = "22.0.0"
+
+[dev-dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"

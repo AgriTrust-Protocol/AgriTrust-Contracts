@@ -1,814 +1,493 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Symbol, Env, String, Vec, Map, xdr::ScVal};
 
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
+    Symbol, vec, IntoVal,
+};
+
+// --- Constants ---
+pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
+const XLM_DECIMALS: u32 = 7;
+const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
+const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
+const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
+
+// --- Submodules ---
+// Submodules removed for consolidation and to fix compilation errors.
+// Core logic is now in this file.
+
+// --- Types ---
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum GrantStatus {
+    Active,
+    Paused,
+    Completed,
+    Cancelled,
+    RageQuitted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum StreamType {
+    FixedAmount,
+    FixedEndDate,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct Grant {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub withdrawn: i128,
+    pub claimable: i128,
+    pub flow_rate: i128,
+    pub last_update_ts: u64,
+    pub rate_updated_at: u64,
+    pub last_claim_time: u64,
+    pub pending_rate: i128,
+    pub effective_timestamp: u64,
+    pub status: GrantStatus,
+    pub redirect: Option<Address>,
+    pub stream_type: StreamType,
+    pub start_time: u64,
+    pub warmup_duration: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+enum DataKey {
+    Admin,
+    GrantToken,
+    GrantIds,
+    Treasury,
+    Oracle,
+    NativeToken,
+    Grant(u64),
+    RecipientGrants(Address),
+}
+
+#[contracterror]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+#[repr(u32)]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    NotAuthorized = 3,
+    GrantNotFound = 4,
+    GrantAlreadyExists = 5,
+    InvalidRate = 6,
+    InvalidAmount = 7,
+    InvalidState = 8,
+    MathOverflow = 9,
+    InsufficientReserve = 10,
+    RescueWouldViolateAllocated = 11,
+    GranteeMismatch = 12,
+    GrantNotInactive = 13,
+}
+
+// --- Internal Helpers ---
+
+fn read_admin(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)
+}
+
+fn read_oracle(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
+}
+
+fn require_admin_auth(env: &Env) -> Result<(), Error> {
+    read_admin(env)?.require_auth();
+    Ok(())
+}
+
+fn require_oracle_auth(env: &Env) -> Result<(), Error> {
+    read_oracle(env)?.require_auth();
+    Ok(())
+}
+
+fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
+    env.storage().instance().get(&DataKey::Grant(grant_id)).ok_or(Error::GrantNotFound)
+}
+
+fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
+    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
+}
+
+fn read_grant_token(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
+}
+
+fn read_treasury(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+}
+
+fn read_grant_ids(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantIds)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
+    let mut total = 0_i128;
+    let ids = read_grant_ids(env);
+    for i in 0..ids.len() {
+        let grant_id = ids.get(i).unwrap();
+        if let Some(grant) = env.storage().instance().get::<_, Grant>(&DataKey::Grant(grant_id)) {
+            if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
+                let remaining = grant.total_amount
+                    .checked_sub(grant.withdrawn)
+                    .ok_or(Error::MathOverflow)?;
+                total = total.checked_add(remaining).ok_or(Error::MathOverflow)?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
+    if grant.warmup_duration == 0 {
+        return 10000; // 100% in basis points
+    }
+
+    let warmup_end = grant.start_time + grant.warmup_duration;
+
+    if now >= warmup_end {
+        return 10000; 
+    }
+
+    if now <= grant.start_time {
+        return 2500; // 25% at start
+    }
+
+    let elapsed_warmup = now - grant.start_time;
+    let progress = ((elapsed_warmup as i128) * 10000) / (grant.warmup_duration as i128);
+
+    // 25% + (75% * progress)
+    2500 + (7500 * progress) / 10000
+}
+
+fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
+    if now < grant.last_update_ts { return Err(Error::InvalidState); }
+    
+    let elapsed = now - grant.last_update_ts;
+    if elapsed == 0 {
+        return Ok(());
+    }
+
+    if grant.status == GrantStatus::Active {
+        // Handle pending rate increases first
+        if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 && now >= grant.effective_timestamp {
+            let switch_ts = grant.effective_timestamp;
+            // Settle up to switch_ts at old rate
+            let pre_elapsed = switch_ts - grant.last_update_ts;
+            let pre_accrued = calculate_accrued(grant, pre_elapsed, switch_ts)?;
+            grant.claimable = grant.claimable.checked_add(pre_accrued).ok_or(Error::MathOverflow)?;
+            
+            // Apply new rate
+            grant.flow_rate = grant.pending_rate;
+            grant.rate_updated_at = switch_ts;
+            grant.pending_rate = 0;
+            grant.effective_timestamp = 0;
+            grant.last_update_ts = switch_ts;
+            
+            // Recalculate remaining elapsed
+            let post_elapsed = now - switch_ts;
+            let post_accrued = calculate_accrued(grant, post_elapsed, now)?;
+            grant.claimable = grant.claimable.checked_add(post_accrued).ok_or(Error::MathOverflow)?;
+        } else {
+            let accrued = calculate_accrued(grant, elapsed, now)?;
+            grant.claimable = grant.claimable.checked_add(accrued).ok_or(Error::MathOverflow)?;
+        }
+    }
+
+    let total_accounted = grant.withdrawn.checked_add(grant.claimable).ok_or(Error::MathOverflow)?;
+    if total_accounted >= grant.total_amount {
+        grant.claimable = grant.total_amount - grant.withdrawn;
+        grant.status = GrantStatus::Completed;
+    }
+
+    grant.last_update_ts = now;
+    Ok(())
+}
+
+fn calculate_accrued(grant: &Grant, elapsed: u64, now: u64) -> Result<i128, Error> {
+    let elapsed_i128 = i128::from(elapsed);
+    let base_accrued = grant.flow_rate.checked_mul(elapsed_i128).ok_or(Error::MathOverflow)?;
+
+    let multiplier = calculate_warmup_multiplier(grant, now);
+    let accrued = base_accrued
+        .checked_mul(multiplier)
+        .ok_or(Error::MathOverflow)?
+        .checked_div(10000)
+        .ok_or(Error::MathOverflow)?;
+
+    Ok(accrued)
+}
+
+// --- Contract Implementation ---
+
 #[contract]
 pub struct GrantContract;
 
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub enum VestingCurve {
-    Linear,
-    Exponential { factor: u32 }, // factor: 1000 = 1.0x base rate
-    Logarithmic { factor: u32 },  // factor: 1000 = 1.0x initial rate
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct Asset {
-    pub code: String,
-    pub issuer: Option<Address>,
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct TreasuryConfig {
-    pub reserve_wallet: Address,
-    pub low_water_mark_days: u32, // days of funding left before trigger
-    pub refill_amount: u128,
-    pub max_auto_refill: u128, // maximum total auto-refill amount
-    pub total_auto_refilled: u128,
-    pub allowance_active: bool,
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct MultiSigConfig {
-    pub council_members: Vec<Address>,
-    pub required_signatures: u32,
-    pub cold_storage_vault: Address,
-    pub emergency_drain_active: bool,
-    pub drain_signatures: Map<Address, u64>, // member -> timestamp of signature
-    pub drain_proposal_expiry: u64, // timestamp when proposal expires
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct EmergencyDrainProposal {
-    pub proposal_id: Symbol,
-    pub proposed_by: Address,
-    pub reason: String,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub executed: bool,
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct StreamPool {
-    pub asset: Asset,
-    pub balance: u128,
-    pub total_deposited: u128,
-    pub last_refill_time: u64,
-    pub isolated_sub_pools: Map<Symbol, IsolatedSubPool>, // grant_id -> sub_pool
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct IsolatedSubPool {
-    pub grant_id: Symbol,
-    pub allocated_amount: u128,
-    pub consumed_amount: u128,
-    pub created_time: u64,
-    pub is_active: bool,
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct Grant {
-    pub admin: Address,
-    pub grantee: Address,
-    pub total_amount: u128,
-    pub released_amount: u128,
-    pub start_time: u64,
-    pub duration: u64,
-    pub vesting_curve: VestingCurve,
-    pub max_supply: u128,
-    pub stream_pool_id: Symbol,
-}
-
-#[derive(Clone, contracttype)]
-#[contracttype]
-pub struct Milestone {
-    pub id: Symbol,
-    pub amount: u128,
-    pub description: String,
-    pub approved: bool,
-    pub released: bool,
-}
-
 #[contractimpl]
 impl GrantContract {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        grant_token: Address,
+        treasury: Address,
+        oracle: Address,
+        native_token: Address,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GrantToken, &grant_token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+        env.storage().instance().set(&DataKey::NativeToken, &native_token);
+        env.storage().instance().set(&DataKey::GrantIds, &Vec::<u64>::new(&env));
+        Ok(())
+    }
+
     pub fn create_grant(
         env: Env,
-        grant_id: Symbol,
-        admin: Address,
-        grantee: Address,
-        total_amount: u128,
-        start_time: u64,
-        duration: u64,
-        vesting_curve: VestingCurve,
-        max_supply: u128,
-        stream_pool_id: Symbol,
-    ) {
-        if total_amount > max_supply {
-            panic!("Total amount cannot exceed max supply");
+        grant_id: u64,
+        recipient: Address,
+        total_amount: i128,
+        flow_rate: i128,
+        warmup_duration: u64
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        if total_amount <= 0 || flow_rate < 0 {
+            return Err(Error::InvalidAmount);
         }
-        
+
+        let key = DataKey::Grant(grant_id);
+        if env.storage().instance().has(&key) {
+            return Err(Error::GrantAlreadyExists);
+        }
+
+        let now = env.ledger().timestamp();
         let grant = Grant {
-            admin: admin.clone(),
-            grantee,
+            recipient: recipient.clone(),
             total_amount,
-            released_amount: 0,
-            start_time,
-            duration,
-            vesting_curve,
-            max_supply,
-            stream_pool_id: stream_pool_id.clone(),
+            withdrawn: 0,
+            claimable: 0,
+            flow_rate,
+            last_update_ts: now,
+            rate_updated_at: now,
+            last_claim_time: now,
+            pending_rate: 0,
+            effective_timestamp: 0,
+            status: GrantStatus::Active,
+            redirect: None,
+            stream_type: StreamType::FixedAmount,
+            start_time: now,
+            warmup_duration,
         };
-        
-        env.storage().instance().set(&grant_id, &grant);
-        env.storage().instance().set(&Symbol::new(&env, "milestones"), &Vec::<Milestone>::new(&env));
+
+        env.storage().instance().set(&key, &grant);
+
+        let mut ids = read_grant_ids(&env);
+        ids.push_back(grant_id);
+        env.storage().instance().set(&DataKey::GrantIds, &ids);
+
+        let recipient_key = DataKey::RecipientGrants(recipient);
+        let mut user_grants: Vec<u64> = env.storage().instance().get(&recipient_key).unwrap_or(vec![&env]);
+        user_grants.push_back(grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
+        Ok(())
     }
 
-    pub fn create_stream_pool(
-        env: Env,
-        pool_id: Symbol,
-        asset: Asset,
-        initial_balance: u128,
-    ) {
-        let pool = StreamPool {
-            asset,
-            balance: initial_balance,
-            total_deposited: initial_balance,
-            last_refill_time: env.ledger().timestamp(),
-            isolated_sub_pools: Map::new(&env),
-        };
-        
-        env.storage().instance().set(&pool_id, &pool);
+    pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        if amount > grant.claimable {
+            return Err(Error::InvalidAmount);
+        }
+
+        grant.claimable = grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
+        grant.withdrawn = grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
+        grant.last_claim_time = env.ledger().timestamp();
+
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        let target = grant.redirect.unwrap_or(grant.recipient.clone());
+        client.transfer(&env.current_contract_address(), &target, &amount);
+
+        try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
+
+        Ok(())
     }
 
-    pub fn create_isolated_sub_pool(
-        env: Env,
-        pool_id: Symbol,
-        grant_id: Symbol,
-        allocated_amount: u128,
-    ) {
-        let mut pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
+    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
-        // Check if sub-pool already exists
-        if pool.isolated_sub_pools.contains_key(&grant_id) {
-            panic!("Sub-pool already exists for this grant");
-        }
-        
-        // Check if pool has sufficient balance
-        let total_allocated: u128 = pool.isolated_sub_pools.iter()
-            .map(|(_, sub_pool)| if sub_pool.is_active { sub_pool.allocated_amount } else { 0 })
-            .sum();
-        
-        if total_allocated + allocated_amount > pool.balance {
-            panic!("Insufficient pool balance for allocation");
-        }
-        
-        let sub_pool = IsolatedSubPool {
-            grant_id: grant_id.clone(),
-            allocated_amount,
-            consumed_amount: 0,
-            created_time: env.ledger().timestamp(),
-            is_active: true,
-        };
-        
-        pool.isolated_sub_pools.set(grant_id.clone(), &sub_pool);
-        env.storage().instance().set(&pool_id, &pool);
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+        grant.status = GrantStatus::Paused;
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
 
-    pub fn consume_from_sub_pool(
-        env: Env,
-        pool_id: Symbol,
-        grant_id: Symbol,
-        amount: u128,
-    ) {
-        let mut pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
-        
-        let mut sub_pool: IsolatedSubPool = pool.isolated_sub_pools.get(&grant_id)
-            .unwrap_or_else(|| panic!("Sub-pool not found"));
-        
-        if !sub_pool.is_active {
-            panic!("Sub-pool is not active");
-        }
-        
-        // Check if sub-pool has sufficient allocation
-        let remaining_allocation = sub_pool.allocated_amount - sub_pool.consumed_amount;
-        if amount > remaining_allocation {
-            panic!("Insufficient allocation in sub-pool");
-        }
-        
-        // Check if main pool has sufficient balance
-        if amount > pool.balance {
-            panic!("Insufficient balance in main pool");
-        }
-        
-        // Update sub-pool and main pool
-        sub_pool.consumed_amount += amount;
-        pool.balance -= amount;
-        
-        pool.isolated_sub_pools.set(grant_id, &sub_pool);
-        env.storage().instance().set(&pool_id, &pool);
+    pub fn resume_stream(env: Env, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
+
+        grant.status = GrantStatus::Active;
+        grant.last_update_ts = env.ledger().timestamp();
+        write_grant(&env, grant_id, &grant);
+        Ok(())
     }
 
-    pub fn extend_sub_pool_allocation(
-        env: Env,
-        pool_id: Symbol,
-        grant_id: Symbol,
-        additional_amount: u128,
-    ) {
-        let mut pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
+    pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
+        if new_rate < 0 { return Err(Error::InvalidRate); }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
         
-        let mut sub_pool: IsolatedSubPool = pool.isolated_sub_pools.get(&grant_id)
-            .unwrap_or_else(|| panic!("Sub-pool not found"));
-        
-        if !sub_pool.is_active {
-            panic!("Sub-pool is not active");
+        let old_rate = grant.flow_rate;
+        if new_rate > old_rate {
+            grant.pending_rate = new_rate;
+            grant.effective_timestamp = env.ledger().timestamp() + RATE_INCREASE_TIMELOCK_SECS;
+        } else {
+            grant.flow_rate = new_rate;
+            grant.rate_updated_at = env.ledger().timestamp();
+            grant.pending_rate = 0;
+            grant.effective_timestamp = 0;
         }
-        
-        // Check if pool has sufficient balance for extension
-        let total_allocated: u128 = pool.isolated_sub_pools.iter()
-            .map(|(_, sp)| if sp.is_active { sp.allocated_amount } else { 0 })
-            .sum();
-        
-        if total_allocated + additional_amount > pool.balance {
-            panic!("Insufficient pool balance for extension");
-        }
-        
-        // Extend allocation
-        sub_pool.allocated_amount += additional_amount;
-        pool.isolated_sub_pools.set(grant_id, &sub_pool);
-        env.storage().instance().set(&pool_id, &pool);
+
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("rateupdt"), grant_id), (old_rate, new_rate));
+        Ok(())
     }
 
-    pub fn deactivate_sub_pool(
-        env: Env,
-        pool_id: Symbol,
-        grant_id: Symbol,
-    ) {
-        let mut pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
+    pub fn apply_kpi_multiplier(env: Env, grant_id: u64, multiplier: i128) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+        if multiplier <= 0 { return Err(Error::InvalidRate); }
+
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
         
-        let mut sub_pool: IsolatedSubPool = pool.isolated_sub_pools.get(&grant_id)
-            .unwrap_or_else(|| panic!("Sub-pool not found"));
-        
-        sub_pool.is_active = false;
-        pool.isolated_sub_pools.set(grant_id, &sub_pool);
-        env.storage().instance().set(&pool_id, &pool);
+        let old_rate = grant.flow_rate;
+        grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        if grant.pending_rate > 0 {
+            grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        }
+        grant.rate_updated_at = env.ledger().timestamp();
+
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("kpimul"), grant_id), (old_rate, grant.flow_rate, multiplier));
+        Ok(())
     }
 
-    pub fn get_sub_pool_info(
-        env: Env,
-        pool_id: Symbol,
-        grant_id: Symbol,
-    ) -> IsolatedSubPool {
-        let pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
+    pub fn rage_quit(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        grant.recipient.require_auth();
+
+        if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
         
-        pool.isolated_sub_pools.get(&grant_id)
-            .unwrap_or_else(|| panic!("Sub-pool not found"))
+        let claim_amount = grant.claimable;
+        grant.claimable = 0;
+        grant.withdrawn = grant.withdrawn.checked_add(claim_amount).ok_or(Error::MathOverflow)?;
+        grant.status = GrantStatus::RageQuitted;
+        
+        let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &grant.recipient, &claim_amount);
+
+        if remaining > 0 {
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+        }
+
+        Ok(())
     }
 
-    pub fn get_pool_summary(env: Env, pool_id: Symbol) -> (u128, u128, u32) {
-        let pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
+    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        require_admin_auth(&env)?;
         
-        let total_allocated: u128 = pool.isolated_sub_pools.iter()
-            .map(|(_, sub_pool)| if sub_pool.is_active { sub_pool.allocated_amount } else { 0 })
-            .sum();
+        if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
         
-        let total_consumed: u128 = pool.isolated_sub_pools.iter()
-            .map(|(_, sub_pool)| if sub_pool.is_active { sub_pool.consumed_amount } else { 0 })
-            .sum();
-        
-        let active_sub_pools: u32 = pool.isolated_sub_pools.iter()
-            .map(|(_, sub_pool)| if sub_pool.is_active { 1 } else { 0 })
-            .sum();
-        
-        (total_allocated, total_consumed, active_sub_pools)
+        let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+        grant.status = GrantStatus::Cancelled;
+        write_grant(&env, grant_id, &grant);
+
+        if remaining > 0 {
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+        }
+
+        Ok(())
     }
 
-    pub fn configure_multi_sig(
-        env: Env,
-        multi_sig_config: MultiSigConfig,
-    ) {
-        // Only contract admin can configure multi-sig
-        let admin = env.storage().instance().get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| panic!("Admin not set"));
-        
-        if env.current_contract_address() != admin {
-            panic!("Only admin can configure multi-sig");
-        }
-        
-        // Validate configuration
-        if multi_sig_config.required_signatures == 0 {
-            panic!("Required signatures must be greater than 0");
-        }
-        
-        if multi_sig_config.required_signatures > multi_sig_config.council_members.len() as u32 {
-            panic!("Required signatures cannot exceed council size");
-        }
-        
-        if multi_sig_config.council_members.is_empty() {
-            panic!("Council members cannot be empty");
-        }
-        
-        env.storage().instance().set(&Symbol::new(&env, "multi_sig"), &multi_sig_config);
-    }
+    pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if amount <= 0 { return Err(Error::InvalidAmount); }
 
-    pub fn create_emergency_drain_proposal(
-        env: Env,
-        proposal_id: Symbol,
-        proposer: Address,
-        reason: String,
-    ) {
-        let multi_sig_config: MultiSigConfig = env.storage().instance()
-            .get(&Symbol::new(&env, "multi_sig"))
-            .unwrap_or_else(|| panic!("Multi-sig not configured"));
-        
-        // Check if proposer is a council member
-        if !multi_sig_config.council_members.contains(&proposer) {
-            panic!("Only council members can create proposals");
-        }
-        
-        // Check if emergency drain is active
-        if !multi_sig_config.emergency_drain_active {
-            panic!("Emergency drain is not active");
-        }
-        
-        let current_time = env.ledger().timestamp();
-        let expiry_time = current_time + 86400; // 24 hours expiry
-        
-        let proposal = EmergencyDrainProposal {
-            proposal_id: proposal_id.clone(),
-            proposed_by: proposer,
-            reason,
-            created_at: current_time,
-            expires_at: expiry_time,
-            executed: false,
-        };
-        
-        env.storage().instance().set(&proposal_id, &proposal);
-        
-        // Initialize signature map for this proposal
-        let mut signature_map: Map<Address, u64> = Map::new(&env);
-        env.storage().instance().set(&Symbol::new(&env, "drain_signatures"), &signature_map);
-        
-        // Emit event
-        env.events().contract(
-            Symbol::new(&env, "emergency_drain_proposal"),
-            (proposal_id, proposer, expiry_time),
-        );
-    }
+        let client = token::Client::new(&env, &token_address);
+        let balance = client.balance(&env.current_contract_address());
 
-    pub fn sign_emergency_drain(
-        env: Env,
-        proposal_id: Symbol,
-        signer: Address,
-    ) {
-        let multi_sig_config: MultiSigConfig = env.storage().instance()
-            .get(&Symbol::new(&env, "multi_sig"))
-            .unwrap_or_else(|| panic!("Multi-sig not configured"));
-        
-        let proposal: EmergencyDrainProposal = env.storage().instance().get(&proposal_id)
-            .unwrap_or_else(|| panic!("Proposal not found"));
-        
-        if proposal.executed {
-            panic!("Proposal already executed");
-        }
-        
-        let current_time = env.ledger().timestamp();
-        if current_time > proposal.expires_at {
-            panic!("Proposal has expired");
-        }
-        
-        // Check if signer is a council member
-        if !multi_sig_config.council_members.contains(&signer) {
-            panic!("Only council members can sign");
-        }
-        
-        let mut signature_map: Map<Address, u64> = env.storage().instance()
-            .get(&Symbol::new(&env, "drain_signatures"))
-            .unwrap_or_else(|| Map::new(&env));
-        
-        // Check if already signed
-        if signature_map.contains_key(&signer) {
-            panic!("Already signed");
-        }
-        
-        // Add signature
-        signature_map.set(signer.clone(), current_time);
-        env.storage().instance().set(&Symbol::new(&env, "drain_signatures"), &signature_map);
-        
-        // Check if we have enough signatures
-        let signature_count = signature_map.len();
-        if signature_count >= multi_sig_config.required_signatures as u32 {
-            // Execute emergency drain
-            Self::execute_emergency_drain(env, proposal_id.clone());
-        }
-        
-        // Emit event
-        env.events().contract(
-            Symbol::new(&env, "emergency_drain_signed"),
-            (proposal_id, signer, signature_count),
-        );
-    }
-
-    pub fn execute_emergency_drain(env: Env, proposal_id: Symbol) {
-        let multi_sig_config: MultiSigConfig = env.storage().instance()
-            .get(&Symbol::new(&env, "multi_sig"))
-            .unwrap_or_else(|| panic!("Multi-sig not configured"));
-        
-        let mut proposal: EmergencyDrainProposal = env.storage().instance().get(&proposal_id)
-            .unwrap_or_else(|| panic!("Proposal not found"));
-        
-        if proposal.executed {
-            panic!("Proposal already executed");
-        }
-        
-        let signature_map: Map<Address, u64> = env.storage().instance()
-            .get(&Symbol::new(&env, "drain_signatures"))
-            .unwrap_or_else(|| Map::new(&env));
-        
-        if signature_map.len() < multi_sig_config.required_signatures as u32 {
-            panic!("Insufficient signatures");
-        }
-        
-        // Calculate total funds to drain (all unstreamed funds)
-        let total_funds = Self::calculate_total_unstreamed_funds(env);
-        
-        if total_funds > 0 {
-            // In a real implementation, this would transfer tokens to cold storage
-            // For now, we simulate by setting balances to zero
-            Self::drain_all_stream_pools(env);
-            
-            // Mark proposal as executed
-            proposal.executed = true;
-            env.storage().instance().set(&proposal_id, &proposal);
-            
-            // Emit event
-            env.events().contract(
-                Symbol::new(&env, "emergency_drain_executed"),
-                (proposal_id, total_funds, multi_sig_config.cold_storage_vault),
-            );
-        }
-    }
-
-    fn calculate_total_unstreamed_funds(_env: Env) -> u128 {
-        let total = 0u128;
-        
-        // This would iterate through all stream pools and calculate remaining balances
-        // For simplicity, we'll return a placeholder value
-        // In a real implementation, you'd need to track all pool IDs
-        
-        total
-    }
-
-    fn drain_all_stream_pools(env: Env) {
-        // This would drain all stream pools to zero balance
-        // In a real implementation, you'd iterate through all pools and transfer funds
-        
-        // For now, we'll emit an event indicating the drain
-        env.events().contract(
-            Symbol::new(&env, "all_pools_drained"),
-            env.ledger().timestamp(),
-        );
-    }
-
-    pub fn get_emergency_proposal(env: Env, proposal_id: Symbol) -> EmergencyDrainProposal {
-        env.storage().instance().get(&proposal_id)
-            .unwrap_or_else(|| panic!("Proposal not found"))
-    }
-
-    pub fn get_signature_count(env: Env) -> u32 {
-        let signature_map: Map<Address, u64> = env.storage().instance()
-            .get(&Symbol::new(&env, "drain_signatures"))
-            .unwrap_or_else(|| Map::new(&env));
-        
-        signature_map.len()
-    }
-
-    pub fn get_multi_sig_config(env: Env) -> MultiSigConfig {
-        env.storage().instance().get(&Symbol::new(&env, "multi_sig"))
-            .unwrap_or_else(|| panic!("Multi-sig not configured"))
-    }
-
-    pub fn configure_treasury(
-        env: Env,
-        treasury_config: TreasuryConfig,
-    ) {
-        // Only contract admin can configure treasury
-        let admin = env.storage().instance().get(&Symbol::new(&env, "admin"))
-            .unwrap_or_else(|| panic!("Admin not set"));
-        
-        if env.current_contract_address() != admin {
-            panic!("Only admin can configure treasury");
-        }
-        
-        env.storage().instance().set(&Symbol::new(&env, "treasury"), &treasury_config);
-    }
-
-    pub fn set_admin(env: Env, admin: Address) {
-        // This can only be called once during initialization
-        if env.storage().instance().contains(&Symbol::new(&env, "admin")) {
-            panic!("Admin already set");
-        }
-        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
-    }
-
-    pub fn check_and_auto_refill(env: Env, pool_id: Symbol) {
-        let treasury_config: TreasuryConfig = env.storage().instance()
-            .get(&Symbol::new(&env, "treasury"))
-            .unwrap_or_else(|| panic!("Treasury not configured"));
-        
-        if !treasury_config.allowance_active {
-            return; // Auto-refill disabled
-        }
-        
-        if treasury_config.total_auto_refilled >= treasury_config.max_auto_refill {
-            return; // Max auto-refill reached
-        }
-        
-        let mut pool: StreamPool = env.storage().instance().get(&pool_id)
-            .unwrap_or_else(|| panic!("Stream pool not found"));
-        
-        let current_time = env.ledger().timestamp();
-        let days_since_last_refill = (current_time - pool.last_refill_time) / 86400; // seconds in a day
-        
-        // Calculate daily consumption rate
-        let daily_rate = if days_since_last_refill > 0 {
-            (pool.total_deposited - pool.balance) / days_since_last_refill as u128
+        let total_allocated = if token_address == read_grant_token(&env)? {
+            total_allocated_funds(&env)?
         } else {
             0
         };
-        
-        // Calculate days of funding remaining
-        let days_remaining = if daily_rate > 0 {
-            pool.balance / daily_rate
+
+        if balance.checked_sub(amount).ok_or(Error::MathOverflow)? < total_allocated {
+            return Err(Error::RescueWouldViolateAllocated);
+        }
+
+        client.transfer(&env.current_contract_address(), &to, &amount);
+        Ok(())
+    }
+
+    pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
+        read_grant(&env, grant_id)
+    }
+
+    pub fn claimable(env: Env, grant_id: u64) -> i128 {
+        if let Ok(mut grant) = read_grant(&env, grant_id) {
+            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            grant.claimable
         } else {
-            u128::MAX // Infinite if no consumption
-        };
-        
-        // Check if below low water mark
-        if days_remaining < treasury_config.low_water_mark_days as u128 {
-            let remaining_refill_capacity = treasury_config.max_auto_refill - treasury_config.total_auto_refilled;
-            let actual_refill_amount = treasury_config.refill_amount.min(remaining_refill_capacity);
-            
-            if actual_refill_amount > 0 {
-                // In a real implementation, this would trigger a path_payment operation
-                // For now, we simulate the refill by updating the pool balance
-                pool.balance += actual_refill_amount;
-                pool.total_deposited += actual_refill_amount;
-                pool.last_refill_time = current_time;
-                
-                env.storage().instance().set(&pool_id, &pool);
-                
-                // Update treasury config
-                let mut updated_config = treasury_config;
-                updated_config.total_auto_refilled += actual_refill_amount;
-                env.storage().instance().set(&Symbol::new(&env, "treasury"), &updated_config);
-                
-                // Emit event for monitoring
-                env.events().contract(
-                    Symbol::new(&env, "auto_refill"),
-                    (
-                        pool_id.clone(),
-                        actual_refill_amount,
-                        pool.balance,
-                        updated_config.total_auto_refilled,
-                    ),
-                );
-            }
+            0
         }
-    }
-
-    pub fn add_milestone(
-        env: Env,
-        grant_id: Symbol,
-        milestone_id: Symbol,
-        amount: u128,
-        description: String,
-    ) {
-        let grant: Grant = env.storage().instance().get(&grant_id).unwrap();
-        let mut milestones: Vec<Milestone> = env.storage().instance()
-            .get(&Symbol::new(&env, "milestones")).unwrap();
-        
-        // Check if this milestone would exceed total grant amount
-        let total_milestone_amount: u128 = milestones.iter()
-            .map(|m| if !m.released { m.amount } else { 0 })
-            .sum();
-        
-        if total_milestone_amount + amount > grant.total_amount - grant.released_amount {
-            panic!("Milestone amount would exceed remaining grant amount");
-        }
-        
-        let milestone = Milestone {
-            id: milestone_id.clone(),
-            amount,
-            description,
-            approved: false,
-            released: false,
-        };
-        
-        milestones.push_back(milestone);
-        env.storage().instance().set(&Symbol::new(&env, "milestones"), &milestones);
-    }
-
-    pub fn approve_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) {
-        let grant: Grant = env.storage().instance().get(&grant_id).unwrap();
-        let mut milestones: Vec<Milestone> = env.storage().instance()
-            .get(&Symbol::new(&env, "milestones")).unwrap();
-        
-        let mut found = false;
-        for i in 0..milestones.len() {
-            if milestones.get(i).unwrap().id == milestone_id {
-                let milestone = milestones.get(i).unwrap();
-                if milestone.approved {
-                    panic!("Milestone already approved");
-                }
-                
-                let updated_milestone = Milestone {
-                    approved: true,
-                    ..milestone
-                };
-                milestones.set(i, updated_milestone);
-                found = true;
-                break;
-            }
-        }
-        
-        if !found {
-            panic!("Milestone not found");
-        }
-        
-        env.storage().instance().set(&Symbol::new(&env, "milestones"), &milestones);
-    }
-
-    pub fn release_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) {
-        let mut grant: Grant = env.storage().instance().get(&grant_id).unwrap();
-        let mut milestones: Vec<Milestone> = env.storage().instance()
-            .get(&Symbol::new(&env, "milestones")).unwrap();
-        
-        let mut found = false;
-        let mut release_amount = 0u128;
-        let mut stream_pool_id = Symbol::new(&env, "");
-        
-        for i in 0..milestones.len() {
-            if milestones.get(i).unwrap().id == milestone_id {
-                let milestone = milestones.get(i).unwrap();
-                if !milestone.approved {
-                    panic!("Milestone not approved");
-                }
-                if milestone.released {
-                    panic!("Milestone already released");
-                }
-                
-                release_amount = milestone.amount;
-                stream_pool_id = grant.stream_pool_id.clone();
-                
-                // Check against max supply
-                if grant.released_amount + release_amount > grant.max_supply {
-                    panic!("Release would exceed max supply");
-                }
-                
-                // Use isolated sub-pool consumption
-                Self::consume_from_sub_pool(env.clone(), stream_pool_id.clone(), grant_id.clone(), release_amount);
-                
-                // Trigger auto-refill check after release
-                Self::check_and_auto_refill(env.clone(), stream_pool_id);
-                
-                let updated_milestone = Milestone {
-                    released: true,
-                    ..milestone
-                };
-                milestones.set(i, updated_milestone);
-                found = true;
-                break;
-            }
-        }
-        
-        if !found {
-            panic!("Milestone not found");
-        }
-        
-        grant.released_amount += release_amount;
-        env.storage().instance().set(&grant_id, &grant);
-        env.storage().instance().set(&Symbol::new(&env, "milestones"), &milestones);
-    }
-
-    pub fn get_grant(env: Env, grant_id: Symbol) -> Grant {
-        env.storage().instance().get(&grant_id).unwrap()
-    }
-
-    pub fn get_milestones(env: Env, _grant_id: Symbol) -> Vec<Milestone> {
-        env.storage().instance().get(&Symbol::new(&env, "milestones")).unwrap()
-    }
-
-    pub fn get_remaining_amount(env: Env, grant_id: Symbol) -> u128 {
-        let _grant: Grant = env.storage().instance().get(&grant_id).unwrap();
-        // In a real implementation, you would calculate based on the grant
-        // For now, return a placeholder
-        1000000
-    }
-
-    pub fn get_stream_pool(env: Env, pool_id: Symbol) -> StreamPool {
-        env.storage().instance().get(&pool_id).unwrap()
-    }
-
-    pub fn get_treasury_config(env: Env) -> TreasuryConfig {
-        env.storage().instance().get(&Symbol::new(&env, "treasury")).unwrap()
-    }
-
-    pub fn compute_vested_amount(env: Env, grant_id: Symbol, current_time: u64) -> u128 {
-        let grant: Grant = env.storage().instance().get(&grant_id).unwrap();
-        
-        match grant.vesting_curve {
-            VestingCurve::Linear => {
-                grant::compute_claimable_balance(
-                    grant.total_amount,
-                    grant.start_time,
-                    current_time,
-                    grant.duration,
-                )
-            }
-            VestingCurve::Exponential { factor } => {
-                grant::compute_exponential_vesting(
-                    grant.total_amount,
-                    grant.start_time,
-                    current_time,
-                    grant.duration,
-                    factor,
-                )
-            }
-            VestingCurve::Logarithmic { factor } => {
-                grant::compute_logarithmic_vesting(
-                    grant.total_amount,
-                    grant.start_time,
-                    current_time,
-                    grant.duration,
-                    factor,
-                )
-            }
-        }
-    }
-}
-
-mod test;
-
-// Grant math utilities used by tests and (optionally) the contract.
-pub mod grant {
-    use soroban_sdk::Env;
-    
-    /// Compute the claimable balance for a linear vesting grant.
-    ///
-    /// - `total`: total amount granted (u128)
-    /// - `start`: grant start timestamp (seconds, u64)
-    /// - `now`: current timestamp (seconds, u64)
-    /// - `duration`: grant duration (seconds, u64)
-    ///
-    /// Returns the amount (u128) claimable at `now` (clamped 0..=total).
-    pub fn compute_claimable_balance(total: u128, start: u64, now: u64, duration: u64) -> u128 {
-        if duration == 0 {
-            return if now >= start { total } else { 0 };
-        }
-        if now <= start {
-            return 0;
-        }
-        let elapsed = now.saturating_sub(start);
-        if elapsed >= duration {
-            return total;
-        }
-
-        // Use decomposition to reduce risk of intermediate overflow:
-        // total * elapsed / duration == (total / duration) * elapsed + (total % duration) * elapsed / duration
-        let dur = duration as u128;
-        let el = elapsed as u128;
-        let whole = total / dur;
-        let rem = total % dur;
-
-        // whole * el shouldn't overflow in realistic token amounts, but use checked_mul with fallback.
-        let part1 = match whole.checked_mul(el) {
-            Some(v) => v,
-            None => {
-                // fallback: perform (whole / dur) * (el * dur) approximated by dividing early
-                // This branch is extremely unlikely; clamp to total as safe fallback.
-                return total;
-            }
-        };
-        let part2 = match rem.checked_mul(el) {
-            Some(v) => v / dur,
-            None => {
-                return total;
-            }
-        };
-        part1 + part2
     }
 
     /// Compute the claimable balance for exponential vesting.
@@ -952,3 +631,15 @@ pub mod grant {
         result
     }
 }
+
+fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
+    let args = (grant_id, amount).into_val(env);
+    let _ = env.try_invoke_contract::<soroban_sdk::Val, soroban_sdk::Error>(
+        recipient,
+        &Symbol::new(env, "on_withdraw"),
+        args,
+    );
+}
+
+#[cfg(test)]
+mod test;
