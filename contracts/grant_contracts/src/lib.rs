@@ -1,4 +1,5 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Symbol, Env, String, Vec, Map, xdr::ScVal};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
@@ -554,6 +555,145 @@ impl GrantContract {
         }
     }
 
+    /// Compute the claimable balance for exponential vesting.
+    /// Rate increases as project nears completion.
+    /// Formula: total * (1 - exp(-factor * progress)) / (1 - exp(-factor))
+    /// where progress = elapsed / duration
+    pub fn compute_exponential_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
+        
+        // Simplified exponential approximation: total * progress^2 / 1000000 * factor
+        // This avoids complex floating point math while providing exponential growth
+        let progress_squared = match progress.checked_mul(progress) {
+            Some(v) => v,
+            None => return total, // overflow protection
+        };
+        
+        let factor_progress = match progress_squared.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        let vested = match total.checked_mul(factor_progress) {
+            Some(v) => v / 1_000_000_000, // Normalize by 1000^3
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+
+    /// Compute the claimable balance for logarithmic vesting.
+    /// Rate decreases as project progresses (front-loaded).
+    /// Formula: total * ln(1 + factor * progress) / ln(1 + factor)
+    /// where progress = elapsed / duration
+    pub fn compute_logarithmic_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
+        
+        // Simplified logarithmic approximation: total * (sqrt(progress * factor) * 1000) / (sqrt(factor) * 1000)
+        // This provides front-loaded vesting without complex math
+        if progress == 0 {
+            return 0;
+        }
+        
+        let progress_factor = match progress.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        // Integer square root approximation
+        let sqrt_progress_factor = integer_sqrt(progress_factor);
+        let sqrt_factor = integer_sqrt(factor_scaled);
+        
+        if sqrt_factor == 0 {
+            return 0;
+        }
+        
+        let vested = match total.checked_mul(sqrt_progress_factor) {
+            Some(v) => {
+                let normalized = match v.checked_mul(1000) {
+                    Some(v2) => v2,
+                    None => total,
+                };
+                match normalized.checked_div(sqrt_factor) {
+                    Some(v3) => v3 / 1000,
+                    None => total,
+                }
+            }
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+    
+    /// Integer square root using binary search
+    fn integer_sqrt(n: u128) -> u128 {
+        if n <= 1 {
+            return n;
+        }
+        
+        let mut low = 1u128;
+        let mut high = n;
+        let mut result = 1u128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            let mid_squared = match mid.checked_mul(mid) {
+                Some(v) => v,
+                None => {
+                    high = mid - 1;
+                    continue;
+                }
+            };
+            
+            if mid_squared == n {
+                return mid;
+            }
+            
+            if mid_squared < n {
+                low = mid + 1;
+                result = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        
+        result
     /// Returns the current claimable balance for the validator (5% share).
     pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
