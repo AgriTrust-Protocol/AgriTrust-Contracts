@@ -1,12 +1,12 @@
 #![cfg(test)]
 
-use super::{GrantContract, GrantContractClient, GrantStatus, SCALING_FACTOR};
+use super::{GrantContract, GrantContractClient, SCALING_FACTOR};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env,
 };
 
-fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantContractClient) {
+fn setup_test(env: &Env) -> (Address, Address, Address, Address, Address, GrantContractClient<'_>) {
     let admin = Address::generate(env);
     let grant_token_addr = env.register_stellar_asset_contract_v2(admin.clone());
     let native_token_addr = env.register_stellar_asset_contract_v2(admin.clone());
@@ -123,7 +123,7 @@ fn test_rage_quit() {
 fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let env = Env::default();
     env.mock_all_auths();
-    let (_admin, _grant_token, _treasury, oracle, _native, client) = setup_test(&env);
+    let (_admin, _grant_token, _treasury, _oracle, _native, client) = setup_test(&env);
     let recipient = Address::generate(&env);
     
     let grant_id = 1;
