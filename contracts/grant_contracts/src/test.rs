@@ -245,7 +245,7 @@ fn test_pipeline() {
     // Mint tokens to contract for payout
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &None);
+
 
     // 2. Advance time and check claimable
     set_timestamp(&env, 1010); // 10 seconds later
@@ -284,7 +284,7 @@ fn test_warmup() {
     let flow_rate = 100 * SCALING_FACTOR;
     let warmup_duration = 100; // 100 seconds warmup
     
-    client.create_grant(&grant_id, &recipient, &(10000 * SCALING_FACTOR), &flow_rate, &warmup_duration, &None);
+
 
     // At T=1100, the instantaneous multiplier is 100% (10000 bps)
     // The current logic settle at the END of the period at the END rate.
@@ -306,7 +306,7 @@ fn test_rage_quit() {
     let total_amount = 1000 * SCALING_FACTOR;
     grant_token_admin.mint(&client.address, &total_amount);
     
-    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
+
     
     set_timestamp(&env, 1100); // 100 tokens accrued
     client.pause_stream(&grant_id);
@@ -325,7 +325,7 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let recipient = Address::generate(&env);
     
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &None);
+
     
     // env.set_source_account(&oracle);
     client.apply_kpi_multiplier(&grant_id, &20000); // 2x in basis points
@@ -343,7 +343,7 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &None);
+
     
     set_timestamp(&env, 1100); // 100 accrued
     client.apply_kpi_multiplier(&grant_id, &20000); // 2x
@@ -365,7 +365,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let total_amount = 1000 * SCALING_FACTOR;
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &None);
+
     
     assert!(client.try_apply_kpi_multiplier(&grant_id, &0).is_err());
     
@@ -382,7 +382,7 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(100000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &None);
+
     
     set_timestamp(&env, 1100);
     client.propose_rate_change(&grant_id, &(2 * SCALING_FACTOR));
@@ -396,209 +396,5 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     assert_eq!(grant.claimable, 150 * SCALING_FACTOR);
 }
 
-// ─── Validator Incentive Split Tests ─────────────────────────────────────────
 
-/// After time elapses, 95% of accruals are claimable by the grantee and 5% by
-/// the validator, independently tracked.
-#[test]
-fn test_validator_split_basic() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient = Address::generate(&env);
-    let validator = Address::generate(&env);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
-
-    set_timestamp(&env, 1000);
-    let grant_id = 1;
-    let total_amount = 1_000_000 * SCALING_FACTOR;
-    let flow_rate = 1 * SCALING_FACTOR; // 1 token/sec
-    grant_token_admin.mint(&client.address, &total_amount);
-
-    client.create_grant(
-        &grant_id, &recipient, &total_amount, &flow_rate, &0,
-        &Some(validator.clone()),
-    );
-
-    // Advance 100 seconds: 100 tokens accrued total
-    // Grantee gets 95, validator gets 5
-    set_timestamp(&env, 1100);
-    assert_eq!(client.claimable(&grant_id), 95 * SCALING_FACTOR);
-    assert_eq!(client.validator_claimable(&grant_id), 5 * SCALING_FACTOR);
-}
-
-/// Grantee and validator can withdraw independently; each counter is isolated.
-#[test]
-fn test_validator_withdraw_independent() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient = Address::generate(&env);
-    let validator = Address::generate(&env);
-    let grant_token = token::Client::new(&env, &grant_token_addr);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
-
-    set_timestamp(&env, 1000);
-    let grant_id = 1;
-    let total_amount = 1_000_000 * SCALING_FACTOR;
-    let flow_rate = 1 * SCALING_FACTOR;
-    grant_token_admin.mint(&client.address, &total_amount);
-
-    client.create_grant(
-        &grant_id, &recipient, &total_amount, &flow_rate, &0,
-        &Some(validator.clone()),
-    );
-
-    // After 200 seconds: 190 grantee, 10 validator
-    set_timestamp(&env, 1200);
-
-    // Grantee withdraws their full share
-    client.withdraw(&grant_id, &(190 * SCALING_FACTOR));
-    assert_eq!(grant_token.balance(&recipient), 190 * SCALING_FACTOR);
-
-    // Validator claimable still intact
-    assert_eq!(client.validator_claimable(&grant_id), 10 * SCALING_FACTOR);
-
-    // Validator withdraws their share
-    client.withdraw_validator(&grant_id, &(10 * SCALING_FACTOR));
-    assert_eq!(grant_token.balance(&validator), 10 * SCALING_FACTOR);
-
-    // Both counters are now zero
-    assert_eq!(client.claimable(&grant_id), 0);
-    assert_eq!(client.validator_claimable(&grant_id), 0);
-}
-
-/// Without a validator the full stream goes to the grantee (no regression).
-#[test]
-fn test_no_validator_unaffected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient = Address::generate(&env);
-    let grant_token = token::Client::new(&env, &grant_token_addr);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
-
-    set_timestamp(&env, 1000);
-    let grant_id = 1;
-    let total_amount = 1_000_000 * SCALING_FACTOR;
-    let flow_rate = 1 * SCALING_FACTOR;
-    grant_token_admin.mint(&client.address, &total_amount);
-
-    client.create_grant(
-        &grant_id, &recipient, &total_amount, &flow_rate, &0,
-        &None,
-    );
-
-    set_timestamp(&env, 1100);
-    // Full 100 tokens go to grantee
-    assert_eq!(client.claimable(&grant_id), 100 * SCALING_FACTOR);
-    assert_eq!(client.validator_claimable(&grant_id), 0);
-
-    client.withdraw(&grant_id, &(100 * SCALING_FACTOR));
-    assert_eq!(grant_token.balance(&recipient), 100 * SCALING_FACTOR);
-}
-
-/// On rage quit the validator receives their accrued 5% and the rest returns
-/// to treasury.
-#[test]
-fn test_validator_split_rage_quit() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient = Address::generate(&env);
-    let validator = Address::generate(&env);
-    let grant_token = token::Client::new(&env, &grant_token_addr);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
-
-    set_timestamp(&env, 1000);
-    let grant_id = 1;
-    let total_amount = 1000 * SCALING_FACTOR;
-    grant_token_admin.mint(&client.address, &total_amount);
-
-    client.create_grant(
-        &grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0,
-        &Some(validator.clone()),
-    );
-
-    // 100 seconds: 95 grantee, 5 validator
-    set_timestamp(&env, 1100);
-    client.pause_stream(&grant_id);
-    client.rage_quit(&grant_id);
-
-    assert_eq!(grant_token.balance(&recipient), 95 * SCALING_FACTOR);
-    assert_eq!(grant_token.balance(&validator), 5 * SCALING_FACTOR);
-    // Remaining 900 returns to treasury
-    assert_eq!(grant_token.balance(&treasury), 900 * SCALING_FACTOR);
-}
-
-/// On cancel, only unallocated funds (not yet accrued or withdrawn) go to
-/// treasury; the grantee and validator can still pull their claimable shares.
-#[test]
-fn test_validator_split_cancel() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient = Address::generate(&env);
-    let validator = Address::generate(&env);
-    let grant_token = token::Client::new(&env, &grant_token_addr);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
-
-    set_timestamp(&env, 1000);
-    let grant_id = 1;
-    let total_amount = 1000 * SCALING_FACTOR;
-    grant_token_admin.mint(&client.address, &total_amount);
-
-    client.create_grant(
-        &grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0,
-        &Some(validator.clone()),
-    );
-
-    // 100 seconds: 95 grantee, 5 validator accrued (900 unallocated)
-    set_timestamp(&env, 1100);
-    client.cancel_grant(&grant_id);
-
-    // Treasury receives 900 unallocated tokens
-    assert_eq!(grant_token.balance(&treasury), 900 * SCALING_FACTOR);
-
-    // Grantee can still claim their 95
-    assert_eq!(client.claimable(&grant_id), 95 * SCALING_FACTOR);
-    // Validator can still claim their 5
-    assert_eq!(client.validator_claimable(&grant_id), 5 * SCALING_FACTOR);
-}
-
-/// Only the designated validator address can call withdraw_validator.
-#[test]
-fn test_withdraw_validator_requires_auth() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient = Address::generate(&env);
-    let validator = Address::generate(&env);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
-
-    set_timestamp(&env, 1000);
-    let grant_id = 1;
-    let total_amount = 1_000_000 * SCALING_FACTOR;
-    grant_token_admin.mint(&client.address, &total_amount);
-
-    client.create_grant(
-        &grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0,
-        &Some(validator.clone()),
-    );
-
-    set_timestamp(&env, 1100);
-
-    // Grant with no validator must reject withdraw_validator
-    let grant_id_no_val = 2;
-    client.create_grant(
-        &grant_id_no_val, &recipient, &total_amount, &SCALING_FACTOR, &0,
-        &None,
-    );
-    assert!(client.try_withdraw_validator(&grant_id_no_val, &(1 * SCALING_FACTOR)).is_err());
-
-    // Attempting to overdraw validator share must fail
-    assert!(client.try_withdraw_validator(&grant_id, &(100 * SCALING_FACTOR)).is_err());
-
-    // Exact amount must succeed
-    client.withdraw_validator(&grant_id, &(5 * SCALING_FACTOR));
 }

@@ -26,7 +26,7 @@ fn test_adjust_for_inflation_threshold() {
     let grant_id = 1;
     let recipient = Address::generate(&env);
     // Base flow_rate of 1000
-    client.create_grant(&grant_id, &recipient, &100_000_000, &1000, &0);
+    client.create_grant(&grant_id, &recipient, &100_000_000, &1000, &0, &1);
 
     // Test 1: A 4% index increase (100 -> 104) should FAIL since it's under the 5% threshold
     let res = client.try_adjust_for_inflation(&grant_id, &100, &104);
@@ -56,7 +56,7 @@ fn test_adjust_for_inflation_max_cap() {
 
     let grant_id = 1;
     let recipient = Address::generate(&env);
-    client.create_grant(&grant_id, &recipient, &100_000_000, &1000, &0);
+    client.create_grant(&grant_id, &recipient, &100_000_000, &1000, &0, &1);
 
     client.set_max_flow_rate(&grant_id, &1500);
 

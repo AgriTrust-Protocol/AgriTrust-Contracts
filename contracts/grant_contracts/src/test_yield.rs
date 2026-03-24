@@ -35,6 +35,7 @@ fn test_harvest_yield() {
     let grant_id = 1;
     let total_amount = 1000 * SCALING_FACTOR;
     grant_token_admin.mint(&client.address, &total_amount);
+    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &1);
     client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0);
     
     assert_eq!(client.get_yield(), 0);
