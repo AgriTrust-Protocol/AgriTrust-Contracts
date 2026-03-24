@@ -24,6 +24,12 @@ const MIN_VOTING_PARTICIPATION: u32 = 1000; // 10% minimum participation (in bas
 const SLASHING_APPROVAL_THRESHOLD: u32 = 6600; // 66% approval required (in basis points)
 const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 
+// Milestone System constants
+const CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days challenge period
+const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason length
+const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason length
+const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -41,6 +47,8 @@ mod test_atomic_bridge;
 mod test_sub_dao_authority;
 #[cfg(test)]
 mod test_coi_voting_exclusion;
+#[cfg(test)]
+mod test_optimistic_milestones;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -175,6 +183,11 @@ pub fn batch_init_with_deposits(
             validator_claimable: 0,
             // COI: Store linked addresses
             linked_addresses: config.linked_addresses.clone(),
+            // Milestone system fields
+            milestone_amount: config.milestone_amount,
+            total_milestones: config.total_milestones,
+            claimed_milestones: 0,
+            available_milestone_funds: 0, // Will be calculated based on milestone_amount
         };
 
         // Store the grant
@@ -230,8 +243,13 @@ pub enum GrantStatus {
     Active,
     Paused,
     Completed,
-    Cancelled,
     RageQuitted,
+    Cancelled,
+    // Milestone-related statuses
+    MilestoneClaimed,    // Milestone claimed, in challenge period
+    MilestoneApproved,    // Challenge period passed, funds released
+    MilestoneChallenged,  // Milestone challenged, under review
+    MilestoneRejected,    // Challenge successful, claim rejected
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +294,11 @@ pub struct Grant {
     pub remaining_balance: i128,   // NEW: Remaining allocated balance for this grant
     // COI (Conflict of Interest) fields
     pub linked_addresses: Vec<Address>, // Linked addresses that cannot vote on this grant
+    // Milestone system fields
+    pub milestone_amount: i128,     // Amount per milestone
+    pub total_milestones: u32,     // Total number of milestones
+    pub claimed_milestones: u32,    // Number of milestones claimed so far
+    pub available_milestone_funds: i128, // Funds available for milestone claims
 }
 
 #[derive(Clone)]
@@ -308,6 +331,8 @@ pub struct GranteeConfig {
     pub warmup_duration: u64,
     pub validator: Option<Address>,
     pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
+    pub milestone_amount: i128,     // Amount per milestone
+    pub total_milestones: u32,     // Total number of milestones
 }
 
 /// Result of batch grant initialization
@@ -359,6 +384,58 @@ pub struct SlashingProposal {
     pub executed_at: Option<u64>, // When slashing was executed
 }
 
+// --- Milestone System Types ---
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MilestoneClaim {
+    pub claim_id: u64,
+    pub grant_id: u64,
+    pub claimer: Address,
+    pub milestone_number: u32,
+    pub amount: i128,
+    pub claimed_at: u64,
+    pub challenge_deadline: u64,
+    pub status: MilestoneStatus,
+    pub evidence: String,
+    pub challenger: Option<Address>,
+    pub challenge_reason: Option<String>,
+    pub challenged_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum MilestoneStatus {
+    Claimed,           // Milestone claimed, in challenge period
+    Approved,           // Challenge period passed, funds released
+    Challenged,         // Challenge raised, under review
+    Rejected,           // Challenge successful, claim rejected
+    Paid,               // Funds successfully released
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MilestoneChallenge {
+    pub challenge_id: u64,
+    pub claim_id: u64,
+    pub challenger: Address,
+    pub reason: String,
+    pub evidence: String,
+    pub created_at: u64,
+    pub status: ChallengeStatus,
+    pub resolved_at: Option<u64>,
+    pub resolution: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ChallengeStatus {
+    Active,             // Challenge is active, awaiting review
+    ResolvedApproved,    // Challenge resolved in favor of claimer
+    ResolvedRejected,    // Challenge resolved in favor of challenger
+    Expired,            // Challenge period expired without resolution
+}
+
 #[derive(Clone)]
 #[contracttype]
 enum DataKey {
@@ -389,6 +466,12 @@ enum DataKey {
     // COI (Conflict of Interest) keys
     LinkedAddresses(u64), // Maps grant_id to linked addresses
     VoterExclusions(u64), // Maps proposal_id to excluded voters with reasons
+    // Milestone system keys
+    MilestoneClaim(u64), // Maps claim_id to milestone claim details
+    MilestoneChallenge(u64), // Maps challenge_id to challenge details
+    GrantMilestones(u64), // Maps grant_id to list of milestone claim IDs
+    NextMilestoneClaimId, // Next available milestone claim ID
+    NextChallengeId, // Next available challenge ID
 }
 
 #[contracterror]
@@ -445,6 +528,18 @@ pub enum Error {
     LinkedAddressNotFound = 43,
     CannotVoteOnOwnGrant = 44,
     ExcludedFromVoting = 45,
+    // Milestone system errors
+    MilestoneNotFound = 46,
+    MilestoneAlreadyClaimed = 47,
+    InvalidMilestoneNumber = 48,
+    ChallengeNotFound = 49,
+    ChallengeAlreadyExists = 50,
+    ChallengePeriodExpired = 51,
+    ChallengeNotActive = 52,
+    InvalidChallengeStatus = 53,
+    InsufficientMilestoneFunds = 54,
+    MilestoneNotClaimed = 55,
+    MilestoneAlreadyChallenged = 56,
 }
 
 // --- Internal Helpers ---
@@ -717,6 +812,81 @@ fn calculate_voting_results(env: &Env, proposal: &SlashingProposal) -> (bool, bo
     };
     
     (participation_met, approval_met)
+}
+
+// --- Milestone System Helper Functions ---
+
+fn read_next_milestone_claim_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextMilestoneClaimId)
+        .unwrap_or(1)
+}
+
+fn write_next_milestone_claim_id(env: &Env, claim_id: u64) {
+    env.storage().instance().set(&DataKey::NextMilestoneClaimId, &claim_id);
+}
+
+fn read_next_challenge_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextChallengeId)
+        .unwrap_or(1)
+}
+
+fn write_next_challenge_id(env: &Env, challenge_id: u64) {
+    env.storage().instance().set(&DataKey::NextChallengeId, &challenge_id);
+}
+
+fn read_milestone_claim(env: &Env, claim_id: u64) -> Result<MilestoneClaim, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneClaim(claim_id))
+        .ok_or(Error::MilestoneNotFound)
+}
+
+fn write_milestone_claim(env: &Env, claim_id: u64, claim: &MilestoneClaim) {
+    env.storage().instance().set(&DataKey::MilestoneClaim(claim_id), claim);
+}
+
+fn read_milestone_challenge(env: &Env, challenge_id: u64) -> Result<MilestoneChallenge, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneChallenge(challenge_id))
+        .ok_or(Error::ChallengeNotFound)
+}
+
+fn write_milestone_challenge(env: &Env, challenge_id: u64, challenge: &MilestoneChallenge) {
+    env.storage().instance().set(&DataKey::MilestoneChallenge(challenge_id), challenge);
+}
+
+fn read_grant_milestones(env: &Env, grant_id: u64) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantMilestones(grant_id))
+        .unwrap_or(vec![&env])
+}
+
+fn write_grant_milestones(env: &Env, grant_id: u64, claim_ids: &Vec<u64>) {
+    env.storage().instance().set(&DataKey::GrantMilestones(grant_id), claim_ids);
+}
+
+fn validate_milestone_number(grant: &Grant, milestone_number: u32) -> Result<(), Error> {
+    if milestone_number == 0 || milestone_number > grant.total_milestones {
+        return Err(Error::InvalidMilestoneNumber);
+    }
+    
+    if milestone_number <= grant.claimed_milestones {
+        return Err(Error::MilestoneAlreadyClaimed);
+    }
+    
+    Ok(())
+}
+
+fn calculate_available_milestone_funds(grant: &Grant) -> i128 {
+    grant.milestone_amount
+        .checked_mul(grant.total_milestones as i128 - grant.claimed_milestones as i128)
+        .unwrap_or(0)
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -2179,6 +2349,285 @@ impl GrantContract {
             Err(Error::VoterHasConflictOfInterest) => Ok(true), // Has conflict
             Err(e) => Err(e), // Other error
         }
+    }
+
+    // --- Milestone System Public Functions ---
+
+    /// Claim a milestone with optimistic approval
+    /// Grant receives funds after 7-day challenge period if no challenge is raised
+    pub fn claim_milestone(
+        env: Env,
+        grant_id: u64,
+        milestone_number: u32,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Validate milestone number
+        validate_milestone_number(&grant, milestone_number)?;
+        
+        // Validate reason length
+        if reason.len() > MAX_MILESTONE_REASON_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+        
+        // Validate evidence length
+        if evidence.len() > MAX_EVIDENCE_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+
+        // Check if grant has sufficient milestone funds
+        let available_funds = calculate_available_milestone_funds(&grant);
+        if available_funds < grant.milestone_amount {
+            return Err(Error::InsufficientMilestoneFunds);
+        }
+
+        // Create milestone claim
+        let claim_id = read_next_milestone_claim_id(&env);
+        let now = env.ledger().timestamp();
+        let challenge_deadline = now + CHALLENGE_PERIOD;
+
+        let claim = MilestoneClaim {
+            claim_id,
+            grant_id,
+            claimer: env.current_contract_address(),
+            milestone_number,
+            amount: grant.milestone_amount,
+            claimed_at: now,
+            challenge_deadline,
+            status: MilestoneStatus::Claimed,
+            evidence,
+            challenger: None,
+            challenge_reason: None,
+            challenged_at: None,
+        };
+
+        // Store claim
+        write_milestone_claim(&env, claim_id, &claim);
+        write_next_milestone_claim_id(&env, claim_id + 1);
+
+        // Update grant
+        grant.claimed_milestones += 1;
+        grant.status = GrantStatus::MilestoneClaimed;
+        write_grant(&env, grant_id, &grant);
+
+        // Add to grant's milestone list
+        let mut milestones = read_grant_milestones(&env, grant_id);
+        milestones.push_back(claim_id);
+        write_grant_milestones(&env, grant_id, &milestones);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("milestone_claimed"), grant_id),
+            (claim_id, milestone_number, grant.milestone_amount, challenge_deadline),
+        );
+
+        Ok(claim_id)
+    }
+
+    /// Challenge a milestone claim
+    /// Any DAO member can challenge a claimed milestone during the 7-day challenge period
+    pub fn challenge_milestone(
+        env: Env,
+        challenger: Address,
+        claim_id: u64,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        let mut claim = read_milestone_claim(&env, claim_id)?;
+        
+        // Validate claim is in challengeable state
+        if claim.status != MilestoneStatus::Claimed {
+            return Err(Error::MilestoneNotClaimed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= claim.challenge_deadline {
+            return Err(Error::ChallengePeriodExpired);
+        }
+
+        // Validate reason length
+        if reason.len() > MAX_CHALLENGE_REASON_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+
+        // Validate evidence length
+        if evidence.len() > MAX_EVIDENCE_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+
+        // Create challenge
+        let challenge_id = read_next_challenge_id(&env);
+        let challenge = MilestoneChallenge {
+            challenge_id,
+            claim_id,
+            challenger: challenger.clone(),
+            reason: reason.clone(),
+            evidence: evidence.clone(),
+            created_at: now,
+            status: ChallengeStatus::Active,
+            resolved_at: None,
+            resolution: None,
+        };
+
+        // Store challenge
+        write_milestone_challenge(&env, challenge_id, &challenge);
+        write_next_challenge_id(&env, challenge_id + 1);
+
+        // Update claim status
+        claim.status = MilestoneStatus::Challenged;
+        claim.challenger = Some(challenger.clone());
+        claim.challenge_reason = Some(reason.clone());
+        claim.challenged_at = Some(now);
+        write_milestone_claim(&env, claim_id, &claim);
+
+        // Update grant status
+        let mut grant = read_grant(&env, claim.grant_id)?;
+        grant.status = GrantStatus::MilestoneChallenged;
+        write_grant(&env, claim.grant_id, &grant);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("milestone_challenged"), claim.grant_id),
+            (claim_id, challenge_id, challenger, reason),
+        );
+
+        Ok(challenge_id)
+    }
+
+    /// Release milestone funds after challenge period expires without challenges
+    /// This function can be called by anyone after the challenge period
+    pub fn release_milestone_funds(
+        env: Env,
+        claim_id: u64,
+    ) -> Result<(), Error> {
+        let mut claim = read_milestone_claim(&env, claim_id)?;
+        
+        // Validate claim is in claimed state
+        if claim.status != MilestoneStatus::Claimed {
+            return Err(Error::MilestoneNotClaimed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < claim.challenge_deadline {
+            return Err(Error::ChallengePeriodExpired);
+        }
+
+        // Check if there are any active challenges
+        // In a real implementation, you would scan for active challenges
+        // For now, we'll assume no challenges exist
+        
+        // Release funds
+        let token_addr = read_grant_token(&env)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &claim.claimer, &claim.amount);
+
+        // Update claim status
+        claim.status = MilestoneStatus::Paid;
+        write_milestone_claim(&env, claim_id, &claim);
+
+        // Update grant status
+        let mut grant = read_grant(&env, claim.grant_id)?;
+        grant.status = GrantStatus::Active; // Back to active for next milestone
+        grant.available_milestone_funds = calculate_available_milestone_funds(&grant);
+        write_grant(&env, claim.grant_id, &grant);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("milestone_released"), claim.grant_id),
+            (claim_id, claim.milestone_number, claim.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Resolve a milestone challenge (admin only)
+    /// Admin can approve or reject challenged milestones
+    pub fn resolve_milestone_challenge(
+        env: Env,
+        admin: Address,
+        challenge_id: u64,
+        approved: bool,
+        resolution: String,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut challenge = read_milestone_challenge(&env, challenge_id)?;
+        let mut claim = read_milestone_claim(&env, challenge.claim_id)?;
+        
+        // Validate challenge is active
+        if challenge.status != ChallengeStatus::Active {
+            return Err(Error::ChallengeNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        
+        // Update challenge
+        challenge.status = if approved {
+            ChallengeStatus::ResolvedApproved
+        } else {
+            ChallengeStatus::ResolvedRejected
+        };
+        challenge.resolved_at = Some(now);
+        challenge.resolution = Some(resolution.clone());
+        write_milestone_challenge(&env, challenge_id, &challenge);
+
+        // Update claim based on resolution
+        if approved {
+            // Approve claim - release funds
+            claim.status = MilestoneStatus::Approved;
+            
+            // Release funds
+            let token_addr = read_grant_token(&env)?;
+            let token_client = token::Client::new(&env, &token_addr);
+            token_client.transfer(&env.current_contract_address(), &claim.claimer, &claim.amount);
+            
+            // Update grant
+            let mut grant = read_grant(&env, claim.grant_id)?;
+            grant.status = GrantStatus::Active;
+            grant.available_milestone_funds = calculate_available_milestone_funds(&grant);
+            write_grant(&env, claim.grant_id, &grant);
+            
+            // Emit approval event
+            env.events().publish(
+                (symbol_short!("milestone_approved"), claim.grant_id),
+                (claim_id, challenge_id, resolution),
+            );
+        } else {
+            // Reject claim - return funds to pool
+            claim.status = MilestoneStatus::Rejected;
+            
+            // Return funds to grant pool
+            let mut grant = read_grant(&env, claim.grant_id)?;
+            grant.available_milestone_funds += claim.amount;
+            write_grant(&env, claim.grant_id, &grant);
+            
+            // Emit rejection event
+            env.events().publish(
+                (symbol_short!("milestone_rejected"), claim.grant_id),
+                (claim_id, challenge_id, resolution),
+            );
+        }
+        
+        write_milestone_claim(&env, claim_id, &claim);
+        Ok(())
+    }
+
+    /// Get milestone claim details
+    pub fn get_milestone_claim(env: Env, claim_id: u64) -> Result<MilestoneClaim, Error> {
+        read_milestone_claim(&env, claim_id)
+    }
+
+    /// Get milestone challenge details
+    pub fn get_milestone_challenge(env: Env, challenge_id: u64) -> Result<MilestoneChallenge, Error> {
+        read_milestone_challenge(&env, challenge_id)
+    }
+
+    /// Get all milestone claims for a grant
+    pub fn get_grant_milestones(env: Env, grant_id: u64) -> Result<Vec<u64>, Error> {
+        let _grant = read_grant(&env, grant_id)?; // Verify grant exists
+        Ok(read_grant_milestones(&env, grant_id))
     }
 }
 
