@@ -250,6 +250,8 @@ pub struct Grant {
     pub security_deposit: i128,    // NEW: Security deposit amount
     pub lease_end_time: u64,      // NEW: Lease termination timestamp
     pub lease_terminated: bool,   // NEW: Legal oracle termination flag
+    // Add funds tracking
+    pub remaining_balance: i128,   // NEW: Remaining allocated balance for this grant
     /// Optional Stellar Validator reward address. When set, 5% of accruals
     /// are directed here ("Ecosystem Tax").
     pub validator: Option<Address>,
@@ -507,6 +509,11 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
         }
     }
 
+    // Update remaining balance based on total allocated and withdrawn
+    let total_withdrawable = grant.remaining_balance.checked_sub(grant.claimable).ok_or(Error::MathOverflow)?;
+    grant.remaining_balance = total_withdrawable.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+
+    let total_accounted = grant.withdrawn.checked_add(grant.claimable).ok_or(Error::MathOverflow)?;
     let total_accounted = grant.withdrawn
         .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
         .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
@@ -627,6 +634,8 @@ impl GrantContract {
             security_deposit,
             lease_end_time,
             lease_terminated: false,
+            // Add funds tracking
+            remaining_balance: total_amount, // Initially, remaining equals total
             validator,
             validator_withdrawn: 0,
             validator_claimable: 0,
@@ -1057,6 +1066,48 @@ impl GrantContract {
         read_grant(&env, grant_id)
     }
 
+    // Add funds functionality
+    pub fn add_funds(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Validate grant state
+        if grant.status != GrantStatus::Active && grant.status != GrantStatus::Paused {
+            return Err(Error::InvalidState);
+        }
+        
+        // Settle any pending accruals first
+        settle_grant(&mut grant, grant_id, env.ledger().timestamp())?;
+        
+        // Add funds to remaining balance
+        grant.remaining_balance = grant.remaining_balance.checked_add(amount).ok_or(Error::MathOverflow)?;
+        
+        // Calculate new end time if flow rate is constant
+        let new_end_time = if grant.flow_rate > 0 {
+            let additional_seconds = amount.checked_div(grant.flow_rate).ok_or(Error::MathOverflow)?;
+            let current_end = if grant.lease_end_time > 0 { grant.lease_end_time } else { u64::MAX };
+            grant.lease_end_time.checked_add(additional_seconds).ok_or(Error::MathOverflow)?
+        } else {
+            grant.lease_end_time // Flow rate is 0, end time unchanged
+        };
+        
+        grant.lease_end_time = new_end_time;
+        write_grant(&env, grant_id, &grant);
+        
+        // Publish GrantTopUp event
+        env.events().publish(
+            (Symbol::new(&env, "grant_top_up"), grant_id),
+            (grant.recipient, amount, grant.remaining_balance, new_end_time),
+        );
+        
+        Ok(())
+    }
+
     // Lease-specific functions
     pub fn terminate_lease_by_oracle(env: Env, grant_id: u64, reason: String) -> Result<(), Error> {
         require_oracle_auth(&env)?;
@@ -1337,4 +1388,6 @@ mod test_nft;
 mod test_staking;
 #[cfg(test)]
 mod test_lease;
+#[cfg(test)]
+mod test_add_funds;
 mod test_inflation;
