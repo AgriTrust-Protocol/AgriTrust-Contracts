@@ -18,6 +18,12 @@ const MAX_SECURITY_DEPOSIT_PERCENTAGE: i128 = 2000; // 20% maximum security depo
 const SNAPSHOT_VERSION: u32 = 1; // Version for future compatibility
 const SNAPSHOT_EXPIRY: u64 = 86400; // 24 hours in seconds
 
+// DAO Governance and Slashing constants
+const SLASHING_PROPOSAL_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days voting period
+const MIN_VOTING_PARTICIPATION: u32 = 1000; // 10% minimum participation (in basis points)
+const SLASHING_APPROVAL_THRESHOLD: u32 = 6600; // 66% approval required (in basis points)
+const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -301,6 +307,45 @@ pub struct BatchInitResult {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct FinancialSnapshot {
+    pub grant_id: u64,           // Grant identifier
+    pub total_received: i128,      // Total amount received by grantee
+    pub timestamp: u64,           // When snapshot was created
+    pub expiry: u64,             // When snapshot expires (24h)
+    pub version: u32,            // Snapshot version for compatibility
+    pub contract_signature: [u8; 64], // Contract's cryptographic signature
+    pub hash: [u8; 32],        // SHA-256 hash of snapshot data
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum SlashingProposalStatus {
+    Proposed,    // Proposal created, voting open
+    Approved,    // Proposal approved, ready for execution
+    Rejected,    // Proposal rejected by DAO vote
+    Executed,    // Slashing executed successfully
+    Expired,     // Voting period expired
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct SlashingProposal {
+    pub proposal_id: u64,
+    pub grant_id: u64,
+    pub proposer: Address,
+    pub reason: String,
+    pub evidence_hash: [u8; 32], // Hash of evidence documents
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub status: SlashingProposalStatus,
+    pub votes_for: i128,       // Total voting power in favor
+    pub votes_against: i128,   // Total voting power against
+    pub total_voting_power: i128, // Total eligible voting power
+    pub executed_at: Option<u64>, // When slashing was executed
+}
+
+#[derive(Clone)]
+#[contracttype]
 enum DataKey {
     Admin,
     GrantToken,
@@ -316,6 +361,13 @@ enum DataKey {
     // Financial snapshot keys
     FinancialSnapshot(u64, u64), // Maps grant_id + timestamp to snapshot
     SnapshotNonce(u64), // Maps grant_id to nonce for snapshot generation
+    // Slashing proposal keys
+    SlashingProposal(u64), // Maps proposal_id to proposal details
+    SlashingProposalIds, // List of all slashing proposal IDs
+    GrantSlashingProposals(u64), // Maps grant_id to list of slashing proposal IDs
+    VotingPower(Address), // Maps voter address to their voting power
+    ProposalVotes(u64, Address), // Maps proposal_id + voter to their vote
+    NextProposalId, // Next available proposal ID
     MaxFlowRate(u64),
 }
 
@@ -349,6 +401,19 @@ pub enum Error {
     InvalidSnapshot = 22,
     SnapshotNotFound = 23,
     InvalidSignature = 24,
+    // Slashing proposal errors
+    ProposalNotFound = 25,
+    ProposalAlreadyExists = 26,
+    InvalidProposalStatus = 27,
+    VotingPeriodEnded = 28,
+    VotingPeriodActive = 29,
+    AlreadyVoted = 30,
+    InsufficientVotingPower = 31,
+    ParticipationThresholdNotMet = 32,
+    ApprovalThresholdNotMet = 33,
+    NoStakeToSlash = 34,
+    SlashingAlreadyExecuted = 35,
+    InvalidReasonLength = 36,
 }
 
 // --- Internal Helpers ---
@@ -502,6 +567,107 @@ fn generate_contract_signature(
     }
     
     signature
+}
+
+// Slashing Proposal Helper Functions
+fn read_next_proposal_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextProposalId)
+        .unwrap_or(1)
+}
+
+fn write_next_proposal_id(env: &Env, proposal_id: u64) {
+    env.storage().instance().set(&DataKey::NextProposalId, &proposal_id);
+}
+
+fn read_slashing_proposal(env: &Env, proposal_id: u64) -> Result<SlashingProposal, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SlashingProposal(proposal_id))
+        .ok_or(Error::ProposalNotFound)
+}
+
+fn write_slashing_proposal(env: &Env, proposal_id: u64, proposal: &SlashingProposal) {
+    env.storage().instance().set(&DataKey::SlashingProposal(proposal_id), proposal);
+}
+
+fn read_slashing_proposal_ids(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SlashingProposalIds)
+        .unwrap_or(vec![&env])
+}
+
+fn write_slashing_proposal_ids(env: &Env, proposal_ids: &Vec<u64>) {
+    env.storage().instance().set(&DataKey::SlashingProposalIds, proposal_ids);
+}
+
+fn read_grant_slashing_proposals(env: &Env, grant_id: u64) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantSlashingProposals(grant_id))
+        .unwrap_or(vec![&env])
+}
+
+fn write_grant_slashing_proposals(env: &Env, grant_id: u64, proposal_ids: &Vec<u64>) {
+    env.storage().instance().set(&DataKey::GrantSlashingProposals(grant_id), proposal_ids);
+}
+
+fn read_voting_power(env: &Env, voter: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::VotingPower(voter.clone()))
+        .unwrap_or(0)
+}
+
+fn write_voting_power(env: &Env, voter: &Address, power: i128) {
+    env.storage().instance().set(&DataKey::VotingPower(voter.clone()), &power);
+}
+
+fn read_vote(env: &Env, proposal_id: u64, voter: &Address) -> Option<bool> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ProposalVotes(proposal_id, voter.clone()))
+}
+
+fn write_vote(env: &Env, proposal_id: u64, voter: &Address, vote: bool) {
+    env.storage().instance().set(&DataKey::ProposalVotes(proposal_id, voter.clone()), &vote);
+}
+
+fn generate_evidence_hash(evidence: &String) -> [u8; 32] {
+    // Generate a hash of evidence documents
+    // In a real implementation, this would use SHA-256
+    let mut hash = [0u8; 32];
+    
+    // Simple hash implementation for demonstration
+    for i in 0..32.min(evidence.len()) {
+        hash[i] = evidence.as_bytes()[i];
+    }
+    
+    hash
+}
+
+fn calculate_voting_results(env: &Env, proposal: &SlashingProposal) -> (bool, bool) {
+    // Returns (participation_met, approval_met)
+    let total_power = proposal.total_voting_power;
+    let votes_cast = proposal.votes_for.checked_add(proposal.votes_against).unwrap_or(0);
+    
+    // Check minimum participation (10%)
+    let participation_met = if total_power > 0 {
+        (votes_cast.checked_mul(10000).unwrap_or(0) / total_power) >= MIN_VOTING_PARTICIPATION
+    } else {
+        false
+    };
+    
+    // Check approval threshold (66%)
+    let approval_met = if votes_cast > 0 {
+        (proposal.votes_for.checked_mul(10000).unwrap_or(0) / votes_cast) >= SLASHING_APPROVAL_THRESHOLD
+    } else {
+        false
+    };
+    
+    (participation_met, approval_met)
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -1362,6 +1528,226 @@ impl GrantContract {
         }
     }
 
+    // DAO Governance and Slashing Functions
+    pub fn propose_slashing(
+        env: Env,
+        grant_id: u64,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        // Validate proposal
+        let grant = read_grant(&env, grant_id)?;
+        
+        // Check if grant has staked collateral
+        if grant.staked_amount <= 0 {
+            return Err(Error::NoStakeToSlash);
+        }
+        
+        // Validate reason length
+        if reason.len() > MAX_SLASHING_REASON_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+        
+        // Check if there's already an active proposal for this grant
+        let grant_proposals = read_grant_slashing_proposals(&env, grant_id);
+        for proposal_id in grant_proposals.iter() {
+            if let Ok(proposal) = read_slashing_proposal(&env, *proposal_id) {
+                if proposal.status == SlashingProposalStatus::Proposed {
+                    return Err(Error::ProposalAlreadyExists);
+                }
+            }
+        }
+        
+        // Create new proposal
+        let proposal_id = read_next_proposal_id(&env);
+        let now = env.ledger().timestamp();
+        let voting_deadline = now + SLASHING_PROPOSAL_DURATION;
+        let evidence_hash = generate_evidence_hash(&evidence);
+        
+        let proposal = SlashingProposal {
+            proposal_id,
+            grant_id,
+            proposer: env.current_contract_address(), // In real implementation, would be actual proposer
+            reason: reason.clone(),
+            evidence_hash,
+            created_at: now,
+            voting_deadline,
+            status: SlashingProposalStatus::Proposed,
+            votes_for: 0,
+            votes_against: 0,
+            total_voting_power: 0, // Would be calculated based on DAO token holders
+            executed_at: None,
+        };
+        
+        // Store proposal
+        write_slashing_proposal(&env, proposal_id, &proposal);
+        
+        // Update proposal lists
+        let mut all_proposals = read_slashing_proposal_ids(&env);
+        all_proposals.push_back(proposal_id);
+        write_slashing_proposal_ids(&env, &all_proposals);
+        
+        let mut grant_proposals = read_grant_slashing_proposals(&env, grant_id);
+        grant_proposals.push_back(proposal_id);
+        write_grant_slashing_proposals(&env, grant_id, &grant_proposals);
+        
+        // Update next proposal ID
+        write_next_proposal_id(&env, proposal_id + 1);
+        
+        // Publish proposal creation event
+        env.events().publish(
+            (Symbol::new(&env, "slashing_proposed"), proposal_id),
+            (grant_id, reason, voting_deadline),
+        );
+        
+        Ok(proposal_id)
+    }
+
+    pub fn vote_on_slashing(
+        env: Env,
+        proposal_id: u64,
+        vote: bool, // true for in favor, false against
+    ) -> Result<(), Error> {
+        let mut proposal = read_slashing_proposal(&env, proposal_id)?;
+        
+        // Validate voting period
+        if proposal.status != SlashingProposalStatus::Proposed {
+            return Err(Error::InvalidProposalStatus);
+        }
+        
+        let now = env.ledger().timestamp();
+        if now >= proposal.voting_deadline {
+            return Err(Error::VotingPeriodEnded);
+        }
+        
+        // Check if voter has already voted
+        let voter = env.current_contract_address(); // In real implementation, would be actual voter
+        if let Some(_) = read_vote(&env, proposal_id, &voter) {
+            return Err(Error::AlreadyVoted);
+        }
+        
+        // Get voter's voting power
+        let voting_power = read_voting_power(&env, &voter);
+        if voting_power <= 0 {
+            return Err(Error::InsufficientVotingPower);
+        }
+        
+        // Record vote
+        write_vote(&env, proposal_id, &voter, vote);
+        
+        // Update vote counts
+        if vote {
+            proposal.votes_for = proposal.votes_for.checked_add(voting_power).ok_or(Error::MathOverflow)?;
+        } else {
+            proposal.votes_against = proposal.votes_against.checked_add(voting_power).ok_or(Error::MathOverflow)?;
+        }
+        
+        // Check if voting should close (if all eligible voters have voted)
+        // In a real implementation, this would be more sophisticated
+        let (participation_met, approval_met) = calculate_voting_results(&env, &proposal);
+        
+        // Update proposal
+        write_slashing_proposal(&env, proposal_id, &proposal);
+        
+        // Publish vote event
+        env.events().publish(
+            (Symbol::new(&env, "slashing_vote_cast"), proposal_id),
+            (voter, vote, voting_power),
+        );
+        
+        Ok(())
+    }
+
+    pub fn execute_slashing(env: Env, proposal_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut proposal = read_slashing_proposal(&env, proposal_id)?;
+        
+        // Validate proposal status
+        if proposal.status != SlashingProposalStatus::Proposed {
+            return Err(Error::InvalidProposalStatus);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Check if voting period has ended
+        if now < proposal.voting_deadline {
+            return Err(Error::VotingPeriodActive);
+        }
+        
+        // Check if voting period expired without sufficient participation
+        if now >= proposal.voting_deadline {
+            let (participation_met, approval_met) = calculate_voting_results(&env, &proposal);
+            
+            if !participation_met {
+                proposal.status = SlashingProposalStatus::Expired;
+                write_slashing_proposal(&env, proposal_id, &proposal);
+                return Err(Error::ParticipationThresholdNotMet);
+            }
+            
+            if !approval_met {
+                proposal.status = SlashingProposalStatus::Rejected;
+                write_slashing_proposal(&env, proposal_id, &proposal);
+                return Err(Error::ApprovalThresholdNotMet);
+            }
+        }
+        
+        // Execute slashing
+        let grant = read_grant(&env, proposal.grant_id)?;
+        
+        if grant.staked_amount <= 0 {
+            return Err(Error::NoStakeToSlash);
+        }
+        
+        // Transfer staked collateral to treasury
+        let treasury = read_treasury(&env)?;
+        let token_client = token::Client::new(&env, &grant.stake_token);
+        token_client.transfer(&env.current_contract_address(), &treasury, &grant.staked_amount);
+        
+        // Update grant status and record slashing
+        let mut updated_grant = grant;
+        updated_grant.status = GrantStatus::Slashed;
+        updated_grant.slash_reason = Some(proposal.reason.clone());
+        updated_grant.staked_amount = 0; // Clear staked amount
+        write_grant(&env, proposal.grant_id, &updated_grant);
+        
+        // Update proposal status
+        proposal.status = SlashingProposalStatus::Executed;
+        proposal.executed_at = Some(now);
+        write_slashing_proposal(&env, proposal_id, &proposal);
+        
+        // Publish slashing execution event
+        env.events().publish(
+            (Symbol::new(&env, "slashing_executed"), proposal_id),
+            (proposal.grant_id, grant.staked_amount, proposal.reason),
+        );
+        
+        Ok(())
+    }
+
+    pub fn get_slashing_proposal(env: Env, proposal_id: u64) -> Result<SlashingProposal, Error> {
+        read_slashing_proposal(&env, proposal_id)
+    }
+
+    pub fn get_grant_slashing_proposals(env: Env, grant_id: u64) -> Vec<u64> {
+        read_grant_slashing_proposals(&env, grant_id)
+    }
+
+    pub fn set_voting_power(env: Env, voter: Address, power: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        if power < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        write_voting_power(&env, &voter, power);
+        
+        // Publish voting power update event
+        env.events().publish(
+            (Symbol::new(&env, "voting_power_updated"), voter.clone()),
+            power,
+        );
+        
     /// Compute the claimable balance for exponential vesting.
     /// Rate increases as project nears completion.
     /// Formula: total * (1 - exp(-factor * progress)) / (1 - exp(-factor))
@@ -1580,4 +1966,6 @@ mod test_lease;
 mod test_add_funds;
 #[cfg(test)]
 mod test_financial_snapshot;
+#[cfg(test)]
+mod test_slashing;
 mod test_inflation;
