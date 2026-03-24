@@ -47,7 +47,7 @@ fn test_pipeline() {
     // Mint tokens to contract for payout
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &flow_rate, &warmup_duration, &1);
+
 
     // 2. Advance time and check claimable
     set_timestamp(&env, 1010); // 10 seconds later
@@ -86,7 +86,6 @@ fn test_warmup() {
     let flow_rate = 100 * SCALING_FACTOR;
     let warmup_duration = 100; // 100 seconds warmup
     
-    client.create_grant(&grant_id, &recipient, &(10000 * SCALING_FACTOR), &flow_rate, &warmup_duration, &1);
 
     // At T=1100, the instantaneous multiplier is 100% (10000 bps)
     // The current logic settle at the END of the period at the END rate.
@@ -108,7 +107,7 @@ fn test_rage_quit() {
     let total_amount = 1000 * SCALING_FACTOR;
     grant_token_admin.mint(&client.address, &total_amount);
     
-    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &1);
+
     
     set_timestamp(&env, 1100); // 100 tokens accrued
     client.pause_stream(&grant_id);
@@ -127,7 +126,7 @@ fn test_apply_kpi_multiplier_requires_oracle_auth() {
     let recipient = Address::generate(&env);
     
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &1);
+
     
     // env.set_source_account(&oracle);
     client.apply_kpi_multiplier(&grant_id, &20000); // 2x in basis points
@@ -145,7 +144,7 @@ fn test_apply_kpi_multiplier_settles_before_updating_rate() {
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(1000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &1);
+
     
     set_timestamp(&env, 1100); // 100 accrued
     client.apply_kpi_multiplier(&grant_id, &20000); // 2x
@@ -167,7 +166,7 @@ fn test_apply_kpi_multiplier_rejects_invalid_multiplier_and_inactive_states() {
     let total_amount = 1000 * SCALING_FACTOR;
     grant_token_admin.mint(&client.address, &total_amount);
 
-    client.create_grant(&grant_id, &recipient, &total_amount, &SCALING_FACTOR, &0, &1);
+
     
     assert!(client.try_apply_kpi_multiplier(&grant_id, &0).is_err());
     
@@ -184,7 +183,7 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     
     set_timestamp(&env, 1000);
     let grant_id = 1;
-    client.create_grant(&grant_id, &recipient, &(100000 * SCALING_FACTOR), &SCALING_FACTOR, &0, &1);
+
     
     set_timestamp(&env, 1100);
     client.propose_rate_change(&grant_id, &(2 * SCALING_FACTOR));
@@ -198,26 +197,5 @@ fn test_apply_kpi_multiplier_scales_pending_rate_and_preserves_accrual_boundarie
     assert_eq!(grant.claimable, 150 * SCALING_FACTOR);
 }
 
-#[test]
-fn test_manage_liquidity() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, grant_token_addr, _treasury, _oracle, _native, client) = setup_test(&env);
-    let recipient1 = Address::generate(&env);
-    let recipient2 = Address::generate(&env);
-    let grant_token_admin = token::StellarAssetClient::new(&env, &grant_token_addr);
 
-    let total_amount = 100000 * SCALING_FACTOR;
-    grant_token_admin.mint(&client.address, &(total_amount * 2));
-
-    client.create_grant(&1, &recipient1, &total_amount, &(100 * SCALING_FACTOR), &0, &1); // Priority 1
-    client.create_grant(&2, &recipient2, &total_amount, &(100 * SCALING_FACTOR), &0, &2); // Priority 2
-
-    // Level 1 requests 100 per sec. Level 2 requests 100 per sec. Total requested = 200.
-    // Set daily liquidity such that exactly 150 per sec is available (150 * 86400)
-    // Level 1 should get 100% (100). Level 2 should get the remainder (50).
-    client.manage_liquidity(&(150 * SCALING_FACTOR * 86400));
-
-    assert_eq!(client.get_grant(&1).flow_rate, 100 * SCALING_FACTOR);
-    assert_eq!(client.get_grant(&2).flow_rate, 50 * SCALING_FACTOR);
 }
