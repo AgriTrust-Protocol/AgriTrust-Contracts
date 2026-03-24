@@ -1,4 +1,11 @@
+#![allow(unexpected_cfgs)]
 #![no_std]
+
+use core::cmp::min;
+
+use soroban_sdk::{
+    contract, contractimpl, contracttype, panic_with_error, token, Address, Env, Map, String,
+    Symbol, Vec,
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
     Symbol, vec, IntoVal, Map,
@@ -24,13 +31,31 @@ const MIN_VOTING_PARTICIPATION: u32 = 1000; // 10% minimum participation (in bas
 const SLASHING_APPROVAL_THRESHOLD: u32 = 6600; // 66% approval required (in basis points)
 const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 
+// Milestone System constants
+const CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days challenge period
+const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason length
+const MAX_CHALLENGE_REASON_LENGTH: u32 = 1000; // Maximum challenge reason length
+const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
+pub mod atomic_bridge;
+pub mod governance;
+pub mod sub_dao_authority;
+
 // --- Test Modules ---
 #[cfg(test)]
 mod test_batch_init;
+#[cfg(test)]
+mod test_atomic_bridge;
+#[cfg(test)]
+mod test_sub_dao_authority;
+#[cfg(test)]
+mod test_coi_voting_exclusion;
+#[cfg(test)]
+mod test_optimistic_milestones;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -42,6 +67,12 @@ pub fn get_next_grant_id(env: Env) -> u64 {
         return 1;
     }
 
+#[contracttype]
+pub enum DataKey {
+    Grant(Symbol),
+    Milestone(Symbol, Symbol),
+    MilestoneVote(Symbol, Symbol, Address),
+    Withdrawn(Symbol, Address),
     // Find the maximum existing ID and add 1
     let mut max_id = 0u64;
     for id in grant_ids.iter() {
@@ -76,6 +107,25 @@ pub fn batch_init_with_deposits(
         return Err(Error::InvalidAmount);
     }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct Grant {
+    pub admin: Address,
+    pub grantees: Map<Address, u32>,
+    pub total_amount: u128,
+    pub released_amount: u128,
+    pub token_address: Address,
+    pub created_at: u64,
+    pub cliff_end: u64,
+    pub stream_start: u64,
+    pub stream_duration: u64,
+    pub status: GrantStatus,
+    pub council_members: Vec<Address>,
+    pub voting_threshold: u32,
+    pub acceleration_windows: Vec<StreamAcceleration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
     // Determine starting grant ID
     let start_id = starting_grant_id.unwrap_or_else(|| {
         let grant_ids = read_grant_ids(&env);
@@ -163,6 +213,13 @@ pub fn batch_init_with_deposits(
             validator: config.validator.clone(),
             validator_withdrawn: 0,
             validator_claimable: 0,
+            // COI: Store linked addresses
+            linked_addresses: config.linked_addresses.clone(),
+            // Milestone system fields
+            milestone_amount: config.milestone_amount,
+            total_milestones: config.total_milestones,
+            claimed_milestones: 0,
+            available_milestone_funds: 0, // Will be calculated based on milestone_amount
         };
 
         // Store the grant
@@ -218,8 +275,13 @@ pub enum GrantStatus {
     Active,
     Paused,
     Completed,
-    Cancelled,
     RageQuitted,
+    Cancelled,
+    // Milestone-related statuses
+    MilestoneClaimed,    // Milestone claimed, in challenge period
+    MilestoneApproved,    // Challenge period passed, funds released
+    MilestoneChallenged,  // Milestone challenged, under review
+    MilestoneRejected,    // Challenge successful, claim rejected
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,10 +312,191 @@ pub struct Grant {
     pub start_time: u64,
     pub warmup_duration: u64,
 
+    // Staking fields
+    pub required_stake: i128,
+    pub staked_amount: i128,
+    pub stake_token: Address,
+    pub slash_reason: Option<String>,
+    // Lease-specific fields
+    pub lessor: Address,           // NEW: Equipment/property owner receiving payments
+    pub property_id: String,        // NEW: Physical asset identifier
+    pub serial_number: String,      // NEW: Equipment serial number
+    pub security_deposit: i128,    // NEW: Security deposit amount
+    pub lease_end_time: u64,      // NEW: Lease termination timestamp
+    pub lease_terminated: bool,   // NEW: Legal oracle termination flag
+    // Add funds tracking
+    pub remaining_balance: i128,   // NEW: Remaining allocated balance for this grant
+    // COI (Conflict of Interest) fields
+    pub linked_addresses: Vec<Address>, // Linked addresses that cannot vote on this grant
+    // Milestone system fields
+    pub milestone_amount: i128,     // Amount per milestone
+    pub total_milestones: u32,     // Total number of milestones
+    pub claimed_milestones: u32,    // Number of milestones claimed so far
+    pub available_milestone_funds: i128, // Funds available for milestone claims
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StreamAcceleration {
+    pub milestone_id: Symbol,
+    pub activated_at: u64,
+    pub expires_at: u64,
+    pub bonus_bps: u32,
 }
 
 #[derive(Clone)]
 #[contracttype]
+pub struct GranteeConfig {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub flow_rate: i128,
+    pub asset: Address,
+    pub warmup_duration: u64,
+    pub validator: Option<Address>,
+    pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
+    pub milestone_amount: i128,     // Amount per milestone
+    pub total_milestones: u32,     // Total number of milestones
+}
+
+/// Result of batch grant initialization
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct BatchInitResult {
+    pub successful_grants: Vec<u64>,
+    pub failed_grants: Vec<u64>,
+    pub total_deposited: i128,
+    pub grants_created: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FinancialSnapshot {
+    pub grant_id: u64,           // Grant identifier
+    pub total_received: i128,      // Total amount received by grantee
+    pub timestamp: u64,           // When snapshot was created
+    pub expiry: u64,             // When snapshot expires (24h)
+    pub version: u32,            // Snapshot version for compatibility
+    pub contract_signature: [u8; 64], // Contract's cryptographic signature
+    pub hash: [u8; 32],        // SHA-256 hash of snapshot data
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum SlashingProposalStatus {
+    Proposed,    // Proposal created, voting open
+    Approved,    // Proposal approved, ready for execution
+    Rejected,    // Proposal rejected by DAO vote
+    Executed,    // Slashing executed successfully
+    Expired,     // Voting period expired
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct SlashingProposal {
+    pub proposal_id: u64,
+    pub grant_id: u64,
+    pub proposer: Address,
+    pub reason: String,
+    pub evidence_hash: [u8; 32], // Hash of evidence documents
+    pub created_at: u64,
+    pub voting_deadline: u64,
+    pub acceleration_bps: u32,
+    pub acceleration_duration: u64,
+    pub status: SlashingProposalStatus,
+    pub votes_for: i128,       // Total voting power in favor
+    pub votes_against: i128,   // Total voting power against
+    pub total_voting_power: i128, // Total eligible voting power
+    pub executed_at: Option<u64>, // When slashing was executed
+}
+
+// --- Milestone System Types ---
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MilestoneClaim {
+    pub claim_id: u64,
+    pub grant_id: u64,
+    pub claimer: Address,
+    pub milestone_number: u32,
+    pub amount: i128,
+    pub claimed_at: u64,
+    pub challenge_deadline: u64,
+    pub status: MilestoneStatus,
+    pub evidence: String,
+    pub challenger: Option<Address>,
+    pub challenge_reason: Option<String>,
+    pub challenged_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum MilestoneStatus {
+    Claimed,           // Milestone claimed, in challenge period
+    Approved,           // Challenge period passed, funds released
+    Challenged,         // Challenge raised, under review
+    Rejected,           // Challenge successful, claim rejected
+    Paid,               // Funds successfully released
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MilestoneChallenge {
+    pub challenge_id: u64,
+    pub claim_id: u64,
+    pub challenger: Address,
+    pub reason: String,
+    pub evidence: String,
+    pub created_at: u64,
+    pub status: ChallengeStatus,
+    pub resolved_at: Option<u64>,
+    pub resolution: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum ChallengeStatus {
+    Active,             // Challenge is active, awaiting review
+    ResolvedApproved,    // Challenge resolved in favor of claimer
+    ResolvedRejected,    // Challenge resolved in favor of challenger
+    Expired,            // Challenge period expired without resolution
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub enum GrantError {
+    GrantNotFound,
+    Unauthorized,
+    InvalidAmount,
+    MilestoneNotFound,
+    AlreadyApproved,
+    ExceedsTotalAmount,
+    InvalidStatus,
+    InvalidShares,
+    NotCouncilMember,
+    AlreadyVoted,
+    VotingExpired,
+    InvalidGrantee,
+    InvalidStreamConfig,
+    InvalidAccelerationConfig,
+}
+
+impl From<GrantError> for soroban_sdk::Error {
+    fn from(error: GrantError) -> Self {
+        match error {
+            GrantError::GrantNotFound => soroban_sdk::Error::from_contract_error(1),
+            GrantError::Unauthorized => soroban_sdk::Error::from_contract_error(2),
+            GrantError::InvalidAmount => soroban_sdk::Error::from_contract_error(3),
+            GrantError::MilestoneNotFound => soroban_sdk::Error::from_contract_error(4),
+            GrantError::AlreadyApproved => soroban_sdk::Error::from_contract_error(5),
+            GrantError::ExceedsTotalAmount => soroban_sdk::Error::from_contract_error(6),
+            GrantError::InvalidStatus => soroban_sdk::Error::from_contract_error(7),
+            GrantError::InvalidShares => soroban_sdk::Error::from_contract_error(8),
+            GrantError::NotCouncilMember => soroban_sdk::Error::from_contract_error(9),
+            GrantError::AlreadyVoted => soroban_sdk::Error::from_contract_error(10),
+            GrantError::VotingExpired => soroban_sdk::Error::from_contract_error(11),
+            GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
+            GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
+            GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
 enum DataKey {
     Admin,
     GrantToken,
@@ -279,6 +522,17 @@ enum DataKey {
     MaxFlowRate(u64),
     PriorityMultipliers,
     PlatformFeeBps,
+    // Sub-DAO Authority integration
+    SubDaoAuthorityContract, // Address of Sub-DAO authority contract
+    // COI (Conflict of Interest) keys
+    LinkedAddresses(u64), // Maps grant_id to linked addresses
+    VoterExclusions(u64), // Maps proposal_id to excluded voters with reasons
+    // Milestone system keys
+    MilestoneClaim(u64), // Maps claim_id to milestone claim details
+    MilestoneChallenge(u64), // Maps challenge_id to challenge details
+    GrantMilestones(u64), // Maps grant_id to list of milestone claim IDs
+    NextMilestoneClaimId, // Next available milestone claim ID
+    NextChallengeId, // Next available challenge ID
 }
 
 #[contracterror]
@@ -299,6 +553,55 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
 
+    // Lease-related errors
+    InvalidLeaseTerms = 14,
+    LeaseAlreadyTerminated = 15,
+    LeaseNotActive = 16,
+    InvalidPropertyId = 17,
+    InvalidSecurityDeposit = 18,
+    LeaseNotExpired = 19,
+    OracleTerminationFailed = 20,
+    // Financial snapshot errors
+    SnapshotExpired = 21,
+    InvalidSnapshot = 22,
+    SnapshotNotFound = 23,
+    InvalidSignature = 24,
+    // Slashing proposal errors
+    ProposalNotFound = 25,
+    ProposalAlreadyExists = 26,
+    InvalidProposalStatus = 27,
+    VotingPeriodEnded = 28,
+    VotingPeriodActive = 29,
+    AlreadyVoted = 30,
+    InsufficientVotingPower = 31,
+    ParticipationThresholdNotMet = 32,
+    ApprovalThresholdNotMet = 33,
+    NoStakeToSlash = 34,
+    SlashingAlreadyExecuted = 35,
+    InvalidReasonLength = 36,
+    // Sub-DAO Authority errors
+    SubDaoActionNotAllowed = 37,
+    SubDaoPermissionRevoked = 38,
+    SubDaoActionVetoed = 39,
+    SubDaoContractNotSet = 40,
+    // COI (Conflict of Interest) errors
+    VoterHasConflictOfInterest = 41,
+    LinkedAddressAlreadyExists = 42,
+    LinkedAddressNotFound = 43,
+    CannotVoteOnOwnGrant = 44,
+    ExcludedFromVoting = 45,
+    // Milestone system errors
+    MilestoneNotFound = 46,
+    MilestoneAlreadyClaimed = 47,
+    InvalidMilestoneNumber = 48,
+    ChallengeNotFound = 49,
+    ChallengeAlreadyExists = 50,
+    ChallengePeriodExpired = 51,
+    ChallengeNotActive = 52,
+    InvalidChallengeStatus = 53,
+    InsufficientMilestoneFunds = 54,
+    MilestoneNotClaimed = 55,
+    MilestoneAlreadyChallenged = 56,
 }
 
 // --- Internal Helpers ---
@@ -335,6 +638,24 @@ fn read_grant_token(env: &Env) -> Result<Address, Error> {
 
 fn read_treasury(env: &Env) -> Result<Address, Error> {
     env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+}
+
+fn read_sub_dao_authority_contract(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::SubDaoAuthorityContract).ok_or(Error::SubDaoContractNotSet)
+}
+
+fn check_sub_dao_permission(env: &Env, caller: &Address, grant_id: u64, action: &str) -> Result<(), Error> {
+    let sub_dao_contract = read_sub_dao_authority_contract(env)?;
+    
+    // This would be a contract call to check permissions
+    // For now, we'll implement basic logic here
+    // In production, this would call SubDaoAuthority::validate_sub_dao_action
+    
+    // Check if caller manages this grant
+    // Note: In a real implementation, this would query the Sub-DAO authority contract
+    // For now, we'll use a simplified approach
+    
+    Err(Error::SubDaoActionNotAllowed) // Default to not allowed until proper integration
 }
 
 fn read_grant_ids(env: &Env) -> Vec<u64> {
@@ -555,6 +876,81 @@ fn calculate_voting_results(env: &Env, proposal: &SlashingProposal) -> (bool, bo
     (participation_met, approval_met)
 }
 
+// --- Milestone System Helper Functions ---
+
+fn read_next_milestone_claim_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextMilestoneClaimId)
+        .unwrap_or(1)
+}
+
+fn write_next_milestone_claim_id(env: &Env, claim_id: u64) {
+    env.storage().instance().set(&DataKey::NextMilestoneClaimId, &claim_id);
+}
+
+fn read_next_challenge_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextChallengeId)
+        .unwrap_or(1)
+}
+
+fn write_next_challenge_id(env: &Env, challenge_id: u64) {
+    env.storage().instance().set(&DataKey::NextChallengeId, &challenge_id);
+}
+
+fn read_milestone_claim(env: &Env, claim_id: u64) -> Result<MilestoneClaim, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneClaim(claim_id))
+        .ok_or(Error::MilestoneNotFound)
+}
+
+fn write_milestone_claim(env: &Env, claim_id: u64, claim: &MilestoneClaim) {
+    env.storage().instance().set(&DataKey::MilestoneClaim(claim_id), claim);
+}
+
+fn read_milestone_challenge(env: &Env, challenge_id: u64) -> Result<MilestoneChallenge, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MilestoneChallenge(challenge_id))
+        .ok_or(Error::ChallengeNotFound)
+}
+
+fn write_milestone_challenge(env: &Env, challenge_id: u64, challenge: &MilestoneChallenge) {
+    env.storage().instance().set(&DataKey::MilestoneChallenge(challenge_id), challenge);
+}
+
+fn read_grant_milestones(env: &Env, grant_id: u64) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantMilestones(grant_id))
+        .unwrap_or(vec![&env])
+}
+
+fn write_grant_milestones(env: &Env, grant_id: u64, claim_ids: &Vec<u64>) {
+    env.storage().instance().set(&DataKey::GrantMilestones(grant_id), claim_ids);
+}
+
+fn validate_milestone_number(grant: &Grant, milestone_number: u32) -> Result<(), Error> {
+    if milestone_number == 0 || milestone_number > grant.total_milestones {
+        return Err(Error::InvalidMilestoneNumber);
+    }
+    
+    if milestone_number <= grant.claimed_milestones {
+        return Err(Error::MilestoneAlreadyClaimed);
+    }
+    
+    Ok(())
+}
+
+fn calculate_available_milestone_funds(grant: &Grant) -> i128 {
+    grant.milestone_amount
+        .checked_mul(grant.total_milestones as i128 - grant.claimed_milestones as i128)
+        .unwrap_or(0)
+}
+
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let mut total = 0_i128;
     let ids = read_grant_ids(env);
@@ -685,6 +1081,17 @@ impl GrantContract {
     pub fn initialize(
         env: Env,
         admin: Address,
+        grantees: Map<Address, u32>,
+        total_amount: u128,
+        token_address: Address,
+        cliff_end: u64,
+        council_members: Vec<Address>,
+        voting_threshold: u32,
+    ) {
+        admin.require_auth();
+
+        if total_amount == 0 {
+            panic_with_error!(&env, GrantError::InvalidAmount);
         grant_token: Address,
         treasury: Address,
         oracle: Address,
@@ -702,6 +1109,99 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Set the Sub-DAO authority contract address (admin only)
+    pub fn set_sub_dao_authority_contract(env: Env, admin: Address, sub_dao_contract: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        env.storage().instance().set(&DataKey::SubDaoAuthorityContract, &sub_dao_contract);
+        
+        env.events().publish(
+            (symbol_short!("subdao_contract_set"),),
+            (admin, sub_dao_contract),
+        );
+        
+        Ok(())
+    }
+
+        let mut total_shares = 0u32;
+        for (_, share) in grantees.iter() {
+            total_shares = total_shares.saturating_add(share);
+        }
+        if total_shares != 10_000 {
+            panic_with_error!(&env, GrantError::InvalidShares);
+        }
+
+        if voting_threshold == 0 || voting_threshold > council_members.len() {
+            panic_with_error!(&env, GrantError::InvalidAmount);
+        }
+
+        let created_at = env.ledger().timestamp();
+        let grant = Grant {
+            admin,
+            grantees,
+            total_amount,
+            released_amount: 0,
+            token_address,
+            created_at,
+            cliff_end,
+            stream_start: created_at,
+            stream_duration: 0,
+            status: GrantStatus::Proposed,
+            council_members,
+            voting_threshold,
+            acceleration_windows: Vec::new(&env),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
+    }
+
+    pub fn configure_stream(env: Env, grant_id: Symbol, stream_start: u64, stream_duration: u64) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        if stream_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidStreamConfig);
+        }
+
+        grant.stream_start = stream_start;
+        grant.stream_duration = stream_duration;
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
+    }
+
+    pub fn add_milestone(
+        env: Env,
+        grant_id: Symbol,
+        milestone_id: Symbol,
+        amount: u128,
+        description: String,
+        voting_period: u64,
+    ) {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        if amount == 0 || voting_period == 0 {
+            panic_with_error!(&env, GrantError::InvalidAmount);
+        }
+
+        let milestone = Milestone {
+            amount,
+            description,
+            approved: false,
+            approved_at: None,
+            votes_for: 0,
+            votes_against: 0,
+            voting_deadline: env.ledger().timestamp().saturating_add(voting_period),
+            acceleration_bps: 0,
+            acceleration_duration: 0,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Milestone(grant_id, milestone_id), &milestone);
     pub fn create_grant(
         env: Env,
         grant_id: u64,
@@ -801,6 +1301,52 @@ impl GrantContract {
     ) -> Result<BatchInitResult, Error> {
         require_admin_auth(&env)?;
 
+    pub fn configure_milestone_acceleration(
+        env: Env,
+        grant_id: Symbol,
+        milestone_id: Symbol,
+        acceleration_bps: u32,
+        acceleration_duration: u64,
+    ) {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        if acceleration_bps == 0 || acceleration_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidAccelerationConfig);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_id);
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        if milestone.approved {
+            panic_with_error!(&env, GrantError::AlreadyApproved);
+        }
+
+        milestone.acceleration_bps = acceleration_bps;
+        milestone.acceleration_duration = acceleration_duration;
+        env.storage().instance().set(&milestone_key, &milestone);
+    }
+
+    pub fn propose_milestone_approval(env: Env, grant_id: Symbol, milestone_id: Symbol) {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        if milestone.approved {
+            panic_with_error!(&env, GrantError::AlreadyApproved);
+        }
+
+        milestone.votes_for = 0;
+        milestone.votes_against = 0;
+        milestone.voting_deadline = env.ledger().timestamp().saturating_add(7 * 24 * 60 * 60);
+
+        for member in grant.council_members.iter() {
+            env.storage().instance().remove(&DataKey::MilestoneVote(
+                grant_id.clone(),
+                milestone_id.clone(),
+                member,
+            ));
+        }
         if grantee_configs.is_empty() {
             return Err(Error::InvalidAmount);
         }
@@ -894,6 +1440,18 @@ impl GrantContract {
         // Update grant IDs list
         env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
 
+    pub fn vote_milestone(
+        env: Env,
+        grant_id: Symbol,
+        milestone_id: Symbol,
+        voter: Address,
+        approve: bool,
+    ) {
+        voter.require_auth();
+
+        let mut grant = Self::load_grant(&env, &grant_id);
+        let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
         let result = BatchInitResult {
             successful_grants: successful_grants.clone(),
             failed_grants,
@@ -937,6 +1495,106 @@ impl GrantContract {
         if amount > grant.claimable {
             return Err(Error::InvalidAmount);
         }
+        if env.ledger().timestamp() > milestone.voting_deadline {
+            panic_with_error!(&env, GrantError::VotingExpired);
+        }
+        if !Self::is_council_member(&grant, &voter) {
+            panic_with_error!(&env, GrantError::NotCouncilMember);
+        }
+
+        let vote_key = DataKey::MilestoneVote(grant_id.clone(), milestone_id.clone(), voter);
+        if env.storage().instance().has(&vote_key) {
+            panic_with_error!(&env, GrantError::AlreadyVoted);
+        }
+        env.storage().instance().set(&vote_key, &approve);
+
+        if approve {
+            milestone.votes_for = milestone.votes_for.saturating_add(1);
+        } else {
+            milestone.votes_against = milestone.votes_against.saturating_add(1);
+        }
+
+        if milestone.votes_for >= grant.voting_threshold {
+            Self::finalize_milestone_approval(
+                &env,
+                &grant_id,
+                &milestone_id,
+                &mut grant,
+                &mut milestone,
+            );
+        }
+
+        env.storage().instance().set(&milestone_key, &milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
+    }
+
+    pub fn approve_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        Self::finalize_milestone_approval(
+            &env,
+            &grant_id,
+            &milestone_id,
+            &mut grant,
+            &mut milestone,
+        );
+
+        env.storage().instance().set(&milestone_key, &milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
+    }
+
+    pub fn withdraw(env: Env, grant_id: Symbol, caller: Address) -> u128 {
+        caller.require_auth();
+
+        let grant = Self::load_grant(&env, &grant_id);
+        let share = match grant.grantees.get(caller.clone()) {
+            Some(share) => share,
+            None => panic_with_error!(&env, GrantError::InvalidGrantee),
+        };
+
+        let available =
+            Self::compute_withdrawable_amount(&env, &grant, &grant_id, caller.clone(), share);
+        if available == 0 {
+            return 0;
+        }
+
+        let withdrawn_key = DataKey::Withdrawn(grant_id, caller.clone());
+        let already_withdrawn = env
+            .storage()
+            .instance()
+            .get::<_, u128>(&withdrawn_key)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&withdrawn_key, &already_withdrawn.saturating_add(available));
+
+        Self::transfer_tokens(
+            &env,
+            &grant.token_address,
+            &env.current_contract_address(),
+            &caller,
+            available,
+        );
+        available
+    }
+
+    pub fn activate_grant(env: Env, grant_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        match grant.status {
+            GrantStatus::Proposed => {
+                grant.status = GrantStatus::Active;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
 
         grant.claimable = grant.claimable.checked_sub(amount).ok_or(Error::MathOverflow)?;
         grant.withdrawn = grant.withdrawn.checked_add(amount).ok_or(Error::MathOverflow)?;
@@ -953,8 +1611,7 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
-        require_admin_auth(&env)?;
+    pub fn pause_stream(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
@@ -962,10 +1619,47 @@ impl GrantContract {
         grant.status = GrantStatus::Paused;
         write_grant(&env, grant_id, &grant);
         Ok(())
+        // Check authorization: either admin or authorized Sub-DAO
+        let action_id = if require_admin_auth(&env).is_ok() {
+            // Admin authorized - proceed directly
+            settle_grant(&mut grant, env.ledger().timestamp())?;
+            grant.status = GrantStatus::Paused;
+            write_grant(&env, grant_id, &grant);
+            
+            // Log admin action
+            env.events().publish(
+                (symbol_short!("admin_pause"),),
+                (grant_id, caller, reason),
+            );
+            0 // Admin actions don't need Sub-DAO tracking
+        } else {
+            // Check Sub-DAO authorization and log action
+            let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
+            
+            // This would call SubDaoAuthority::delegated_pause_grant in production
+            // For now, we'll simulate the action
+            check_sub_dao_permission(&env, &caller, grant_id, "pause")?;
+            
+            settle_grant(&mut grant, env.ledger().timestamp())?;
+            grant.status = GrantStatus::Paused;
+            write_grant(&env, grant_id, &grant);
+            
+            // Generate action ID for tracking
+            let action_id = env.ledger().sequence();
+            
+            // Emit delegated pause event
+            env.events().publish(
+                (symbol_short!("delegated_pause"),),
+                (caller, grant_id, action_id, reason),
+            );
+            
+            action_id
+        };
+        
+        Ok(action_id)
     }
 
-    pub fn resume_stream(env: Env, grant_id: u64) -> Result<(), Error> {
-        require_admin_auth(&env)?;
+    pub fn resume_stream(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
 
@@ -979,6 +1673,43 @@ impl GrantContract {
         grant.last_update_ts = env.ledger().timestamp();
         write_grant(&env, grant_id, &grant);
         Ok(())
+        // Check authorization: either admin or authorized Sub-DAO
+        let action_id = if require_admin_auth(&env).is_ok() {
+            // Admin authorized - proceed directly
+            grant.status = GrantStatus::Active;
+            grant.last_update_ts = env.ledger().timestamp();
+            write_grant(&env, grant_id, &grant);
+            
+            // Log admin action
+            env.events().publish(
+                (symbol_short!("admin_resume"),),
+                (grant_id, caller, reason),
+            );
+            0 // Admin actions don't need Sub-DAO tracking
+        } else {
+            // Check Sub-DAO authorization and log action
+            let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
+            
+            // This would call SubDaoAuthority::delegated_resume_grant in production
+            check_sub_dao_permission(&env, &caller, grant_id, "resume")?;
+            
+            grant.status = GrantStatus::Active;
+            grant.last_update_ts = env.ledger().timestamp();
+            write_grant(&env, grant_id, &grant);
+            
+            // Generate action ID for tracking
+            let action_id = env.ledger().sequence();
+            
+            // Emit delegated resume event
+            env.events().publish(
+                (symbol_short!("delegated_resume"),),
+                (caller, grant_id, action_id, reason),
+            );
+            
+            action_id
+        };
+
+        Ok(action_id)
     }
 
     pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -1022,6 +1753,8 @@ impl GrantContract {
         
         let old_rate = grant.flow_rate;
 
+        grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+      
         if grant.pending_rate > 0 {
             grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
         }
@@ -1218,27 +1951,108 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn cancel_grant(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
+    pub fn pause_grant(env: Env, grant_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        match grant.status {
+            GrantStatus::Active => {
+                grant.status = GrantStatus::Paused;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
+            }
+            _ => panic_with_error!(&env, GrantError::InvalidStatus),
     pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
-        require_admin_auth(&env)?;
 
         if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
 
+
         grant.status = GrantStatus::Cancelled;
         write_grant(&env, grant_id, &grant);
+        // Check authorization: either admin or authorized Sub-DAO
+        let action_id = if require_admin_auth(&env).is_ok() {
+            // Admin authorized - proceed directly
+            settle_grant(&mut grant, env.ledger().timestamp())?;
 
-        if remaining > 0 {
-            let token_addr = read_grant_token(&env)?;
-            let client = token::Client::new(&env, &token_addr);
-            let treasury = read_treasury(&env)?;
-            client.transfer(&env.current_contract_address(), &treasury, &remaining);
-        }
+            // Remaining = total - already withdrawn - pending claimable (both sides)
+            let total_paid = grant.withdrawn
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
+            grant.status = GrantStatus::Cancelled;
+            write_grant(&env, grant_id, &grant);
 
-        Ok(())
+            if remaining > 0 {
+                let token_addr = read_grant_token(&env)?;
+                let client = token::Client::new(&env, &token_addr);
+                let treasury = read_treasury(&env)?;
+                client.transfer(&env.current_contract_address(), &treasury, &remaining);
+            }
+
+            // Log admin action
+            env.events().publish(
+                (symbol_short!("admin_cancel"),),
+                (grant_id, caller, reason),
+            );
+            0 // Admin actions don't need Sub-DAO tracking
+        } else {
+            // Check Sub-DAO authorization and log action
+            let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
+            
+            // This would call SubDaoAuthority::delegated_clawback_grant in production
+            check_sub_dao_permission(&env, &caller, grant_id, "cancel")?;
+            
+            settle_grant(&mut grant, env.ledger().timestamp())?;
+
+            // Remaining = total - already withdrawn - pending claimable (both sides)
+            let total_paid = grant.withdrawn
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
+            grant.status = GrantStatus::Cancelled;
+            write_grant(&env, grant_id, &grant);
+
+            if remaining > 0 {
+                let token_addr = read_grant_token(&env)?;
+                let client = token::Client::new(&env, &token_addr);
+                let treasury = read_treasury(&env)?;
+                client.transfer(&env.current_contract_address(), &treasury, &remaining);
+            }
+
+            // Generate action ID for tracking
+            let action_id = env.ledger().sequence();
+
+            // Emit delegated clawback event
+            env.events().publish(
+                (symbol_short!("delegated_clawback"),),
+                (caller, grant_id, action_id, reason),
+            );
+
+            action_id
+        };
+
+        Ok(action_id)
     }
 
+    pub fn resume_grant(env: Env, grant_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        match grant.status {
+            GrantStatus::Paused => {
+                grant.status = GrantStatus::Active;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
+            }
+            _ => panic_with_error!(&env, GrantError::InvalidStatus),
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
         require_admin_auth(&env)?;
         if amount <= 0 { return Err(Error::InvalidAmount); }
@@ -1260,6 +2074,18 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn cancel_grant(env: Env, grant_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        match grant.status {
+            GrantStatus::Proposed | GrantStatus::Paused => {
+                grant.status = GrantStatus::Cancelled;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
+            }
+            _ => panic_with_error!(&env, GrantError::InvalidStatus),
     pub fn get_grant(env: Env, grant_id: u64) -> Result<Grant, Error> {
         read_grant(&env, grant_id)
     }
@@ -1348,6 +2174,19 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn get_grant(env: Env, grant_id: Symbol) -> Grant {
+        Self::load_grant(&env, &grant_id)
+    }
+
+    pub fn get_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) -> Milestone {
+        Self::load_milestone(&env, &DataKey::Milestone(grant_id, milestone_id))
+    }
+
+    pub fn get_withdrawable_amount(env: Env, grant_id: Symbol, caller: Address) -> u128 {
+        let grant = Self::load_grant(&env, &grant_id);
+        let share = match grant.grantees.get(caller.clone()) {
+            Some(share) => share,
+            None => return 0,
     pub fn get_lease_info(env: Env, grant_id: u64) -> Result<(Address, String, String, i128, u64, bool), Error> {
         let grant = read_grant(&env, grant_id)?;
         if grant.stream_type != StreamType::TimeLockedLease {
@@ -1407,6 +2246,87 @@ impl GrantContract {
         Ok(snapshot)
     }
 
+        Self::compute_withdrawable_amount(&env, &grant, &grant_id, caller, share)
+    }
+
+    pub fn get_remaining_amount(env: Env, grant_id: Symbol) -> u128 {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.total_amount.saturating_sub(grant.released_amount)
+    }
+}
+
+impl GrantContract {
+    fn finalize_milestone_approval(
+        env: &Env,
+        grant_id: &Symbol,
+        milestone_id: &Symbol,
+        grant: &mut Grant,
+        milestone: &mut Milestone,
+    ) {
+        if milestone.approved {
+            panic_with_error!(env, GrantError::AlreadyApproved);
+        }
+        match grant.status {
+            GrantStatus::Cancelled | GrantStatus::Paused => {
+                panic_with_error!(env, GrantError::InvalidStatus);
+            }
+            _ => {}
+        }
+
+        let new_released = grant
+            .released_amount
+            .checked_add(milestone.amount)
+            .unwrap_or_else(|| panic_with_error!(env, GrantError::ExceedsTotalAmount));
+        if new_released > grant.total_amount {
+            panic_with_error!(env, GrantError::ExceedsTotalAmount);
+        }
+
+        milestone.approved = true;
+        milestone.approved_at = Some(env.ledger().timestamp());
+        grant.released_amount = new_released;
+
+        if milestone.acceleration_bps > 0 && milestone.acceleration_duration > 0 {
+            grant.acceleration_windows.push_back(StreamAcceleration {
+                milestone_id: milestone_id.clone(),
+                activated_at: env.ledger().timestamp(),
+                expires_at: env
+                    .ledger()
+                    .timestamp()
+                    .saturating_add(milestone.acceleration_duration),
+                bonus_bps: milestone.acceleration_bps,
+            });
+        }
+
+        if grant.released_amount == grant.total_amount {
+            grant.status = GrantStatus::Completed;
+        }
+
+        Self::transfer_tokens(
+            env,
+            &grant.token_address,
+            &grant.admin,
+            &env.current_contract_address(),
+            milestone.amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id.clone()), grant);
+    }
+
+    fn compute_withdrawable_amount(
+        env: &Env,
+        grant: &Grant,
+        grant_id: &Symbol,
+        caller: Address,
+        share: u32,
+    ) -> u128 {
+        let current_time = env.ledger().timestamp();
+        if grant.cliff_end > 0 && current_time < grant.cliff_end {
+            return 0;
+        }
+        match grant.status {
+            GrantStatus::Proposed | GrantStatus::Paused | GrantStatus::Cancelled => return 0,
+            _ => {}
     pub fn verify_financial_snapshot(
         env: Env, 
         grant_id: u64, 
@@ -1444,6 +2364,61 @@ impl GrantContract {
         Ok(true)
     }
 
+        let released_entitlement = grant.released_amount.saturating_mul(share as u128) / 10_000;
+        let stream_limited_entitlement = if grant.stream_duration == 0 {
+            released_entitlement
+        } else {
+            let total_entitlement = grant.total_amount.saturating_mul(share as u128) / 10_000;
+            let streamed = grant::compute_accelerated_claimable_balance(
+                total_entitlement,
+                grant.stream_start,
+                current_time,
+                grant.stream_duration,
+                &grant.acceleration_windows,
+            );
+            min(streamed, released_entitlement)
+        };
+
+        let withdrawn_key = DataKey::Withdrawn(grant_id.clone(), caller);
+        let already_withdrawn = env
+            .storage()
+            .instance()
+            .get::<_, u128>(&withdrawn_key)
+            .unwrap_or(0);
+        stream_limited_entitlement.saturating_sub(already_withdrawn)
+    }
+
+    fn load_grant(env: &Env, grant_id: &Symbol) -> Grant {
+        env.storage()
+            .instance()
+            .get::<_, Grant>(&DataKey::Grant(grant_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, GrantError::GrantNotFound))
+    }
+
+    fn load_milestone(env: &Env, key: &DataKey) -> Milestone {
+        env.storage()
+            .instance()
+            .get::<_, Milestone>(key)
+            .unwrap_or_else(|| panic_with_error!(env, GrantError::MilestoneNotFound))
+    }
+
+    fn is_council_member(grant: &Grant, voter: &Address) -> bool {
+        for member in grant.council_members.iter() {
+            if member == *voter {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn transfer_tokens(
+        env: &Env,
+        token_address: &Address,
+        from: &Address,
+        to: &Address,
+        amount: u128,
+    ) {
+        token::Client::new(env, token_address).transfer(from, to, &(amount as i128));
     pub fn get_snapshot_info(env: Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
         let snapshot = read_financial_snapshot(&env, grant_id, timestamp)?;
         
@@ -1464,8 +2439,816 @@ impl GrantContract {
         }
     }
 
+    // DAO Governance and Slashing Functions
+    pub fn propose_slashing(
+        env: Env,
+        grant_id: u64,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        // Validate proposal
+        let grant = read_grant(&env, grant_id)?;
+        
+        // Check if grant has staked collateral
+        if grant.staked_amount <= 0 {
+            return Err(Error::NoStakeToSlash);
+        }
+        
+        // Validate reason length
+        if reason.len() > MAX_SLASHING_REASON_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+        
+        // Check if there's already an active proposal for this grant
+        let grant_proposals = read_grant_slashing_proposals(&env, grant_id);
+        for proposal_id in grant_proposals.iter() {
+            if let Ok(proposal) = read_slashing_proposal(&env, *proposal_id) {
+                if proposal.status == SlashingProposalStatus::Proposed {
+                    return Err(Error::ProposalAlreadyExists);
+                }
+            }
+        }
+        
+        // Create new proposal
+        let proposal_id = read_next_proposal_id(&env);
+        let now = env.ledger().timestamp();
+        let voting_deadline = now + SLASHING_PROPOSAL_DURATION;
+        let evidence_hash = generate_evidence_hash(&evidence);
+        
+        let proposal = SlashingProposal {
+            proposal_id,
+            grant_id,
+            proposer: env.current_contract_address(), // In real implementation, would be actual proposer
+            reason: reason.clone(),
+            evidence_hash,
+            created_at: now,
+            voting_deadline,
+            status: SlashingProposalStatus::Proposed,
+            votes_for: 0,
+            votes_against: 0,
+            total_voting_power: 0, // Would be calculated based on DAO token holders
+            executed_at: None,
+        };
+        
+        // Store proposal
+        write_slashing_proposal(&env, proposal_id, &proposal);
+        
+        // Update proposal lists
+        let mut all_proposals = read_slashing_proposal_ids(&env);
+        all_proposals.push_back(proposal_id);
+        write_slashing_proposal_ids(&env, &all_proposals);
+        
+        let mut grant_proposals = read_grant_slashing_proposals(&env, grant_id);
+        grant_proposals.push_back(proposal_id);
+        write_grant_slashing_proposals(&env, grant_id, &grant_proposals);
+        
+        // Update next proposal ID
+        write_next_proposal_id(&env, proposal_id + 1);
+        
+        // Publish proposal creation event
+        env.events().publish(
+            (Symbol::new(&env, "slashing_proposed"), proposal_id),
+            (grant_id, reason, voting_deadline),
+        );
+        
+        Ok(proposal_id)
+    }
+
+    pub fn vote_on_slashing(
+        env: Env,
+        proposal_id: u64,
+        vote: bool, // true for in favor, false against
+    ) -> Result<(), Error> {
+        let mut proposal = read_slashing_proposal(&env, proposal_id)?;
+        
+        // Validate voting period
+        if proposal.status != SlashingProposalStatus::Proposed {
+            return Err(Error::InvalidProposalStatus);
+        }
+        
+        let now = env.ledger().timestamp();
+        if now >= proposal.voting_deadline {
+            return Err(Error::VotingPeriodEnded);
+        }
+        
+        // Check if voter has already voted
+        let voter = env.current_contract_address(); // In real implementation, would be actual voter
+        if let Some(_) = read_vote(&env, proposal_id, &voter) {
+            return Err(Error::AlreadyVoted);
+        }
+        
+        // Get voter's voting power
+        let voting_power = read_voting_power(&env, &voter);
+        if voting_power <= 0 {
+            return Err(Error::InsufficientVotingPower);
+        }
+        
+        // Record vote
+        write_vote(&env, proposal_id, &voter, vote);
+        
+        // Update vote counts
+        if vote {
+            proposal.votes_for = proposal.votes_for.checked_add(voting_power).ok_or(Error::MathOverflow)?;
+        } else {
+            proposal.votes_against = proposal.votes_against.checked_add(voting_power).ok_or(Error::MathOverflow)?;
+        }
+        
+        // Check if voting should close (if all eligible voters have voted)
+        // In a real implementation, this would be more sophisticated
+        let (participation_met, approval_met) = calculate_voting_results(&env, &proposal);
+        
+        // Update proposal
+        write_slashing_proposal(&env, proposal_id, &proposal);
+        
+        // Publish vote event
+        env.events().publish(
+            (Symbol::new(&env, "slashing_vote_cast"), proposal_id),
+            (voter, vote, voting_power),
+        );
+        
+        Ok(())
+    }
+
+    pub fn execute_slashing(env: Env, proposal_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut proposal = read_slashing_proposal(&env, proposal_id)?;
+        
+        // Validate proposal status
+        if proposal.status != SlashingProposalStatus::Proposed {
+            return Err(Error::InvalidProposalStatus);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Check if voting period has ended
+        if now < proposal.voting_deadline {
+            return Err(Error::VotingPeriodActive);
+        }
+        
+        // Check if voting period expired without sufficient participation
+        if now >= proposal.voting_deadline {
+            let (participation_met, approval_met) = calculate_voting_results(&env, &proposal);
+            
+            if !participation_met {
+                proposal.status = SlashingProposalStatus::Expired;
+                write_slashing_proposal(&env, proposal_id, &proposal);
+                return Err(Error::ParticipationThresholdNotMet);
+            }
+            
+            if !approval_met {
+                proposal.status = SlashingProposalStatus::Rejected;
+                write_slashing_proposal(&env, proposal_id, &proposal);
+                return Err(Error::ApprovalThresholdNotMet);
+            }
+        }
+        
+        // Execute slashing
+        let grant = read_grant(&env, proposal.grant_id)?;
+        
+        if grant.staked_amount <= 0 {
+            return Err(Error::NoStakeToSlash);
+        }
+        
+        // Transfer staked collateral to treasury
+        let treasury = read_treasury(&env)?;
+        let token_client = token::Client::new(&env, &grant.stake_token);
+        token_client.transfer(&env.current_contract_address(), &treasury, &grant.staked_amount);
+        
+        // Update grant status and record slashing
+        let mut updated_grant = grant;
+        updated_grant.status = GrantStatus::Slashed;
+        updated_grant.slash_reason = Some(proposal.reason.clone());
+        updated_grant.staked_amount = 0; // Clear staked amount
+        write_grant(&env, proposal.grant_id, &updated_grant);
+        
+        // Update proposal status
+        proposal.status = SlashingProposalStatus::Executed;
+        proposal.executed_at = Some(now);
+        write_slashing_proposal(&env, proposal_id, &proposal);
+        
+        // Publish slashing execution event
+        env.events().publish(
+            (Symbol::new(&env, "slashing_executed"), proposal_id),
+            (proposal.grant_id, grant.staked_amount, proposal.reason),
+        );
+        
+        Ok(())
+    }
+
+pub mod grant {
+    use core::cmp::{max, min};
+
+    use soroban_sdk::Vec;
+
+    use crate::StreamAcceleration;
+
+    pub fn compute_claimable_balance(total: u128, start: u64, now: u64, duration: u64) -> u128 {
+    pub fn get_slashing_proposal(env: Env, proposal_id: u64) -> Result<SlashingProposal, Error> {
+        read_slashing_proposal(&env, proposal_id)
+    }
+
+    pub fn get_grant_slashing_proposals(env: Env, grant_id: u64) -> Vec<u64> {
+        read_grant_slashing_proposals(&env, grant_id)
+    }
+
+    pub fn set_voting_power(env: Env, voter: Address, power: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        if power < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        write_voting_power(&env, &voter, power);
+        
+        // Publish voting power update event
+        env.events().publish(
+            (Symbol::new(&env, "voting_power_updated"), voter.clone()),
+            power,
+        );
+        
+    /// Compute the claimable balance for exponential vesting.
+    /// Rate increases as project nears completion.
+    /// Formula: total * (1 - exp(-factor * progress)) / (1 - exp(-factor))
+    /// where progress = elapsed / duration
+    pub fn compute_exponential_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let dur = duration as u128;
+        let el = elapsed as u128;
+        let whole = total / dur;
+        let rem = total % dur;
+
+        let part1 = match whole.checked_mul(el) {
+            Some(value) => value,
+            None => return total,
+        };
+        let part2 = match rem.checked_mul(el) {
+            Some(value) => value / dur,
+            None => return total,
+        };
+        part1.saturating_add(part2)
+    }
+
+    pub fn compute_accelerated_claimable_balance(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        windows: &Vec<StreamAcceleration>,
+    ) -> u128 {
+        let base = compute_claimable_balance(total, start, now, duration);
+        let mut extra = 0u128;
+
+        for window in windows.iter() {
+            if window.bonus_bps == 0 {
+                continue;
+            }
+
+            let overlap_start = max(start, window.activated_at);
+            let overlap_end = min(now, window.expires_at);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+
+            let baseline_during_window =
+                compute_claimable_balance(total, start, overlap_end, duration).saturating_sub(
+                    compute_claimable_balance(total, start, overlap_start, duration),
+                );
+            let bonus = baseline_during_window.saturating_mul(window.bonus_bps as u128) / 10_000;
+            extra = extra.saturating_add(bonus);
+        }
+
+        min(total, base.saturating_add(extra))
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
+        
+        // Simplified exponential approximation: total * progress^2 / 1000000 * factor
+        // This avoids complex floating point math while providing exponential growth
+        let progress_squared = match progress.checked_mul(progress) {
+            Some(v) => v,
+            None => return total, // overflow protection
+        };
+        
+        let factor_progress = match progress_squared.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        let vested = match total.checked_mul(factor_progress) {
+            Some(v) => v / 1_000_000_000, // Normalize by 1000^3
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+
+    /// Compute the claimable balance for logarithmic vesting.
+    /// Rate decreases as project progresses (front-loaded).
+    /// Formula: total * ln(1 + factor * progress) / ln(1 + factor)
+    /// where progress = elapsed / duration
+    pub fn compute_logarithmic_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
+        
+        // Simplified logarithmic approximation: total * (sqrt(progress * factor) * 1000) / (sqrt(factor) * 1000)
+        // This provides front-loaded vesting without complex math
+        if progress == 0 {
+            return 0;
+        }
+        
+        let progress_factor = match progress.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        // Integer square root approximation
+        let sqrt_progress_factor = Self::integer_sqrt(progress_factor);
+        let sqrt_factor = Self::integer_sqrt(factor_scaled);
+        
+        if sqrt_factor == 0 {
+            return 0;
+        }
+        
+        let vested = match total.checked_mul(sqrt_progress_factor) {
+            Some(v) => {
+                let normalized = match v.checked_mul(1000) {
+                    Some(v2) => v2,
+                    None => total,
+                };
+                match normalized.checked_div(sqrt_factor) {
+                    Some(v3) => v3 / 1000,
+                    None => total,
+                }
+            }
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+    
+    /// Integer square root using binary search
+    fn integer_sqrt(n: u128) -> u128 {
+        if n <= 1 {
+            return n;
+        }
+        
+        let mut low = 1u128;
+        let mut high = n;
+        let mut result = 1u128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            let mid_squared = match mid.checked_mul(mid) {
+                Some(v) => v,
+                None => {
+                    high = mid - 1;
+                    continue;
+                }
+            };
+            
+            if mid_squared == n {
+                return mid;
+            }
+            
+            if mid_squared < n {
+                low = mid + 1;
+                result = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        
+        result
+    }
+
+    /// Returns the current claimable balance for the validator (5% share).
+    pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
+        if let Ok(mut grant) = read_grant(&env, grant_id) {
+            if grant.validator.is_none() {
+                return 0;
+            }
+            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            grant.validator_claimable
+        } else {
+            0
+        }
+    }
+
+    /// Returns (validator_address, validator_claimable, validator_withdrawn) for a grant.
+    pub fn get_validator_info(
+        env: Env,
+        grant_id: u64,
+    ) -> Result<(Option<Address>, i128, i128), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        Ok((grant.validator, grant.validator_claimable, grant.validator_withdrawn))
+    }
+
+    /// Allows the designated validator to pull their 5% share independently.
+    pub fn withdraw_validator(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        let validator_addr = grant.validator.clone().ok_or(Error::InvalidState)?;
+        validator_addr.require_auth();
+
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        if amount <= 0 || amount > grant.validator_claimable {
+            return Err(Error::InvalidAmount);
+        }
+
+        grant.validator_claimable = grant.validator_claimable
+            .checked_sub(amount)
+            .ok_or(Error::MathOverflow)?;
+        grant.validator_withdrawn = grant.validator_withdrawn
+            .checked_add(amount)
+            .ok_or(Error::MathOverflow)?;
+
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &validator_addr, &amount);
 
         Ok(())
+    }
+
+    // COI (Conflict of Interest) Public Functions
+
+    /// Add a linked address to a grant (admin only)
+    /// Linked addresses cannot vote on grant-related proposals
+    pub fn add_linked_address(
+        env: Env,
+        admin: Address,
+        grant_id: u64,
+        linked_address: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        // Verify grant exists
+        let _grant = read_grant(&env, grant_id)?;
+        
+        add_linked_address(&env, grant_id, &linked_address)?;
+        
+        env.events().publish(
+            (symbol_short!("linked_addr_added"), grant_id),
+            (admin, linked_address),
+        );
+        
+        Ok(())
+    }
+
+    /// Remove a linked address from a grant (admin only)
+    pub fn remove_linked_address(
+        env: Env,
+        admin: Address,
+        grant_id: u64,
+        linked_address: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        remove_linked_address(&env, grant_id, &linked_address)?;
+        
+        env.events().publish(
+            (symbol_short!("linked_addr_removed"), grant_id),
+            (admin, linked_address),
+        );
+        
+        Ok(())
+    }
+
+    /// Get all linked addresses for a grant
+    pub fn get_linked_addresses(env: Env, grant_id: u64) -> Result<Vec<Address>, Error> {
+        let _grant = read_grant(&env, grant_id)?; // Verify grant exists
+        Ok(get_linked_addresses(&env, grant_id))
+    }
+
+    /// Check if a voter has conflict of interest with a grant
+    pub fn check_voter_conflict(
+        env: Env,
+        voter: Address,
+        grant_id: u64,
+    ) -> Result<bool, Error> {
+        match check_voter_conflict_of_interest(&env, &voter, grant_id) {
+            Ok(()) => Ok(false), // No conflict
+            Err(Error::CannotVoteOnOwnGrant) => Ok(true), // Has conflict
+            Err(Error::VoterHasConflictOfInterest) => Ok(true), // Has conflict
+            Err(e) => Err(e), // Other error
+        }
+    }
+
+    // --- Milestone System Public Functions ---
+
+    /// Claim a milestone with optimistic approval
+    /// Grant receives funds after 7-day challenge period if no challenge is raised
+    pub fn claim_milestone(
+        env: Env,
+        grant_id: u64,
+        milestone_number: u32,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Validate milestone number
+        validate_milestone_number(&grant, milestone_number)?;
+        
+        // Validate reason length
+        if reason.len() > MAX_MILESTONE_REASON_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+        
+        // Validate evidence length
+        if evidence.len() > MAX_EVIDENCE_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+
+        // Check if grant has sufficient milestone funds
+        let available_funds = calculate_available_milestone_funds(&grant);
+        if available_funds < grant.milestone_amount {
+            return Err(Error::InsufficientMilestoneFunds);
+        }
+
+        // Create milestone claim
+        let claim_id = read_next_milestone_claim_id(&env);
+        let now = env.ledger().timestamp();
+        let challenge_deadline = now + CHALLENGE_PERIOD;
+
+        let claim = MilestoneClaim {
+            claim_id,
+            grant_id,
+            claimer: env.current_contract_address(),
+            milestone_number,
+            amount: grant.milestone_amount,
+            claimed_at: now,
+            challenge_deadline,
+            status: MilestoneStatus::Claimed,
+            evidence,
+            challenger: None,
+            challenge_reason: None,
+            challenged_at: None,
+        };
+
+        // Store claim
+        write_milestone_claim(&env, claim_id, &claim);
+        write_next_milestone_claim_id(&env, claim_id + 1);
+
+        // Update grant
+        grant.claimed_milestones += 1;
+        grant.status = GrantStatus::MilestoneClaimed;
+        write_grant(&env, grant_id, &grant);
+
+        // Add to grant's milestone list
+        let mut milestones = read_grant_milestones(&env, grant_id);
+        milestones.push_back(claim_id);
+        write_grant_milestones(&env, grant_id, &milestones);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("milestone_claimed"), grant_id),
+            (claim_id, milestone_number, grant.milestone_amount, challenge_deadline),
+        );
+
+        Ok(claim_id)
+    }
+
+    /// Challenge a milestone claim
+    /// Any DAO member can challenge a claimed milestone during the 7-day challenge period
+    pub fn challenge_milestone(
+        env: Env,
+        challenger: Address,
+        claim_id: u64,
+        reason: String,
+        evidence: String,
+    ) -> Result<u64, Error> {
+        let mut claim = read_milestone_claim(&env, claim_id)?;
+        
+        // Validate claim is in challengeable state
+        if claim.status != MilestoneStatus::Claimed {
+            return Err(Error::MilestoneNotClaimed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= claim.challenge_deadline {
+            return Err(Error::ChallengePeriodExpired);
+        }
+
+        // Validate reason length
+        if reason.len() > MAX_CHALLENGE_REASON_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+
+        // Validate evidence length
+        if evidence.len() > MAX_EVIDENCE_LENGTH as usize {
+            return Err(Error::InvalidReasonLength);
+        }
+
+        // Create challenge
+        let challenge_id = read_next_challenge_id(&env);
+        let challenge = MilestoneChallenge {
+            challenge_id,
+            claim_id,
+            challenger: challenger.clone(),
+            reason: reason.clone(),
+            evidence: evidence.clone(),
+            created_at: now,
+            status: ChallengeStatus::Active,
+            resolved_at: None,
+            resolution: None,
+        };
+
+        // Store challenge
+        write_milestone_challenge(&env, challenge_id, &challenge);
+        write_next_challenge_id(&env, challenge_id + 1);
+
+        // Update claim status
+        claim.status = MilestoneStatus::Challenged;
+        claim.challenger = Some(challenger.clone());
+        claim.challenge_reason = Some(reason.clone());
+        claim.challenged_at = Some(now);
+        write_milestone_claim(&env, claim_id, &claim);
+
+        // Update grant status
+        let mut grant = read_grant(&env, claim.grant_id)?;
+        grant.status = GrantStatus::MilestoneChallenged;
+        write_grant(&env, claim.grant_id, &grant);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("milestone_challenged"), claim.grant_id),
+            (claim_id, challenge_id, challenger, reason),
+        );
+
+        Ok(challenge_id)
+    }
+
+    /// Release milestone funds after challenge period expires without challenges
+    /// This function can be called by anyone after the challenge period
+    pub fn release_milestone_funds(
+        env: Env,
+        claim_id: u64,
+    ) -> Result<(), Error> {
+        let mut claim = read_milestone_claim(&env, claim_id)?;
+        
+        // Validate claim is in claimed state
+        if claim.status != MilestoneStatus::Claimed {
+            return Err(Error::MilestoneNotClaimed);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < claim.challenge_deadline {
+            return Err(Error::ChallengePeriodExpired);
+        }
+
+        // Check if there are any active challenges
+        // In a real implementation, you would scan for active challenges
+        // For now, we'll assume no challenges exist
+        
+        // Release funds
+        let token_addr = read_grant_token(&env)?;
+        let token_client = token::Client::new(&env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), &claim.claimer, &claim.amount);
+
+        // Update claim status
+        claim.status = MilestoneStatus::Paid;
+        write_milestone_claim(&env, claim_id, &claim);
+
+        // Update grant status
+        let mut grant = read_grant(&env, claim.grant_id)?;
+        grant.status = GrantStatus::Active; // Back to active for next milestone
+        grant.available_milestone_funds = calculate_available_milestone_funds(&grant);
+        write_grant(&env, claim.grant_id, &grant);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("milestone_released"), claim.grant_id),
+            (claim_id, claim.milestone_number, claim.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Resolve a milestone challenge (admin only)
+    /// Admin can approve or reject challenged milestones
+    pub fn resolve_milestone_challenge(
+        env: Env,
+        admin: Address,
+        challenge_id: u64,
+        approved: bool,
+        resolution: String,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        let mut challenge = read_milestone_challenge(&env, challenge_id)?;
+        let mut claim = read_milestone_claim(&env, challenge.claim_id)?;
+        
+        // Validate challenge is active
+        if challenge.status != ChallengeStatus::Active {
+            return Err(Error::ChallengeNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        
+        // Update challenge
+        challenge.status = if approved {
+            ChallengeStatus::ResolvedApproved
+        } else {
+            ChallengeStatus::ResolvedRejected
+        };
+        challenge.resolved_at = Some(now);
+        challenge.resolution = Some(resolution.clone());
+        write_milestone_challenge(&env, challenge_id, &challenge);
+
+        // Update claim based on resolution
+        if approved {
+            // Approve claim - release funds
+            claim.status = MilestoneStatus::Approved;
+            
+            // Release funds
+            let token_addr = read_grant_token(&env)?;
+            let token_client = token::Client::new(&env, &token_addr);
+            token_client.transfer(&env.current_contract_address(), &claim.claimer, &claim.amount);
+            
+            // Update grant
+            let mut grant = read_grant(&env, claim.grant_id)?;
+            grant.status = GrantStatus::Active;
+            grant.available_milestone_funds = calculate_available_milestone_funds(&grant);
+            write_grant(&env, claim.grant_id, &grant);
+            
+            // Emit approval event
+            env.events().publish(
+                (symbol_short!("milestone_approved"), claim.grant_id),
+                (claim_id, challenge_id, resolution),
+            );
+        } else {
+            // Reject claim - return funds to pool
+            claim.status = MilestoneStatus::Rejected;
+            
+            // Return funds to grant pool
+            let mut grant = read_grant(&env, claim.grant_id)?;
+            grant.available_milestone_funds += claim.amount;
+            write_grant(&env, claim.grant_id, &grant);
+            
+            // Emit rejection event
+            env.events().publish(
+                (symbol_short!("milestone_rejected"), claim.grant_id),
+                (claim_id, challenge_id, resolution),
+            );
+        }
+        
+        write_milestone_claim(&env, claim_id, &claim);
+        Ok(())
+    }
+
+    /// Get milestone claim details
+    pub fn get_milestone_claim(env: Env, claim_id: u64) -> Result<MilestoneClaim, Error> {
+        read_milestone_claim(&env, claim_id)
+    }
+
+    /// Get milestone challenge details
+    pub fn get_milestone_challenge(env: Env, challenge_id: u64) -> Result<MilestoneChallenge, Error> {
+        read_milestone_challenge(&env, challenge_id)
+    }
+
+    /// Get all milestone claims for a grant
+    pub fn get_grant_milestones(env: Env, grant_id: u64) -> Result<Vec<u64>, Error> {
+        let _grant = read_grant(&env, grant_id)?; // Verify grant exists
+        Ok(read_grant_milestones(&env, grant_id))
     }
 }
 

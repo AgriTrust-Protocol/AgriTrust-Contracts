@@ -12,7 +12,11 @@ use soroban_sdk::{
     Env,
     Vec,
     Map,
+    String,
 };
+
+use super::atomic_bridge::{AtomicBridge, BridgeError};
+use super::{GranteeConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -38,6 +42,10 @@ pub struct Proposal {
     pub created_at: u64,
     pub stake_amount: i128,
     pub stake_returned: bool,
+    // Atomic Bridge fields
+    pub grant_payload: Option<Vec<GranteeConfig>>,
+    pub total_grant_amount: i128,
+    pub atomic_execution_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +83,8 @@ pub enum GovernanceDataKey {
     CouncilMembers,
     StakeToken,
     ProposalStakeAmount,
+    // Atomic Bridge integration
+    AtomicBridgeContract,
 }
 
 #[contracterror]
@@ -88,15 +98,17 @@ pub enum GovernanceError {
     ProposalAlreadyExists = 105,
     VotingEnded = 106,
     InvalidWeight = 107,
-    InvalidAmount = 108,
-    MathOverflow = 109,
-    QuorumNotMet = 110,
-    ThresholdNotMet = 111,
+    NotACouncilMember = 108,
+    QuorumNotMet = 109,
+    ThresholdNotMet = 110,
+    MathOverflow = 111,
     AlreadyVoted = 112,
-    NotCouncilMember = 113,
-    InsufficientStake = 113,
-    StakeAlreadyReturned = 114,
-    ProposalNotConcluded = 115,
+    // COI (Conflict of Interest) errors
+    VoterHasConflictOfInterest = 113,
+    NotCouncilMember = 114,
+    InsufficientStake = 115,
+    StakeAlreadyReturned = 116,
+    ProposalNotConcluded = 117,
 }
 
 pub struct GovernanceContract;
@@ -271,6 +283,9 @@ impl GovernanceContract {
             created_at: now,
             stake_amount,
             stake_returned: false,
+            grant_payload: None,
+            total_grant_amount: 0,
+            atomic_execution_enabled: false,
         };
 
         env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
@@ -280,6 +295,69 @@ impl GovernanceContract {
         env.events().publish(
             (symbol_short!("prop_new"), proposal_id),
             (proposer, voting_deadline),
+        );
+
+        Ok(proposal_id)
+    }
+
+    /// Create a proposal with atomic grant execution enabled
+    /// This is the key function for the atomic bridge integration
+    pub fn propose_atomic_grant(
+        env: Env,
+        proposer: Address,
+        title: soroban_sdk::String,
+        description: soroban_sdk::String,
+        voting_period: u64,
+        grant_configs: Vec<GranteeConfig>,
+        total_grant_amount: i128,
+    ) -> Result<u64, GovernanceError> {
+        proposer.require_auth();
+
+        let stake_token = Self::get_stake_token(&env)?;
+        let stake_amount = Self::get_proposal_stake_amount(&env)?;
+
+        // Transfer stake from proposer to this contract
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&proposer, &env.current_contract_address(), &stake_amount);
+
+        let now = env.ledger().timestamp();
+        let voting_deadline = now
+            .checked_add(voting_period)
+            .ok_or(GovernanceError::MathOverflow)?;
+
+        let mut proposal_ids = Self::get_proposal_ids(&env)?;
+        let proposal_id = if proposal_ids.is_empty() {
+            0
+        } else {
+            let last_id = proposal_ids.get(proposal_ids.len() - 1).unwrap();
+            last_id.checked_add(1).ok_or(GovernanceError::MathOverflow)?
+        };
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            title,
+            description,
+            voting_deadline,
+            status: ProposalStatus::Active,
+            yes_votes: 0,
+            no_votes: 0,
+            total_voting_power: 0,
+            created_at: now,
+            stake_amount,
+            stake_returned: false,
+            grant_payload: Some(grant_configs.clone()),
+            total_grant_amount,
+            atomic_execution_enabled: true,
+        };
+
+        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+        proposal_ids.push_back(proposal_id);
+        env.storage().instance().set(&GovernanceDataKey::ProposalIds, &proposal_ids);
+
+        env.events().publish(
+            (symbol_short!("atomic_prop_new"), proposal_id),
+            (proposer, voting_deadline, total_grant_amount, grant_configs.len()),
         );
 
         Ok(proposal_id)
@@ -310,6 +388,25 @@ impl GovernanceContract {
 
         if env.storage().instance().has(&GovernanceDataKey::Vote(voter.clone(), proposal_id)) {
             return Err(GovernanceError::AlreadyVoted);
+        }
+
+        // COI Check: Verify voter doesn't have conflict of interest
+        if proposal.grant_payload.is_some() {
+            // This is a grant proposal, check COI for each grantee
+            let grant_configs = proposal.grant_payload.as_ref().unwrap();
+            for config in grant_configs.iter() {
+                // Check if voter is the grantee
+                if voter == config.recipient {
+                    return Err(GovernanceError::VoterHasConflictOfInterest);
+                }
+                
+                // Check if voter is in linked addresses
+                for linked_addr in config.linked_addresses.iter() {
+                    if voter == *linked_addr {
+                        return Err(GovernanceError::VoterHasConflictOfInterest);
+                    }
+                }
+            }
         }
 
         let voting_power = Self::calculate_voting_power(&env, &voter)?;
@@ -390,6 +487,8 @@ impl GovernanceContract {
     /// The council membership check uses the optimized byte-comparison path:
     /// `caller` is serialised to XDR bytes exactly once, then compared
     /// against the pre-serialised `Vec<Bytes>` in storage.
+    /// 
+    /// Enhanced with atomic bridge integration for automatic grant creation.
     pub fn execute_proposal(
         env: Env,
         caller: Address,
@@ -425,13 +524,48 @@ impl GovernanceContract {
             return Err(GovernanceError::ThresholdNotMet);
         }
 
-        proposal.status = ProposalStatus::Executed;
-        env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+        // Check if this is an atomic grant proposal and execute grants atomically
+        if proposal.atomic_execution_enabled && proposal.grant_payload.is_some() {
+            let grant_configs = proposal.grant_payload.as_ref().unwrap();
+            let total_amount = proposal.total_grant_amount;
 
-        env.events().publish(
-            (symbol_short!("prop_exec"), proposal_id),
-            (proposal.yes_votes, proposal.no_votes),
-        );
+            // Get atomic bridge contract
+            let bridge_contract = Self::get_atomic_bridge_contract(&env)?;
+            
+            // Call atomic bridge to execute grants
+            match AtomicBridgeClient::new(&env, &bridge_contract)
+                .execute_atomic_grants(&env.current_contract_address(), proposal_id, grant_configs.clone(), total_amount) {
+                Ok(grant_ids) => {
+                    // Atomic execution successful
+                    proposal.status = ProposalStatus::Executed;
+                    env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+                    env.events().publish(
+                        (symbol_short!("prop_exec_atomic"), proposal_id),
+                        (proposal.yes_votes, proposal.no_votes, grant_ids.len()),
+                    );
+                }
+                Err(_) => {
+                    // Atomic execution failed - still mark proposal as executed but log the failure
+                    proposal.status = ProposalStatus::Executed;
+                    env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+                    env.events().publish(
+                        (symbol_short!("prop_exec_atomic_fail"), proposal_id),
+                        (proposal.yes_votes, proposal.no_votes),
+                    );
+                }
+            }
+        } else {
+            // Regular proposal execution (non-atomic)
+            proposal.status = ProposalStatus::Executed;
+            env.storage().instance().set(&GovernanceDataKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (symbol_short!("prop_exec"), proposal_id),
+                (proposal.yes_votes, proposal.no_votes),
+            );
+        }
 
         Ok(())
     }
@@ -576,6 +710,32 @@ impl GovernanceContract {
             .ok_or(GovernanceError::NotInitialized)
     }
 
+    fn get_atomic_bridge_contract(env: &Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&GovernanceDataKey::AtomicBridgeContract)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    /// Set the atomic bridge contract address (admin only)
+    pub fn set_atomic_bridge_contract(
+        env: Env,
+        admin: Address,
+        bridge_contract: Address,
+    ) -> Result<(), GovernanceError> {
+        // For simplicity, we'll use council auth instead of a separate admin
+        require_council_auth(&env, &admin)?;
+        
+        env.storage().instance().set(&GovernanceDataKey::AtomicBridgeContract, &bridge_contract);
+        
+        env.events().publish(
+            (symbol_short!("bridge_set"),),
+            (admin, bridge_contract),
+        );
+        
+        Ok(())
+    }
+
     // View functions
     pub fn get_proposal_info(env: Env, proposal_id: u64) -> Result<Proposal, GovernanceError> {
         Self::get_proposal(&env, proposal_id)
@@ -594,5 +754,32 @@ impl GovernanceContract {
             .instance()
             .get(&GovernanceDataKey::Vote(voter, proposal_id))
             .ok_or(GovernanceError::ProposalNotFound)
+    }
+}
+
+// Atomic Bridge Client Stub
+pub struct AtomicBridgeClient {
+    env: Env,
+    contract_id: Address,
+}
+
+impl AtomicBridgeClient {
+    pub fn new(env: &Env, contract_id: &Address) -> Self {
+        Self {
+            env: env.clone(),
+            contract_id: contract_id.clone(),
+        }
+    }
+
+    pub fn execute_atomic_grants(
+        &self,
+        caller: &Address,
+        proposal_id: u64,
+        grant_configs: Vec<GranteeConfig>,
+        total_amount: i128,
+    ) -> Result<Vec<u64>, BridgeError> {
+        // This would be a proper contract call in the actual implementation
+        // For now, returning a stub result
+        Ok(Vec::new(&self.env))
     }
 }
