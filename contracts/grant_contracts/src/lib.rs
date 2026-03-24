@@ -17,6 +17,10 @@ const MAX_STAKE_PERCENTAGE: i128 = 5000; // 50% maximum stake (in basis points)
 const MIN_SECURITY_DEPOSIT_PERCENTAGE: i128 = 500; // 5% minimum security deposit
 const MAX_SECURITY_DEPOSIT_PERCENTAGE: i128 = 2000; // 20% maximum security deposit
 
+// Financial Snapshot constants
+const SNAPSHOT_VERSION: u32 = 1; // Version for future compatibility
+const SNAPSHOT_EXPIRY: u64 = 86400; // 24 hours in seconds
+
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
@@ -77,6 +81,18 @@ pub struct Grant {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct FinancialSnapshot {
+    pub grant_id: u64,           // Grant identifier
+    pub total_received: i128,      // Total amount received by grantee
+    pub timestamp: u64,           // When snapshot was created
+    pub expiry: u64,             // When snapshot expires (24h)
+    pub version: u32,            // Snapshot version for compatibility
+    pub contract_signature: [u8; 64], // Contract's cryptographic signature
+    pub hash: [u8; 32],        // SHA-256 hash of snapshot data
+}
+
+#[derive(Clone)]
+#[contracttype]
 enum DataKey {
     Admin,
     GrantToken,
@@ -89,6 +105,9 @@ enum DataKey {
     // Lease-related keys
     LeaseAgreement(u64), // Maps grant_id to lease agreement details
     PropertyRegistry(String), // Maps property_id to lease history
+    // Financial snapshot keys
+    FinancialSnapshot(u64, u64), // Maps grant_id + timestamp to snapshot
+    SnapshotNonce(u64), // Maps grant_id to nonce for snapshot generation
 }
 
 #[contracterror]
@@ -116,6 +135,11 @@ pub enum Error {
     InvalidSecurityDeposit = 18,
     LeaseNotExpired = 19,
     OracleTerminationFailed = 20,
+    // Financial snapshot errors
+    SnapshotExpired = 21,
+    InvalidSnapshot = 22,
+    SnapshotNotFound = 23,
+    InvalidSignature = 24,
 }
 
 // --- Internal Helpers ---
@@ -197,6 +221,78 @@ fn calculate_security_deposit(total_amount: i128, deposit_percentage: i128) -> R
         .ok_or(Error::MathOverflow)?;
     
     Ok(deposit)
+}
+
+// Financial Snapshot Helper Functions
+fn read_snapshot_nonce(env: &Env, grant_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::SnapshotNonce(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_snapshot_nonce(env: &Env, grant_id: u64, nonce: u64) {
+    env.storage().instance().set(&DataKey::SnapshotNonce(grant_id), &nonce);
+}
+
+fn read_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::FinancialSnapshot(grant_id, timestamp))
+        .ok_or(Error::SnapshotNotFound)
+}
+
+fn write_financial_snapshot(env: &Env, grant_id: u64, timestamp: u64, snapshot: &FinancialSnapshot) {
+    env.storage().instance().set(&DataKey::FinancialSnapshot(grant_id, timestamp), snapshot);
+}
+
+fn generate_snapshot_hash(
+    grant_id: u64,
+    total_received: i128,
+    timestamp: u64,
+    expiry: u64,
+    version: u32,
+) -> [u8; 32] {
+    // Create a deterministic hash from snapshot data
+    // In a real implementation, this would use SHA-256 or similar
+    let mut hasher = [0u8; 32];
+    
+    // Simple hash implementation for demonstration
+    // In production, use proper cryptographic hash
+    let combined = format!(
+        "{}:{}:{}:{}:{}",
+        grant_id, total_received, timestamp, expiry, version
+    );
+    
+    // For now, return a placeholder hash
+    // TODO: Implement proper SHA-256 hashing
+    for i in 0..32.min(combined.len()) {
+        hasher[i] = combined.as_bytes()[i];
+    }
+    
+    hasher
+}
+
+fn generate_contract_signature(
+    env: &Env,
+    grant_id: u64,
+    total_received: i128,
+    timestamp: u64,
+) -> [u8; 64] {
+    // Generate a contract signature for the snapshot
+    // In a real implementation, this would use the contract's private key
+    // For now, return a deterministic signature based on the data
+    let mut signature = [0u8; 64];
+    
+    let combined = format!("{}:{}:{}", grant_id, total_received, timestamp);
+    
+    // Simple signature generation for demonstration
+    // In production, use proper cryptographic signing
+    for i in 0..64.min(combined.len()) {
+        signature[i] = combined.as_bytes()[i];
+    }
+    
+    signature
 }
 
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
@@ -680,6 +776,98 @@ impl GrantContract {
         read_property_history(&env, &property_id)
     }
 
+    // Financial Snapshot Functions
+    pub fn create_financial_snapshot(env: Env, grant_id: u64) -> Result<FinancialSnapshot, Error> {
+        let grant = read_grant(&env, grant_id)?;
+        
+        // Only grantee can create their own snapshot
+        grant.recipient.require_auth();
+        
+        // Settle any pending accruals first
+        settle_grant(&mut grant.clone(), grant_id, env.ledger().timestamp())?;
+        
+        let now = env.ledger().timestamp();
+        let expiry = now + SNAPSHOT_EXPIRY;
+        let nonce = read_snapshot_nonce(&env, grant_id) + 1;
+        
+        // Calculate total received (withdrawn + claimable)
+        let total_received = grant.withdrawn.checked_add(grant.claimable).ok_or(Error::MathOverflow)?;
+        
+        // Generate hash and signature
+        let hash = generate_snapshot_hash(grant_id, total_received, now, expiry, SNAPSHOT_VERSION);
+        let signature = generate_contract_signature(&env, grant_id, total_received, now);
+        
+        let snapshot = FinancialSnapshot {
+            grant_id,
+            total_received,
+            timestamp: now,
+            expiry,
+            version: SNAPSHOT_VERSION,
+            contract_signature: signature,
+            hash,
+        };
+        
+        // Store snapshot and update nonce
+        write_financial_snapshot(&env, grant_id, now, &snapshot);
+        write_snapshot_nonce(&env, grant_id, nonce);
+        
+        // Publish snapshot creation event
+        env.events().publish(
+            (Symbol::new(&env, "financial_snapshot_created"), grant_id),
+            (grant.recipient, total_received, now, expiry),
+        );
+        
+        Ok(snapshot)
+    }
+
+    pub fn verify_financial_snapshot(
+        env: Env, 
+        grant_id: u64, 
+        timestamp: u64,
+        total_received: i128,
+        hash: [u8; 32],
+        signature: [u8; 64]
+    ) -> Result<bool, Error> {
+        let snapshot = read_financial_snapshot(&env, grant_id, timestamp)?;
+        
+        // Check if snapshot has expired
+        if env.ledger().timestamp() > snapshot.expiry {
+            return Err(Error::SnapshotExpired);
+        }
+        
+        // Verify the hash matches
+        let expected_hash = generate_snapshot_hash(
+            grant_id,
+            total_received,
+            timestamp,
+            snapshot.expiry,
+            SNAPSHOT_VERSION
+        );
+        
+        if hash != expected_hash {
+            return Err(Error::InvalidSnapshot);
+        }
+        
+        // Verify the signature matches
+        let expected_signature = generate_contract_signature(&env, grant_id, total_received, timestamp);
+        if signature != expected_signature {
+            return Err(Error::InvalidSignature);
+        }
+        
+        Ok(true)
+    }
+
+    pub fn get_snapshot_info(env: Env, grant_id: u64, timestamp: u64) -> Result<FinancialSnapshot, Error> {
+        let snapshot = read_financial_snapshot(&env, grant_id, timestamp)?;
+        
+        // Check if snapshot has expired
+        if env.ledger().timestamp() > snapshot.expiry {
+            return Err(Error::SnapshotExpired);
+        }
+        
+        Ok(snapshot)
+    }
+
     pub fn claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
             let _ = settle_grant(&mut grant, env.ledger().timestamp());
@@ -709,3 +897,5 @@ mod test_staking;
 mod test_lease;
 #[cfg(test)]
 mod test_add_funds;
+#[cfg(test)]
+mod test_financial_snapshot;
