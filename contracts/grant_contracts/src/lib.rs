@@ -35,9 +35,14 @@ const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
 
+pub mod atomic_bridge;
+pub mod governance;
+
 // --- Test Modules ---
 #[cfg(test)]
 mod test_batch_init;
+#[cfg(test)]
+mod test_atomic_bridge;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
