@@ -30,12 +30,15 @@ const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 
 pub mod atomic_bridge;
 pub mod governance;
+pub mod sub_dao_authority;
 
 // --- Test Modules ---
 #[cfg(test)]
 mod test_batch_init;
 #[cfg(test)]
 mod test_atomic_bridge;
+#[cfg(test)]
+mod test_sub_dao_authority;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -374,6 +377,8 @@ enum DataKey {
     ProposalVotes(u64, Address), // Maps proposal_id + voter to their vote
     NextProposalId, // Next available proposal ID
     MaxFlowRate(u64),
+    // Sub-DAO Authority integration
+    SubDaoAuthorityContract, // Address of Sub-DAO authority contract
 }
 
 #[contracterror]
@@ -419,6 +424,11 @@ pub enum Error {
     NoStakeToSlash = 34,
     SlashingAlreadyExecuted = 35,
     InvalidReasonLength = 36,
+    // Sub-DAO Authority errors
+    SubDaoActionNotAllowed = 37,
+    SubDaoPermissionRevoked = 38,
+    SubDaoActionVetoed = 39,
+    SubDaoContractNotSet = 40,
 }
 
 // --- Internal Helpers ---
@@ -455,6 +465,24 @@ fn read_grant_token(env: &Env) -> Result<Address, Error> {
 
 fn read_treasury(env: &Env) -> Result<Address, Error> {
     env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+}
+
+fn read_sub_dao_authority_contract(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::SubDaoAuthorityContract).ok_or(Error::SubDaoContractNotSet)
+}
+
+fn check_sub_dao_permission(env: &Env, caller: &Address, grant_id: u64, action: &str) -> Result<(), Error> {
+    let sub_dao_contract = read_sub_dao_authority_contract(env)?;
+    
+    // This would be a contract call to check permissions
+    // For now, we'll implement basic logic here
+    // In production, this would call SubDaoAuthority::validate_sub_dao_action
+    
+    // Check if caller manages this grant
+    // Note: In a real implementation, this would query the Sub-DAO authority contract
+    // For now, we'll use a simplified approach
+    
+    Err(Error::SubDaoActionNotAllowed) // Default to not allowed until proper integration
 }
 
 fn read_grant_ids(env: &Env) -> Vec<u64> {
@@ -844,6 +872,20 @@ impl GrantContract {
         Ok(())
     }
 
+    /// Set the Sub-DAO authority contract address (admin only)
+    pub fn set_sub_dao_authority_contract(env: Env, admin: Address, sub_dao_contract: Address) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        env.storage().instance().set(&DataKey::SubDaoAuthorityContract, &sub_dao_contract);
+        
+        env.events().publish(
+            (symbol_short!("subdao_contract_set"),),
+            (admin, sub_dao_contract),
+        );
+        
+        Ok(())
+    }
+
     pub fn create_grant(
         env: Env,
         grant_id: u64,
@@ -1113,26 +1155,91 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn pause_stream(env: Env, grant_id: u64) -> Result<(), Error> {
-        require_admin_auth(&env)?;
+    pub fn pause_stream(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
-        settle_grant(&mut grant, env.ledger().timestamp())?;
-        grant.status = GrantStatus::Paused;
-        write_grant(&env, grant_id, &grant);
-        Ok(())
+        // Check authorization: either admin or authorized Sub-DAO
+        let action_id = if require_admin_auth(&env).is_ok() {
+            // Admin authorized - proceed directly
+            settle_grant(&mut grant, env.ledger().timestamp())?;
+            grant.status = GrantStatus::Paused;
+            write_grant(&env, grant_id, &grant);
+            
+            // Log admin action
+            env.events().publish(
+                (symbol_short!("admin_pause"),),
+                (grant_id, caller, reason),
+            );
+            0 // Admin actions don't need Sub-DAO tracking
+        } else {
+            // Check Sub-DAO authorization and log action
+            let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
+            
+            // This would call SubDaoAuthority::delegated_pause_grant in production
+            // For now, we'll simulate the action
+            check_sub_dao_permission(&env, &caller, grant_id, "pause")?;
+            
+            settle_grant(&mut grant, env.ledger().timestamp())?;
+            grant.status = GrantStatus::Paused;
+            write_grant(&env, grant_id, &grant);
+            
+            // Generate action ID for tracking
+            let action_id = env.ledger().sequence();
+            
+            // Emit delegated pause event
+            env.events().publish(
+                (symbol_short!("delegated_pause"),),
+                (caller, grant_id, action_id, reason),
+            );
+            
+            action_id
+        };
+        
+        Ok(action_id)
     }
 
-    pub fn resume_stream(env: Env, grant_id: u64) -> Result<(), Error> {
-        require_admin_auth(&env)?;
+    pub fn resume_stream(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
 
-        grant.status = GrantStatus::Active;
-        grant.last_update_ts = env.ledger().timestamp();
-        write_grant(&env, grant_id, &grant);
-        Ok(())
+        // Check authorization: either admin or authorized Sub-DAO
+        let action_id = if require_admin_auth(&env).is_ok() {
+            // Admin authorized - proceed directly
+            grant.status = GrantStatus::Active;
+            grant.last_update_ts = env.ledger().timestamp();
+            write_grant(&env, grant_id, &grant);
+            
+            // Log admin action
+            env.events().publish(
+                (symbol_short!("admin_resume"),),
+                (grant_id, caller, reason),
+            );
+            0 // Admin actions don't need Sub-DAO tracking
+        } else {
+            // Check Sub-DAO authorization and log action
+            let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
+            
+            // This would call SubDaoAuthority::delegated_resume_grant in production
+            check_sub_dao_permission(&env, &caller, grant_id, "resume")?;
+            
+            grant.status = GrantStatus::Active;
+            grant.last_update_ts = env.ledger().timestamp();
+            write_grant(&env, grant_id, &grant);
+            
+            // Generate action ID for tracking
+            let action_id = env.ledger().sequence();
+            
+            // Emit delegated resume event
+            env.events().publish(
+                (symbol_short!("delegated_resume"),),
+                (caller, grant_id, action_id, reason),
+            );
+            
+            action_id
+        };
+
+        Ok(action_id)
     }
 
     pub fn propose_rate_change(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -1279,33 +1386,78 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
+    pub fn cancel_grant(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
-        require_admin_auth(&env)?;
 
         if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        // Check authorization: either admin or authorized Sub-DAO
+        let action_id = if require_admin_auth(&env).is_ok() {
+            // Admin authorized - proceed directly
+            settle_grant(&mut grant, env.ledger().timestamp())?;
 
-        // Remaining = total - already withdrawn - pending claimable (both sides)
-        let total_paid = grant.withdrawn
-            .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
-            .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
-            .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
-        let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
-        grant.status = GrantStatus::Cancelled;
-        write_grant(&env, grant_id, &grant);
+            // Remaining = total - already withdrawn - pending claimable (both sides)
+            let total_paid = grant.withdrawn
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
+            grant.status = GrantStatus::Cancelled;
+            write_grant(&env, grant_id, &grant);
 
-        if remaining > 0 {
-            let token_addr = read_grant_token(&env)?;
-            let client = token::Client::new(&env, &token_addr);
-            let treasury = read_treasury(&env)?;
-            client.transfer(&env.current_contract_address(), &treasury, &remaining);
-        }
+            if remaining > 0 {
+                let token_addr = read_grant_token(&env)?;
+                let client = token::Client::new(&env, &token_addr);
+                let treasury = read_treasury(&env)?;
+                client.transfer(&env.current_contract_address(), &treasury, &remaining);
+            }
 
-        Ok(())
+            // Log admin action
+            env.events().publish(
+                (symbol_short!("admin_cancel"),),
+                (grant_id, caller, reason),
+            );
+            0 // Admin actions don't need Sub-DAO tracking
+        } else {
+            // Check Sub-DAO authorization and log action
+            let sub_dao_contract = read_sub_dao_authority_contract(&env)?;
+            
+            // This would call SubDaoAuthority::delegated_clawback_grant in production
+            check_sub_dao_permission(&env, &caller, grant_id, "cancel")?;
+            
+            settle_grant(&mut grant, env.ledger().timestamp())?;
+
+            // Remaining = total - already withdrawn - pending claimable (both sides)
+            let total_paid = grant.withdrawn
+                .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+                .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+                .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+            let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
+            grant.status = GrantStatus::Cancelled;
+            write_grant(&env, grant_id, &grant);
+
+            if remaining > 0 {
+                let token_addr = read_grant_token(&env)?;
+                let client = token::Client::new(&env, &token_addr);
+                let treasury = read_treasury(&env)?;
+                client.transfer(&env.current_contract_address(), &treasury, &remaining);
+            }
+
+            // Generate action ID for tracking
+            let action_id = env.ledger().sequence();
+
+            // Emit delegated clawback event
+            env.events().publish(
+                (symbol_short!("delegated_clawback"),),
+                (caller, grant_id, action_id, reason),
+            );
+
+            action_id
+        };
+
+        Ok(action_id)
     }
 
     pub fn rescue_tokens(env: Env, token_address: Address, amount: i128, to: Address) -> Result<(), Error> {
