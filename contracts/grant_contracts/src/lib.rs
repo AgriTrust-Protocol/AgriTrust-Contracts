@@ -262,6 +262,18 @@ pub struct Grant {
     pub lease_terminated: bool,   // NEW: Legal oracle termination flag
     // Add funds tracking
     pub remaining_balance: i128,   // NEW: Remaining allocated balance for this grant
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FinancialSnapshot {
+    pub grant_id: u64,           // Grant identifier
+    pub total_received: i128,      // Total amount received by grantee
+    pub timestamp: u64,           // When snapshot was created
+    pub expiry: u64,             // When snapshot expires (24h)
+    pub version: u32,            // Snapshot version for compatibility
+    pub contract_signature: [u8; 64], // Contract's cryptographic signature
+    pub hash: [u8; 32],        // SHA-256 hash of snapshot data
     /// Optional Stellar Validator reward address. When set, 5% of accruals
     /// are directed here ("Ecosystem Tax").
     pub validator: Option<Address>,
