@@ -6,10 +6,7 @@ use soroban_sdk::{
 
 // --- Constants ---
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
-const XLM_DECIMALS: u32 = 7;
-const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
-const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -276,6 +273,7 @@ enum DataKey {
     NativeToken,
     Grant(u64),
     RecipientGrants(Address),
+    MaxFlowRate(u64),
 }
 
 #[contracterror]
@@ -295,7 +293,6 @@ pub enum Error {
     RescueWouldViolateAllocated = 11,
     GranteeMismatch = 12,
     GrantNotInactive = 13,
-    NotValidator = 14,
 }
 
 // --- Internal Helpers ---
@@ -785,6 +782,64 @@ impl GrantContract {
         Ok(())
     }
 
+    pub fn set_max_flow_rate(env: Env, grant_id: u64, max_flow_rate: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if max_flow_rate <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let _ = read_grant(&env, grant_id)?;
+        env.storage().instance().set(&DataKey::MaxFlowRate(grant_id), &max_flow_rate);
+        Ok(())
+    }
+
+    pub fn adjust_for_inflation(env: Env, grant_id: u64, old_index: i128, new_index: i128) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+        if old_index <= 0 || new_index <= 0 {
+            return Err(Error::InvalidRate);
+        }
+
+        let mut grant = read_grant(&env, grant_id)?;
+        if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
+
+        let diff = new_index.checked_sub(old_index).ok_or(Error::MathOverflow)?;
+        let abs_diff = diff.checked_abs().ok_or(Error::MathOverflow)?;
+        
+        let change_bps = abs_diff
+            .checked_mul(10000)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(old_index)
+            .ok_or(Error::MathOverflow)?;
+
+        if change_bps < 500 { // Must be greater than or equal to a 5% threshold change
+            return Err(Error::ThresholdNotMet);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        let old_rate = grant.flow_rate;
+        let mut new_rate = old_rate
+            .checked_mul(new_index)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(old_index)
+            .ok_or(Error::MathOverflow)?;
+
+        if let Some(max_cap) = env.storage().instance().get::<_, i128>(&DataKey::MaxFlowRate(grant_id)) {
+            if new_rate > max_cap {
+                new_rate = max_cap;
+            }
+        }
+
+        grant.flow_rate = new_rate;
+        grant.rate_updated_at = env.ledger().timestamp();
+        grant.pending_rate = 0;
+        grant.effective_timestamp = 0;
+
+        write_grant(&env, grant_id, &grant);
+        env.events().publish((symbol_short!("inflatn"), grant_id), (old_rate, new_rate));
+        
+        Ok(())
+    }
+
     pub fn rage_quit(env: Env, grant_id: u64) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         grant.recipient.require_auth();
@@ -1097,3 +1152,5 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_inflation;
