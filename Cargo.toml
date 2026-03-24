@@ -1,17 +1,9 @@
-[package]
-name = "grant_contracts"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["contracts/grant_contracts", "contracts/vesting_contracts"]
 
-[lib]
-crate-type = ["cdylib"]
-path = "contracts/grant_contracts/src/lib.rs"
-
-[dependencies]
+[workspace.dependencies]
 soroban-sdk = "22.0.0"
-
-[dev-dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"
