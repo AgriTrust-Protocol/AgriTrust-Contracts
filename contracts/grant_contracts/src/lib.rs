@@ -1853,7 +1853,9 @@ impl GrantContract {
         let grant = Self::load_grant(&env, &grant_id);
         grant.total_amount.saturating_sub(grant.released_amount)
     }
+}
 
+impl GrantContract {
     fn finalize_milestone_approval(
         env: &Env,
         grant_id: &Symbol,
