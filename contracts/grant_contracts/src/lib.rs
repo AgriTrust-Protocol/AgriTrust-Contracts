@@ -1,4 +1,5 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Symbol, Env, String, Vec, Map, xdr::ScVal};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
@@ -50,6 +51,13 @@ pub struct Grant {
     pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
+    /// Optional Stellar Validator reward address. When set, 5% of accruals
+    /// are directed here ("Ecosystem Tax").
+    pub validator: Option<Address>,
+    /// Independent withdrawal counter for the validator's 5% share.
+    pub validator_withdrawn: i128,
+    /// Claimable balance accumulator for the validator (5% of stream).
+    pub validator_claimable: i128,
 }
 
 #[derive(Clone)]
@@ -83,7 +91,6 @@ pub enum Error {
     RescueWouldViolateAllocated = 11,
     GranteeMismatch = 12,
     GrantNotInactive = 13,
-    ThresholdNotMet = 14,
 }
 
 // --- Internal Helpers ---
@@ -168,6 +175,32 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
     2500 + (7500 * progress) / 10000
 }
 
+/// Splits `accrued` tokens between the grantee (95%) and the validator (5%).
+/// When no validator is set the full amount goes to the grantee.
+fn apply_accrued_split(grant: &mut Grant, accrued: i128) -> Result<(), Error> {
+    if grant.validator.is_some() && accrued > 0 {
+        let validator_share = accrued
+            .checked_mul(500)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(Error::MathOverflow)?;
+        let grantee_share = accrued
+            .checked_sub(validator_share)
+            .ok_or(Error::MathOverflow)?;
+        grant.claimable = grant.claimable
+            .checked_add(grantee_share)
+            .ok_or(Error::MathOverflow)?;
+        grant.validator_claimable = grant.validator_claimable
+            .checked_add(validator_share)
+            .ok_or(Error::MathOverflow)?;
+    } else {
+        grant.claimable = grant.claimable
+            .checked_add(accrued)
+            .ok_or(Error::MathOverflow)?;
+    }
+    Ok(())
+}
+
 fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts { return Err(Error::InvalidState); }
     
@@ -183,28 +216,37 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             // Settle up to switch_ts at old rate
             let pre_elapsed = switch_ts - grant.last_update_ts;
             let pre_accrued = calculate_accrued(grant, pre_elapsed, switch_ts)?;
-            grant.claimable = grant.claimable.checked_add(pre_accrued).ok_or(Error::MathOverflow)?;
-            
+            apply_accrued_split(grant, pre_accrued)?;
+
             // Apply new rate
             grant.flow_rate = grant.pending_rate;
             grant.rate_updated_at = switch_ts;
             grant.pending_rate = 0;
             grant.effective_timestamp = 0;
             grant.last_update_ts = switch_ts;
-            
+
             // Recalculate remaining elapsed
             let post_elapsed = now - switch_ts;
             let post_accrued = calculate_accrued(grant, post_elapsed, now)?;
-            grant.claimable = grant.claimable.checked_add(post_accrued).ok_or(Error::MathOverflow)?;
+            apply_accrued_split(grant, post_accrued)?;
         } else {
             let accrued = calculate_accrued(grant, elapsed, now)?;
-            grant.claimable = grant.claimable.checked_add(accrued).ok_or(Error::MathOverflow)?;
+            apply_accrued_split(grant, accrued)?;
         }
     }
 
-    let total_accounted = grant.withdrawn.checked_add(grant.claimable).ok_or(Error::MathOverflow)?;
+    let total_accounted = grant.withdrawn
+        .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+        .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
     if total_accounted >= grant.total_amount {
-        grant.claimable = grant.total_amount - grant.withdrawn;
+        // Cap remaining claimable so total does not exceed total_amount
+        let already_paid = grant.withdrawn
+            .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+            .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+        grant.claimable = grant.total_amount
+            .checked_sub(already_paid).ok_or(Error::MathOverflow)?
+            .max(0);
         grant.status = GrantStatus::Completed;
     }
 
@@ -259,7 +301,8 @@ impl GrantContract {
         recipient: Address,
         total_amount: i128,
         flow_rate: i128,
-        warmup_duration: u64
+        warmup_duration: u64,
+        validator: Option<Address>,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
@@ -289,6 +332,9 @@ impl GrantContract {
             stream_type: StreamType::FixedAmount,
             start_time: now,
             warmup_duration,
+            validator,
+            validator_withdrawn: 0,
+            validator_claimable: 0,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -392,6 +438,9 @@ impl GrantContract {
         
         let old_rate = grant.flow_rate;
         grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        if grant.pending_rate > 0 {
+            grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        }
         grant.rate_updated_at = env.ledger().timestamp();
 
         write_grant(&env, grant_id, &grant);
@@ -464,18 +513,31 @@ impl GrantContract {
         if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
-        
+
         let claim_amount = grant.claimable;
+        let validator_amount = grant.validator_claimable;
         grant.claimable = 0;
+        grant.validator_claimable = 0;
         grant.withdrawn = grant.withdrawn.checked_add(claim_amount).ok_or(Error::MathOverflow)?;
+        grant.validator_withdrawn = grant.validator_withdrawn.checked_add(validator_amount).ok_or(Error::MathOverflow)?;
         grant.status = GrantStatus::RageQuitted;
-        
-        let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+
+        let total_paid = grant.withdrawn
+            .checked_add(grant.validator_withdrawn)
+            .ok_or(Error::MathOverflow)?;
+        let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
         write_grant(&env, grant_id, &grant);
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
         client.transfer(&env.current_contract_address(), &grant.recipient, &claim_amount);
+
+        // Pay out the validator's accrued share on rage quit
+        if validator_amount > 0 {
+            if let Some(ref validator_addr) = grant.validator {
+                client.transfer(&env.current_contract_address(), validator_addr, &validator_amount);
+            }
+        }
 
         if remaining > 0 {
             let treasury = read_treasury(&env)?;
@@ -488,14 +550,19 @@ impl GrantContract {
     pub fn cancel_grant(env: Env, grant_id: u64) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         require_admin_auth(&env)?;
-        
+
         if grant.status == GrantStatus::Completed || grant.status == GrantStatus::RageQuitted {
             return Err(Error::InvalidState);
         }
 
         settle_grant(&mut grant, env.ledger().timestamp())?;
-        
-        let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
+
+        // Remaining = total - already withdrawn - pending claimable (both sides)
+        let total_paid = grant.withdrawn
+            .checked_add(grant.validator_withdrawn).ok_or(Error::MathOverflow)?
+            .checked_add(grant.claimable).ok_or(Error::MathOverflow)?
+            .checked_add(grant.validator_claimable).ok_or(Error::MathOverflow)?;
+        let remaining = grant.total_amount.checked_sub(total_paid).ok_or(Error::MathOverflow)?;
         grant.status = GrantStatus::Cancelled;
         write_grant(&env, grant_id, &grant);
 
@@ -541,6 +608,200 @@ impl GrantContract {
         } else {
             0
         }
+    }
+
+    /// Compute the claimable balance for exponential vesting.
+    /// Rate increases as project nears completion.
+    /// Formula: total * (1 - exp(-factor * progress)) / (1 - exp(-factor))
+    /// where progress = elapsed / duration
+    pub fn compute_exponential_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
+        
+        // Simplified exponential approximation: total * progress^2 / 1000000 * factor
+        // This avoids complex floating point math while providing exponential growth
+        let progress_squared = match progress.checked_mul(progress) {
+            Some(v) => v,
+            None => return total, // overflow protection
+        };
+        
+        let factor_progress = match progress_squared.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        let vested = match total.checked_mul(factor_progress) {
+            Some(v) => v / 1_000_000_000, // Normalize by 1000^3
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+
+    /// Compute the claimable balance for logarithmic vesting.
+    /// Rate decreases as project progresses (front-loaded).
+    /// Formula: total * ln(1 + factor * progress) / ln(1 + factor)
+    /// where progress = elapsed / duration
+    pub fn compute_logarithmic_vesting(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        factor: u32,
+    ) -> u128 {
+        if duration == 0 {
+            return if now >= start { total } else { 0 };
+        }
+        if now <= start {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(start);
+        if elapsed >= duration {
+            return total;
+        }
+
+        let progress = (elapsed as u128 * 1000) / (duration as u128); // progress in 0.1% increments
+        let factor_scaled = factor as u128; // factor is already scaled by 1000
+        
+        // Simplified logarithmic approximation: total * (sqrt(progress * factor) * 1000) / (sqrt(factor) * 1000)
+        // This provides front-loaded vesting without complex math
+        if progress == 0 {
+            return 0;
+        }
+        
+        let progress_factor = match progress.checked_mul(factor_scaled) {
+            Some(v) => v,
+            None => return total,
+        };
+        
+        // Integer square root approximation
+        let sqrt_progress_factor = integer_sqrt(progress_factor);
+        let sqrt_factor = integer_sqrt(factor_scaled);
+        
+        if sqrt_factor == 0 {
+            return 0;
+        }
+        
+        let vested = match total.checked_mul(sqrt_progress_factor) {
+            Some(v) => {
+                let normalized = match v.checked_mul(1000) {
+                    Some(v2) => v2,
+                    None => total,
+                };
+                match normalized.checked_div(sqrt_factor) {
+                    Some(v3) => v3 / 1000,
+                    None => total,
+                }
+            }
+            None => total,
+        };
+        
+        vested.min(total)
+    }
+    
+    /// Integer square root using binary search
+    fn integer_sqrt(n: u128) -> u128 {
+        if n <= 1 {
+            return n;
+        }
+        
+        let mut low = 1u128;
+        let mut high = n;
+        let mut result = 1u128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            let mid_squared = match mid.checked_mul(mid) {
+                Some(v) => v,
+                None => {
+                    high = mid - 1;
+                    continue;
+                }
+            };
+            
+            if mid_squared == n {
+                return mid;
+            }
+            
+            if mid_squared < n {
+                low = mid + 1;
+                result = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        
+        result
+    /// Returns the current claimable balance for the validator (5% share).
+    pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
+        if let Ok(mut grant) = read_grant(&env, grant_id) {
+            if grant.validator.is_none() {
+                return 0;
+            }
+            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            grant.validator_claimable
+        } else {
+            0
+        }
+    }
+
+    /// Returns (validator_address, validator_claimable, validator_withdrawn) for a grant.
+    pub fn get_validator_info(
+        env: Env,
+        grant_id: u64,
+    ) -> Result<(Option<Address>, i128, i128), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        Ok((grant.validator, grant.validator_claimable, grant.validator_withdrawn))
+    }
+
+    /// Allows the designated validator to pull their 5% share independently.
+    pub fn withdraw_validator(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
+        let mut grant = read_grant(&env, grant_id)?;
+        let validator_addr = grant.validator.clone().ok_or(Error::InvalidState)?;
+        validator_addr.require_auth();
+
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+            return Err(Error::InvalidState);
+        }
+
+        settle_grant(&mut grant, env.ledger().timestamp())?;
+
+        if amount <= 0 || amount > grant.validator_claimable {
+            return Err(Error::InvalidAmount);
+        }
+
+        grant.validator_claimable = grant.validator_claimable
+            .checked_sub(amount)
+            .ok_or(Error::MathOverflow)?;
+        grant.validator_withdrawn = grant.validator_withdrawn
+            .checked_add(amount)
+            .ok_or(Error::MathOverflow)?;
+
+        write_grant(&env, grant_id, &grant);
+
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &validator_addr, &amount);
+
+        env.events().publish((symbol_short!("valwdraw"), grant_id), amount);
+        Ok(())
     }
 }
 

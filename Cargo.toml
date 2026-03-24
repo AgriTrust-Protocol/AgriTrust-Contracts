@@ -1,7 +1,6 @@
-[package]
-name = "grant_contracts"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["contracts/grant_contracts", "contracts/vesting_contracts"]
 
 [lib]
 crate-type = ["cdylib"]
