@@ -1,8 +1,11 @@
+#![allow(unexpected_cfgs)]
 #![no_std]
 
+use core::cmp::min;
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Map, Symbol, String, Vec, 
-    token, panic_with_error, unwrap::UnwrapOptimized
+    contract, contractimpl, contracttype, panic_with_error, token, Address, Env, Map, String,
+    Symbol, Vec,
 };
 
 #[contract]
@@ -12,25 +15,29 @@ pub struct GrantContract;
 pub enum DataKey {
     Grant(Symbol),
     Milestone(Symbol, Symbol),
-    MilestoneVote(Symbol, Symbol, Address), // grant_id, milestone_id, voter_address
-    CouncilMembers,
-    Withdrawn(Symbol, Address), // grant_id, grantee_address
+    MilestoneVote(Symbol, Symbol, Address),
+    Withdrawn(Symbol, Address),
 }
 
+#[derive(Clone)]
 #[contracttype]
 pub struct Grant {
     pub admin: Address,
-    pub grantees: Map<Address, u32>, // address -> basis points (10000 = 100%)
+    pub grantees: Map<Address, u32>,
     pub total_amount: u128,
     pub released_amount: u128,
     pub token_address: Address,
     pub created_at: u64,
-    pub cliff_end: u64, // 0 means no cliff
+    pub cliff_end: u64,
+    pub stream_start: u64,
+    pub stream_duration: u64,
     pub status: GrantStatus,
-    pub council_members: Vec<Address>, // For DAO governance
-    pub voting_threshold: u32, // Number of votes required for milestone approval
+    pub council_members: Vec<Address>,
+    pub voting_threshold: u32,
+    pub acceleration_windows: Vec<StreamAcceleration>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum GrantStatus {
     Proposed,
@@ -40,6 +47,16 @@ pub enum GrantStatus {
     Cancelled,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct StreamAcceleration {
+    pub milestone_id: Symbol,
+    pub activated_at: u64,
+    pub expires_at: u64,
+    pub bonus_bps: u32,
+}
+
+#[derive(Clone)]
 #[contracttype]
 pub struct Milestone {
     pub amount: u128,
@@ -49,6 +66,8 @@ pub struct Milestone {
     pub votes_for: u32,
     pub votes_against: u32,
     pub voting_deadline: u64,
+    pub acceleration_bps: u32,
+    pub acceleration_duration: u64,
 }
 
 #[contracttype]
@@ -64,8 +83,9 @@ pub enum GrantError {
     NotCouncilMember,
     AlreadyVoted,
     VotingExpired,
-    CliffNotPassed,
     InvalidGrantee,
+    InvalidStreamConfig,
+    InvalidAccelerationConfig,
 }
 
 impl From<GrantError> for soroban_sdk::Error {
@@ -82,8 +102,9 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::NotCouncilMember => soroban_sdk::Error::from_contract_error(9),
             GrantError::AlreadyVoted => soroban_sdk::Error::from_contract_error(10),
             GrantError::VotingExpired => soroban_sdk::Error::from_contract_error(11),
-            GrantError::CliffNotPassed => soroban_sdk::Error::from_contract_error(12),
-            GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(13),
+            GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
+            GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
+            GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
         }
     }
 }
@@ -94,47 +115,66 @@ impl GrantContract {
         env: Env,
         grant_id: Symbol,
         admin: Address,
-        grantees: Map<Address, u32>, // address -> basis points
+        grantees: Map<Address, u32>,
         total_amount: u128,
         token_address: Address,
-        cliff_end: u64, // 0 means no cliff
+        cliff_end: u64,
         council_members: Vec<Address>,
         voting_threshold: u32,
     ) {
         admin.require_auth();
-        
+
         if total_amount == 0 {
             panic_with_error!(&env, GrantError::InvalidAmount);
         }
 
-        // Validate that total shares equal 10000 basis points (100%)
         let mut total_shares = 0u32;
         for (_, share) in grantees.iter() {
-            total_shares += share;
+            total_shares = total_shares.saturating_add(share);
         }
-        if total_shares != 10000 {
+        if total_shares != 10_000 {
             panic_with_error!(&env, GrantError::InvalidShares);
         }
 
-        // Validate voting threshold
-        if voting_threshold == 0 || voting_threshold > council_members.len() as u32 {
+        if voting_threshold == 0 || voting_threshold > council_members.len() {
             panic_with_error!(&env, GrantError::InvalidAmount);
         }
 
+        let created_at = env.ledger().timestamp();
         let grant = Grant {
-            admin: admin.clone(),
-            grantees: grantees.clone(),
+            admin,
+            grantees,
             total_amount,
             released_amount: 0,
-            token_address: token_address.clone(),
-            created_at: env.ledger().timestamp(),
+            token_address,
+            created_at,
             cliff_end,
+            stream_start: created_at,
+            stream_duration: 0,
             status: GrantStatus::Proposed,
-            council_members: council_members.clone(),
+            council_members,
             voting_threshold,
+            acceleration_windows: Vec::new(&env),
         };
 
-        env.storage().instance().set(&DataKey::Grant(grant_id), &grant);
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
+    }
+
+    pub fn configure_stream(env: Env, grant_id: Symbol, stream_start: u64, stream_duration: u64) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        if stream_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidStreamConfig);
+        }
+
+        grant.stream_start = stream_start;
+        grant.stream_duration = stream_duration;
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
     }
 
     pub fn add_milestone(
@@ -143,16 +183,12 @@ impl GrantContract {
         milestone_id: Symbol,
         amount: u128,
         description: String,
-        voting_period: u64, // voting period in seconds
+        voting_period: u64,
     ) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
-
+        let grant = Self::load_grant(&env, &grant_id);
         grant.admin.require_auth();
 
-        if amount == 0 {
+        if amount == 0 || voting_period == 0 {
             panic_with_error!(&env, GrantError::InvalidAmount);
         }
 
@@ -163,319 +199,395 @@ impl GrantContract {
             approved_at: None,
             votes_for: 0,
             votes_against: 0,
-            voting_deadline: env.ledger().timestamp() + voting_period,
+            voting_deadline: env.ledger().timestamp().saturating_add(voting_period),
+            acceleration_bps: 0,
+            acceleration_duration: 0,
         };
 
-        env.storage().instance().set(&DataKey::Milestone(grant_id, milestone_id), &milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::Milestone(grant_id, milestone_id), &milestone);
     }
 
-    // DAO Governance Functions
-    
-    pub fn propose_milestone_approval(env: Env, grant_id: Symbol, milestone_id: Symbol) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
+    pub fn configure_milestone_acceleration(
+        env: Env,
+        grant_id: Symbol,
+        milestone_id: Symbol,
+        acceleration_bps: u32,
+        acceleration_duration: u64,
+    ) {
+        let grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
 
+        if acceleration_bps == 0 || acceleration_duration == 0 {
+            panic_with_error!(&env, GrantError::InvalidAccelerationConfig);
+        }
+
+        let milestone_key = DataKey::Milestone(grant_id, milestone_id);
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        if milestone.approved {
+            panic_with_error!(&env, GrantError::AlreadyApproved);
+        }
+
+        milestone.acceleration_bps = acceleration_bps;
+        milestone.acceleration_duration = acceleration_duration;
+        env.storage().instance().set(&milestone_key, &milestone);
+    }
+
+    pub fn propose_milestone_approval(env: Env, grant_id: Symbol, milestone_id: Symbol) {
+        let grant = Self::load_grant(&env, &grant_id);
         grant.admin.require_auth();
 
         let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
-        let mut milestone: Milestone = env.storage().instance()
-            .get::<_, Milestone>(&milestone_key)
-            .unwrap_optimized();
-
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
         if milestone.approved {
             panic_with_error!(&env, GrantError::AlreadyApproved);
         }
 
-        // Reset voting when proposed
         milestone.votes_for = 0;
         milestone.votes_against = 0;
-        milestone.voting_deadline = env.ledger().timestamp() + 7 * 24 * 60 * 60; // 7 days default
+        milestone.voting_deadline = env.ledger().timestamp().saturating_add(7 * 24 * 60 * 60);
+
+        for member in grant.council_members.iter() {
+            env.storage().instance().remove(&DataKey::MilestoneVote(
+                grant_id.clone(),
+                milestone_id.clone(),
+                member,
+            ));
+        }
 
         env.storage().instance().set(&milestone_key, &milestone);
     }
 
-    pub fn vote_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol, approve: bool) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
+    pub fn vote_milestone(
+        env: Env,
+        grant_id: Symbol,
+        milestone_id: Symbol,
+        voter: Address,
+        approve: bool,
+    ) {
+        voter.require_auth();
 
-        let caller = env.current_contract_address(); // In practice, this should be the signer
-        
-        // Check if caller is a council member
-        let mut is_council_member = false;
-        for member in grant.council_members.iter() {
-            if member == caller {
-                is_council_member = true;
-                break;
-            }
-        }
-        if !is_council_member {
-            panic_with_error!(&env, GrantError::NotCouncilMember);
-        }
-
+        let mut grant = Self::load_grant(&env, &grant_id);
         let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
-        let mut milestone: Milestone = env.storage().instance()
-            .get::<_, Milestone>(&milestone_key)
-            .unwrap_optimized();
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
 
         if milestone.approved {
             panic_with_error!(&env, GrantError::AlreadyApproved);
         }
-
-        // Check if voting has expired
         if env.ledger().timestamp() > milestone.voting_deadline {
             panic_with_error!(&env, GrantError::VotingExpired);
         }
+        if !Self::is_council_member(&grant, &voter) {
+            panic_with_error!(&env, GrantError::NotCouncilMember);
+        }
 
-        // Check if already voted
-        let vote_key = DataKey::MilestoneVote(grant_id.clone(), milestone_id.clone(), caller.clone());
-        if env.storage().instance().get::<_, bool>(&vote_key).is_some() {
+        let vote_key = DataKey::MilestoneVote(grant_id.clone(), milestone_id.clone(), voter);
+        if env.storage().instance().has(&vote_key) {
             panic_with_error!(&env, GrantError::AlreadyVoted);
         }
-
-        // Record the vote
         env.storage().instance().set(&vote_key, &approve);
-        
+
         if approve {
-            milestone.votes_for += 1;
+            milestone.votes_for = milestone.votes_for.saturating_add(1);
         } else {
-            milestone.votes_against += 1;
+            milestone.votes_against = milestone.votes_against.saturating_add(1);
         }
 
-        // Check if threshold is reached
         if milestone.votes_for >= grant.voting_threshold {
-            milestone.approved = true;
-            milestone.approved_at = Some(env.ledger().timestamp());
-            
-            // Update grant and execute transfer
-            let mut grant_data: Grant = env.storage().instance()
-                .get::<_, Grant>(&grant_key)
-                .unwrap_optimized();
-                
-            let new_released = grant_data.released_amount.checked_add(milestone.amount)
-                .unwrap_or_else(|| panic_with_error!(&env, GrantError::ExceedsTotalAmount));
-
-            if new_released > grant_data.total_amount {
-                panic_with_error!(&env, GrantError::ExceedsTotalAmount);
-            }
-
-            grant_data.released_amount = new_released;
-
-            if grant_data.released_amount == grant_data.total_amount {
-                grant_data.status = GrantStatus::Completed;
-            }
-
-            env.storage().instance().set(&grant_key, &grant_data);
-            
-            // Transfer tokens to contract (will be distributed via withdraw)
-            Self::transfer_tokens(&env, &grant_data.token_address, &grant_data.admin, &env.current_contract_address(), milestone.amount);
+            Self::finalize_milestone_approval(
+                &env,
+                &grant_id,
+                &milestone_id,
+                &mut grant,
+                &mut milestone,
+            );
         }
 
         env.storage().instance().set(&milestone_key, &milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
+    }
+
+    pub fn approve_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) {
+        let mut grant = Self::load_grant(&env, &grant_id);
+        grant.admin.require_auth();
+
+        let milestone_key = DataKey::Milestone(grant_id.clone(), milestone_id.clone());
+        let mut milestone = Self::load_milestone(&env, &milestone_key);
+        Self::finalize_milestone_approval(
+            &env,
+            &grant_id,
+            &milestone_id,
+            &mut grant,
+            &mut milestone,
+        );
+
+        env.storage().instance().set(&milestone_key, &milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id), &grant);
     }
 
     pub fn withdraw(env: Env, grant_id: Symbol, caller: Address) -> u128 {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let mut grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
-
         caller.require_auth();
 
-        // Check if caller is a valid grantee
-        let caller_share = match grant.grantees.get(caller.clone()) {
+        let grant = Self::load_grant(&env, &grant_id);
+        let share = match grant.grantees.get(caller.clone()) {
             Some(share) => share,
             None => panic_with_error!(&env, GrantError::InvalidGrantee),
         };
 
-        // Check cliff period
-        let current_time = env.ledger().timestamp();
-        if grant.cliff_end > 0 && current_time < grant.cliff_end {
-            return 0; // Cliff not passed, no withdrawal allowed
-        }
-
-        // Calculate caller's total entitled amount based on their share
-        let caller_total_entitled = (grant.total_amount * caller_share as u128) / 10000;
-        
-        // Calculate how much the caller has already withdrawn
-        // For simplicity, we'll track this in a separate storage key per user
-        let withdrawn_key = DataKey::Withdrawn(grant_id.clone(), caller.clone());
-        let already_withdrawn = env.storage().instance()
-            .get::<_, u128>(&withdrawn_key)
-            .unwrap_or(0);
-
-        // Calculate available amount for this caller
-        let available_for_caller = caller_total_entitled.saturating_sub(already_withdrawn);
-        
-        if available_for_caller == 0 {
+        let available =
+            Self::compute_withdrawable_amount(&env, &grant, &grant_id, caller.clone(), share);
+        if available == 0 {
             return 0;
         }
 
-        // Update withdrawn amount
-        env.storage().instance().set(&withdrawn_key, &(already_withdrawn + available_for_caller));
-        
-        // Update grant's released amount
-        grant.released_amount = grant.released_amount.checked_add(available_for_caller).unwrap_optimized();
-        env.storage().instance().set(&grant_key, &grant);
+        let withdrawn_key = DataKey::Withdrawn(grant_id, caller.clone());
+        let already_withdrawn = env
+            .storage()
+            .instance()
+            .get::<_, u128>(&withdrawn_key)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&withdrawn_key, &already_withdrawn.saturating_add(available));
 
-        // Transfer tokens to caller
-        Self::transfer_tokens(&env, &grant.token_address, &env.current_contract_address(), &caller, available_for_caller);
-        
-        available_for_caller
+        Self::transfer_tokens(
+            &env,
+            &grant.token_address,
+            &env.current_contract_address(),
+            &caller,
+            available,
+        );
+        available
     }
 
     pub fn activate_grant(env: Env, grant_id: Symbol) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let mut grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
-
+        let mut grant = Self::load_grant(&env, &grant_id);
         grant.admin.require_auth();
 
         match grant.status {
             GrantStatus::Proposed => {
                 grant.status = GrantStatus::Active;
-                env.storage().instance().set(&grant_key, &grant);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
         }
     }
 
     pub fn pause_grant(env: Env, grant_id: Symbol) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let mut grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
-
+        let mut grant = Self::load_grant(&env, &grant_id);
         grant.admin.require_auth();
 
         match grant.status {
             GrantStatus::Active => {
                 grant.status = GrantStatus::Paused;
-                env.storage().instance().set(&grant_key, &grant);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
         }
     }
 
     pub fn resume_grant(env: Env, grant_id: Symbol) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let mut grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
-
+        let mut grant = Self::load_grant(&env, &grant_id);
         grant.admin.require_auth();
 
         match grant.status {
             GrantStatus::Paused => {
                 grant.status = GrantStatus::Active;
-                env.storage().instance().set(&grant_key, &grant);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
         }
     }
 
     pub fn cancel_grant(env: Env, grant_id: Symbol) {
-        let grant_key = DataKey::Grant(grant_id.clone());
-        let mut grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&grant_key)
-            .unwrap_optimized();
-
+        let mut grant = Self::load_grant(&env, &grant_id);
         grant.admin.require_auth();
 
         match grant.status {
             GrantStatus::Proposed | GrantStatus::Paused => {
                 grant.status = GrantStatus::Cancelled;
-                env.storage().instance().set(&grant_key, &grant);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Grant(grant_id), &grant);
             }
             _ => panic_with_error!(&env, GrantError::InvalidStatus),
         }
     }
 
     pub fn get_grant(env: Env, grant_id: Symbol) -> Grant {
-        env.storage().instance()
-            .get::<_, Grant>(&DataKey::Grant(grant_id))
-            .unwrap_optimized()
+        Self::load_grant(&env, &grant_id)
+    }
+
+    pub fn get_milestone(env: Env, grant_id: Symbol, milestone_id: Symbol) -> Milestone {
+        Self::load_milestone(&env, &DataKey::Milestone(grant_id, milestone_id))
     }
 
     pub fn get_withdrawable_amount(env: Env, grant_id: Symbol, caller: Address) -> u128 {
-        let grant_id_clone = grant_id.clone();
-        let grant: Grant = env.storage().instance()
-            .get::<_, Grant>(&DataKey::Grant(grant_id))
-            .unwrap_optimized();
-
-        // Check if caller is a valid grantee
-        let caller_share = match grant.grantees.get(caller.clone()) {
+        let grant = Self::load_grant(&env, &grant_id);
+        let share = match grant.grantees.get(caller.clone()) {
             Some(share) => share,
             None => return 0,
         };
 
-        // Check cliff period
-        let current_time = env.ledger().timestamp();
-        if grant.cliff_end > 0 && current_time < grant.cliff_end {
-            return 0; // Cliff not passed, no withdrawal allowed
-        }
-
-        // Calculate caller's total entitled amount based on their share
-        let caller_total_entitled = (grant.total_amount * caller_share as u128) / 10000;
-        
-        // Calculate how much the caller has already withdrawn
-        let withdrawn_key = DataKey::Withdrawn(grant_id_clone, caller);
-        let already_withdrawn = env.storage().instance()
-            .get::<_, u128>(&withdrawn_key)
-            .unwrap_or(0);
-
-        // Calculate available amount for this caller
-        caller_total_entitled.saturating_sub(already_withdrawn)
+        Self::compute_withdrawable_amount(&env, &grant, &grant_id, caller, share)
     }
 
     pub fn get_remaining_amount(env: Env, grant_id: Symbol) -> u128 {
-        let grant = Self::get_grant(env, grant_id);
+        let grant = Self::load_grant(&env, &grant_id);
         grant.total_amount.saturating_sub(grant.released_amount)
     }
 
-    fn transfer_tokens(env: &Env, token_address: &Address, from: &Address, to: &Address, amount: u128) {
-        let token_client = token::Client::new(env, token_address);
-        
-        // Handle potential transfer fees by checking balance after transfer
-        let from_balance_before = token_client.balance(from);
-        let to_balance_before = token_client.balance(to);
-        
-        token_client.transfer(from, to, &(amount as i128));
-        
-        let from_balance_after = token_client.balance(from);
-        let to_balance_after = token_client.balance(to);
-        
-        // Verify transfer behavior for tokens with fees
-        let expected_from_decrease = amount as i128;
-        let actual_from_decrease = from_balance_before.saturating_sub(from_balance_after);
-        let actual_to_increase = to_balance_after.saturating_sub(to_balance_before);
-        
-        // For tokens with transfer fees, actual_to_increase might be less than amount
-        // This is expected behavior for fee-charging tokens
-        if actual_from_decrease != expected_from_decrease {
-            // Log warning but don't fail - some tokens might have complex fee structures
-            // Note: Logging is limited in Soroban, so we'll just continue
-            // The transfer fee detection logic is still useful for debugging
+    fn finalize_milestone_approval(
+        env: &Env,
+        grant_id: &Symbol,
+        milestone_id: &Symbol,
+        grant: &mut Grant,
+        milestone: &mut Milestone,
+    ) {
+        if milestone.approved {
+            panic_with_error!(env, GrantError::AlreadyApproved);
         }
+        match grant.status {
+            GrantStatus::Cancelled | GrantStatus::Paused => {
+                panic_with_error!(env, GrantError::InvalidStatus);
+            }
+            _ => {}
+        }
+
+        let new_released = grant
+            .released_amount
+            .checked_add(milestone.amount)
+            .unwrap_or_else(|| panic_with_error!(env, GrantError::ExceedsTotalAmount));
+        if new_released > grant.total_amount {
+            panic_with_error!(env, GrantError::ExceedsTotalAmount);
+        }
+
+        milestone.approved = true;
+        milestone.approved_at = Some(env.ledger().timestamp());
+        grant.released_amount = new_released;
+
+        if milestone.acceleration_bps > 0 && milestone.acceleration_duration > 0 {
+            grant.acceleration_windows.push_back(StreamAcceleration {
+                milestone_id: milestone_id.clone(),
+                activated_at: env.ledger().timestamp(),
+                expires_at: env
+                    .ledger()
+                    .timestamp()
+                    .saturating_add(milestone.acceleration_duration),
+                bonus_bps: milestone.acceleration_bps,
+            });
+        }
+
+        if grant.released_amount == grant.total_amount {
+            grant.status = GrantStatus::Completed;
+        }
+
+        Self::transfer_tokens(
+            env,
+            &grant.token_address,
+            &grant.admin,
+            &env.current_contract_address(),
+            milestone.amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Grant(grant_id.clone()), grant);
+    }
+
+    fn compute_withdrawable_amount(
+        env: &Env,
+        grant: &Grant,
+        grant_id: &Symbol,
+        caller: Address,
+        share: u32,
+    ) -> u128 {
+        let current_time = env.ledger().timestamp();
+        if grant.cliff_end > 0 && current_time < grant.cliff_end {
+            return 0;
+        }
+        match grant.status {
+            GrantStatus::Proposed | GrantStatus::Paused | GrantStatus::Cancelled => return 0,
+            _ => {}
+        }
+
+        let released_entitlement = grant.released_amount.saturating_mul(share as u128) / 10_000;
+        let stream_limited_entitlement = if grant.stream_duration == 0 {
+            released_entitlement
+        } else {
+            let total_entitlement = grant.total_amount.saturating_mul(share as u128) / 10_000;
+            let streamed = grant::compute_accelerated_claimable_balance(
+                total_entitlement,
+                grant.stream_start,
+                current_time,
+                grant.stream_duration,
+                &grant.acceleration_windows,
+            );
+            min(streamed, released_entitlement)
+        };
+
+        let withdrawn_key = DataKey::Withdrawn(grant_id.clone(), caller);
+        let already_withdrawn = env
+            .storage()
+            .instance()
+            .get::<_, u128>(&withdrawn_key)
+            .unwrap_or(0);
+        stream_limited_entitlement.saturating_sub(already_withdrawn)
+    }
+
+    fn load_grant(env: &Env, grant_id: &Symbol) -> Grant {
+        env.storage()
+            .instance()
+            .get::<_, Grant>(&DataKey::Grant(grant_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, GrantError::GrantNotFound))
+    }
+
+    fn load_milestone(env: &Env, key: &DataKey) -> Milestone {
+        env.storage()
+            .instance()
+            .get::<_, Milestone>(key)
+            .unwrap_or_else(|| panic_with_error!(env, GrantError::MilestoneNotFound))
+    }
+
+    fn is_council_member(grant: &Grant, voter: &Address) -> bool {
+        for member in grant.council_members.iter() {
+            if member == *voter {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn transfer_tokens(
+        env: &Env,
+        token_address: &Address,
+        from: &Address,
+        to: &Address,
+        amount: u128,
+    ) {
+        token::Client::new(env, token_address).transfer(from, to, &(amount as i128));
     }
 }
 
 mod test;
 
-// Grant math utilities used by tests and (optionally) the contract.
 pub mod grant {
-    /// Compute the claimable balance for a linear vesting grant.
-    ///
-    /// - `total`: total amount granted (u128)
-    /// - `start`: grant start timestamp (seconds, u64)
-    /// - `now`: current timestamp (seconds, u64)
-    /// - `duration`: grant duration (seconds, u64)
-    ///
-    /// Returns the amount (u128) claimable at `now` (clamped 0..=total).
+    use core::cmp::{max, min};
+
+    use soroban_sdk::Vec;
+
+    use crate::StreamAcceleration;
+
     pub fn compute_claimable_balance(total: u128, start: u64, now: u64, duration: u64) -> u128 {
         if duration == 0 {
             return if now >= start { total } else { 0 };
@@ -488,28 +600,51 @@ pub mod grant {
             return total;
         }
 
-        // Use decomposition to reduce risk of intermediate overflow:
-        // total * elapsed / duration == (total / duration) * elapsed + (total % duration) * elapsed / duration
         let dur = duration as u128;
         let el = elapsed as u128;
         let whole = total / dur;
         let rem = total % dur;
 
-        // whole * el shouldn't overflow in realistic token amounts, but use checked_mul with fallback.
         let part1 = match whole.checked_mul(el) {
-            Some(v) => v,
-            None => {
-                // fallback: perform (whole / dur) * (el * dur) approximated by dividing early
-                // This branch is extremely unlikely; clamp to total as safe fallback.
-                return total;
-            }
+            Some(value) => value,
+            None => return total,
         };
         let part2 = match rem.checked_mul(el) {
-            Some(v) => v / dur,
-            None => {
-                return total;
-            }
+            Some(value) => value / dur,
+            None => return total,
         };
-        part1 + part2
+        part1.saturating_add(part2)
+    }
+
+    pub fn compute_accelerated_claimable_balance(
+        total: u128,
+        start: u64,
+        now: u64,
+        duration: u64,
+        windows: &Vec<StreamAcceleration>,
+    ) -> u128 {
+        let base = compute_claimable_balance(total, start, now, duration);
+        let mut extra = 0u128;
+
+        for window in windows.iter() {
+            if window.bonus_bps == 0 {
+                continue;
+            }
+
+            let overlap_start = max(start, window.activated_at);
+            let overlap_end = min(now, window.expires_at);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+
+            let baseline_during_window =
+                compute_claimable_balance(total, start, overlap_end, duration).saturating_sub(
+                    compute_claimable_balance(total, start, overlap_start, duration),
+                );
+            let bonus = baseline_during_window.saturating_mul(window.bonus_bps as u128) / 10_000;
+            extra = extra.saturating_add(bonus);
+        }
+
+        min(total, base.saturating_add(extra))
     }
 }

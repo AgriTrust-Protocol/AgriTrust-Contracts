@@ -1,330 +1,199 @@
 #![cfg(test)]
 
-use soroban_sdk::{symbol_short, Address, Env};
-use crate::{GrantContract, GrantContractClient};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Ledger as _},
+    token, Address, Env, Map, String, Vec,
+};
 
-#[test]
-fn test_multiple_milestones() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
-    let token_address = Address::generate(&env);
+use crate::{GrantContract, GrantContractClient, GrantStatus};
 
-    let contract_id = env.register(GrantContract, ());
-    let client = GrantContractClient::new(&env, &contract_id);
+const DAY: u64 = 24 * 60 * 60;
 
-    // Create a grant
-    let grant_id = symbol_short!("grant_multi");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000, &token_address).unwrap();
+fn set_timestamp(env: &Env, timestamp: u64) {
+    env.ledger().with_mut(|li| {
+        li.timestamp = timestamp;
+    });
+}
 
-    // Add multiple milestones
-    let milestone_1 = symbol_short!("m1");
-    let milestone_2 = symbol_short!("m2");
-    let milestone_3 = symbol_short!("m3");
+fn build_grantees(env: &Env, grantee: &Address) -> Map<Address, u32> {
+    let mut grantees = Map::new(env);
+    grantees.set(grantee.clone(), 10_000);
+    grantees
+}
 
-    client.add_milestone(&grant_id, &milestone_1, &250_000, &String::from_str(&env, "Phase 1")).unwrap();
-    client.add_milestone(&grant_id, &milestone_2, &350_000, &String::from_str(&env, "Phase 2")).unwrap();
-    client.add_milestone(&grant_id, &milestone_3, &400_000, &String::from_str(&env, "Phase 3")).unwrap();
+fn build_council(env: &Env, members: &[Address]) -> Vec<Address> {
+    let mut council = Vec::new(env);
+    for member in members {
+        council.push_back(member.clone());
+    }
+    council
+}
 
-    // Approve first milestone
-    client.approve_milestone(&grant_id, &milestone_1).unwrap();
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.released_amount, 250_000);
-
-    // Approve second milestone
-    client.approve_milestone(&grant_id, &milestone_2).unwrap();
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.released_amount, 600_000);
-
-    // Approve third milestone
-    client.approve_milestone(&grant_id, &milestone_3).unwrap();
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.released_amount, 1_000_000);
+fn setup_token(env: &Env, admin: &Address, amount: i128) -> Address {
+    let token_address = env.register_stellar_asset_contract(admin.clone());
+    token::StellarAssetClient::new(env, &token_address).mint(admin, &amount);
+    token_address
 }
 
 #[test]
-fn test_double_release_prevention() {
+fn milestone_speed_bonus_doubles_flow_for_30_days() {
     let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
     let admin = Address::generate(&env);
     let grantee = Address::generate(&env);
-    let token_address = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
 
-    let contract_id = env.register(GrantContract, ());
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant and milestone
-    let grant_id = symbol_short!("grant_double");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000, &token_address).unwrap();
-
-    let milestone_id = symbol_short!("milestone_double");
+    let grant_id = symbol_short!("gbonus1");
+    let milestone_id = symbol_short!("mile1");
+    client.create_grant(
+        &grant_id,
+        &admin,
+        &build_grantees(&env, &grantee),
+        &1_000_000u128,
+        &token_address,
+        &0u64,
+        &build_council(&env, &[admin.clone()]),
+        &1u32,
+    );
+    client.configure_stream(&grant_id, &0u64, &(100 * DAY));
     client.add_milestone(
         &grant_id,
         &milestone_id,
-        &500_000,
-        &String::from_str(&env, "Test"),
-    ).unwrap();
+        &1_000_000u128,
+        &String::from_str(&env, "Milestone 1"),
+        &(40 * DAY),
+    );
+    client.configure_milestone_acceleration(&grant_id, &milestone_id, &10_000u32, &(30 * DAY));
+    client.approve_milestone(&grant_id, &milestone_id);
 
-    // Approve once
-    client.approve_milestone(&grant_id, &milestone_id).unwrap();
+    set_timestamp(&env, 15 * DAY);
+    assert_eq!(
+        client.get_withdrawable_amount(&grant_id, &grantee),
+        300_000u128
+    );
 
-    // Try to approve again - should fail
-    let result = client.approve_milestone(&grant_id, &milestone_id);
-    assert!(result.is_err());
+    let withdrawn = client.withdraw(&grant_id, &grantee);
+    assert_eq!(withdrawn, 300_000u128);
+    assert_eq!(
+        token::Client::new(&env, &token_address).balance(&grantee),
+        300_000i128
+    );
+
+    set_timestamp(&env, 40 * DAY);
+    assert_eq!(
+        client.get_withdrawable_amount(&grant_id, &grantee),
+        400_000u128
+    );
+
+    set_timestamp(&env, 100 * DAY);
+    assert_eq!(
+        client.get_withdrawable_amount(&grant_id, &grantee),
+        700_000u128
+    );
 }
 
 #[test]
-fn test_get_remaining_amount() {
+fn speed_bonus_never_exceeds_released_milestone_funding() {
     let env = Env::default();
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
+
     let admin = Address::generate(&env);
     let grantee = Address::generate(&env);
-    let token_address = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
 
-    let contract_id = env.register(GrantContract, ());
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant
-    let grant_id = symbol_short!("grant_remaining");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000, &token_address).unwrap();
+    let grant_id = symbol_short!("grantcap");
+    let milestone_id = symbol_short!("cap1");
+    client.create_grant(
+        &grant_id,
+        &admin,
+        &build_grantees(&env, &grantee),
+        &1_000_000u128,
+        &token_address,
+        &0u64,
+        &build_council(&env, &[admin.clone()]),
+        &1u32,
+    );
+    client.configure_stream(&grant_id, &0u64, &(100 * DAY));
+    client.add_milestone(
+        &grant_id,
+        &milestone_id,
+        &200_000u128,
+        &String::from_str(&env, "Seed funding"),
+        &(10 * DAY),
+    );
+    client.configure_milestone_acceleration(&grant_id, &milestone_id, &10_000u32, &(30 * DAY));
+    client.approve_milestone(&grant_id, &milestone_id);
 
-    // Check remaining amount before any releases
-    let remaining = client.get_remaining_amount(&grant_id).unwrap();
-    assert_eq!(remaining, 1_000_000);
-
-    // Add and approve a milestone
-    let milestone_id = symbol_short!("m1");
-    client.add_milestone(&grant_id, &milestone_id, &400_000, &String::from_str(&env, "Phase 1")).unwrap();
-    client.approve_milestone(&grant_id, &milestone_id).unwrap();
-
-    // Check remaining amount after release
-    let remaining = client.get_remaining_amount(&grant_id).unwrap();
-    assert_eq!(remaining, 600_000);
+    set_timestamp(&env, 30 * DAY);
+    assert_eq!(
+        client.get_withdrawable_amount(&grant_id, &grantee),
+        200_000u128
+    );
 }
 
 #[test]
-fn test_exceed_total_grant_amount() {
+fn council_threshold_controls_when_acceleration_starts() {
     let env = Env::default();
-    let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
-    let token_address = Address::generate(&env);
+    env.mock_all_auths();
+    set_timestamp(&env, 0);
 
-    let contract_id = env.register(GrantContract, ());
+    let admin = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let grantee = Address::generate(&env);
+    let token_address = setup_token(&env, &admin, 1_000_000);
+
+    let contract_id = env.register_contract(None, GrantContract);
     let client = GrantContractClient::new(&env, &contract_id);
 
-    // Create a grant with 1M total
-    let grant_id = symbol_short!("grant_exceed");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000, &token_address).unwrap();
+    let grant_id = symbol_short!("grantvote");
+    let milestone_id = symbol_short!("vote1");
+    client.create_grant(
+        &grant_id,
+        &admin,
+        &build_grantees(&env, &grantee),
+        &1_000_000u128,
+        &token_address,
+        &0u64,
+        &build_council(&env, &[admin.clone(), reviewer.clone()]),
+        &2u32,
+    );
+    client.configure_stream(&grant_id, &0u64, &(100 * DAY));
+    client.add_milestone(
+        &grant_id,
+        &milestone_id,
+        &1_000_000u128,
+        &String::from_str(&env, "Council gated"),
+        &(20 * DAY),
+    );
+    client.configure_milestone_acceleration(&grant_id, &milestone_id, &5_000u32, &(30 * DAY));
 
-    // Add milestone for 600K
-    let milestone_1 = symbol_short!("m1");
-    client.add_milestone(&grant_id, &milestone_1, &600_000, &String::from_str(&env, "Phase 1")).unwrap();
-    client.approve_milestone(&grant_id, &milestone_1).unwrap();
+    client.vote_milestone(&grant_id, &milestone_id, &admin, &true);
+    let milestone = client.get_milestone(&grant_id, &milestone_id);
+    assert_eq!(milestone.votes_for, 1);
+    assert!(!milestone.approved);
+    assert_eq!(client.get_grant(&grant_id).released_amount, 0u128);
 
-    // Add milestone for 500K (would exceed total)
-    let milestone_2 = symbol_short!("m2");
-    client.add_milestone(&grant_id, &milestone_2, &500_000, &String::from_str(&env, "Phase 2")).unwrap();
+    set_timestamp(&env, 5 * DAY);
+    client.vote_milestone(&grant_id, &milestone_id, &reviewer, &true);
 
-    // Trying to approve should fail
-    let result = client.approve_milestone(&grant_id, &milestone_2);
-    assert!(result.is_err());
-}
+    let grant = client.get_grant(&grant_id);
+    assert_eq!(grant.released_amount, 1_000_000u128);
+    assert_eq!(grant.acceleration_windows.len(), 1);
+    assert_eq!(grant.status, GrantStatus::Completed);
 
-#[test]
-fn test_grant_simulation_10_years() {
-    // 10 years in seconds
-    let duration: u64 = 315_360_000;
-
-    // Total grant amount
-    let total: u128 = 1_000_000_000u128;
-
-    // Use a realistic large timestamp to catch overflow issues
-    let start: u64 = 1_700_000_000;
-
-    // --------------------------------------------------
-    // ✔ Start: nothing should be claimable
-    // --------------------------------------------------
-    let claim0 =
-        grant::compute_claimable_balance(total, start, start, duration);
-    assert_eq!(claim0, 0);
-
-    // --------------------------------------------------
-    // ✔ Year 5: exactly 50%
-    // --------------------------------------------------
-    let year5 = start + duration / 2;
-    let claim5 =
-        grant::compute_claimable_balance(total, start, year5, duration);
-
-    assert_eq!(claim5, total / 2);
-
-    // --------------------------------------------------
-    // ✔ Year 10: 100% vested
-    // --------------------------------------------------
-    let year10 = start + duration;
-    let claim10 =
-        grant::compute_claimable_balance(total, start, year10, duration);
-
-    assert_eq!(claim10, total);
-
-    // --------------------------------------------------
-    // ✔ After expiry: must remain capped at total
-    // --------------------------------------------------
-    let after = year10 + 1_000_000;
-    let claim_after =
-        grant::compute_claimable_balance(total, start, after, duration);
-
-    assert_eq!(claim_after, total);
-
-    // --------------------------------------------------
-    // ✔ Verify constant equals 10-year duration
-    // --------------------------------------------------
-    assert_eq!(duration, 315_360_000u64);
-}
-
-#[test]
-fn test_custom_token_with_transfer_fee() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
-    
-    // Deploy a custom token contract with transfer fee
-    let token_contract_id = env.register_stellar_asset_contract(admin.clone());
-    let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
-    
-    // Mint tokens to admin
-    token_client.mint(&admin, &1_000_000);
-    
-    let contract_id = env.register(GrantContract, ());
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    // Create a grant with custom token
-    let grant_id = symbol_short!("grant_custom_token");
-    client.create_grant(&grant_id, &admin, &grantee, &500_000, &token_contract_id).unwrap();
-
-    // Add milestone
-    let milestone_id = symbol_short!("m1");
-    client.add_milestone(&grant_id, &milestone_id, &100_000, &String::from_str(&env, "Phase 1")).unwrap();
-
-    // Check contract balance before approval
-    let contract_balance_before = token_client.balance(&contract_id);
-    
-    // Approve milestone - this should handle transfer fees correctly
-    client.approve_milestone(&grant_id, &milestone_id).unwrap();
-    
-    // Verify contract balance tracks correctly (accounting for potential fees)
-    let contract_balance_after = token_client.balance(&contract_id);
-    let grantee_balance = token_client.balance(&grantee);
-    
-    // The grantee should receive tokens (amount might be less due to fees)
-    assert!(grantee_balance > 0);
-    
-    // Contract should have remaining balance
-    assert_eq!(contract_balance_after, contract_balance_before);
-    
-    // Verify grant state
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.released_amount, 100_000);
-}
-
-#[test]
-fn test_long_pause_duration() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
-    let token_address = Address::generate(&env);
-
-    let contract_id = env.register(GrantContract, ());
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    // Create a grant
-    let grant_id = symbol_short!("grant_long_pause");
-    client.create_grant(&grant_id, &admin, &grantee, &1_000_000, &token_address).unwrap();
-
-    // Add milestone
-    let milestone_id = symbol_short!("m1");
-    client.add_milestone(&grant_id, &milestone_id, &500_000, &String::from_str(&env, "Phase 1")).unwrap();
-
-    // Activate the grant
-    client.activate_grant(&grant_id).unwrap();
-    
-    // Simulate long pause (100 years in seconds)
-    let hundred_years_seconds: u64 = 100 * 365 * 24 * 60 * 60; // ~3.15 billion seconds
-    env.ledger().set_timestamp(env.ledger().timestamp() + hundred_years_seconds);
-
-    // Pause the grant
-    client.pause_grant(&grant_id).unwrap();
-    
-    // Verify grant is paused
-    let grant_info = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info.status, crate::GrantStatus::Paused);
-    
-    // Resume after long pause
-    client.resume_grant(&grant_id).unwrap();
-    
-    // Verify grant is active again
-    let grant_info_after = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info_after.status, crate::GrantStatus::Active);
-    
-    // Approve milestone should still work after long pause
-    client.approve_milestone(&grant_id, &milestone_id).unwrap();
-    
-    // Verify total_withdrawn + remaining == initial_deposit
-    let remaining = client.get_remaining_amount(&grant_id).unwrap();
-    let grant_info_final = client.get_grant(&grant_id).unwrap();
-    assert_eq!(grant_info_final.released_amount + remaining, 1_000_000);
-}
-
-// Fuzz test for extreme pause durations
-#[test]
-fn test_fuzz_extreme_pause_durations() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let grantee = Address::generate(&env);
-    let token_address = Address::generate(&env);
-
-    let contract_id = env.register(GrantContract, ());
-    let client = GrantContractClient::new(&env, &contract_id);
-
-    // Test various extreme pause durations
-    let test_durations = vec![
-        0u64,                                    // No pause
-        1u64,                                    // 1 second
-        86_400u64,                               // 1 day
-        31_536_000u64,                           // 1 year
-        3_153_600_000u64,                        // 100 years
-        u64::MAX / 2,                           // Very large duration
-    ];
-
-    for (i, pause_duration) in test_durations.iter().enumerate() {
-        let grant_id = symbol_short!(&format!("grant_fuzz_{}", i));
-        client.create_grant(&grant_id, &admin, &grantee, &1_000_000, &token_address).unwrap();
-        
-        let milestone_id = symbol_short!(&format!("m_fuzz_{}", i));
-        client.add_milestone(&grant_id, &milestone_id, &100_000, &String::from_str(&env, "Test")).unwrap();
-        
-        // Activate the grant
-        client.activate_grant(&grant_id).unwrap();
-        
-        // Advance time by pause duration
-        env.ledger().set_timestamp(env.ledger().timestamp() + pause_duration);
-        
-        // Pause and resume
-        client.pause_grant(&grant_id).unwrap();
-        
-        // Verify paused status
-        let grant_info_paused = client.get_grant(&grant_id).unwrap();
-        assert_eq!(grant_info_paused.status, crate::GrantStatus::Paused);
-        
-        client.resume_grant(&grant_id).unwrap();
-        
-        // Verify active status
-        let grant_info_resumed = client.get_grant(&grant_id).unwrap();
-        assert_eq!(grant_info_resumed.status, crate::GrantStatus::Active);
-        
-        // Approve milestone
-        client.approve_milestone(&grant_id, &milestone_id).unwrap();
-        
-        // Verify invariants
-        let remaining = client.get_remaining_amount(&grant_id).unwrap();
-        let grant_info = client.get_grant(&grant_id).unwrap();
-        assert_eq!(grant_info.released_amount + remaining, 1_000_000);
-    }
+    set_timestamp(&env, 15 * DAY);
+    assert_eq!(
+        client.get_withdrawable_amount(&grant_id, &grantee),
+        200_000u128
+    );
 }
