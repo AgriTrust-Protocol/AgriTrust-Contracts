@@ -11,6 +11,11 @@ const XLM_DECIMALS: u32 = 7;
 const RENT_RESERVE_XLM: i128 = 5 * 10i128.pow(XLM_DECIMALS);
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
+const NFT_SUPPLY: i128 = 1000000; // Max NFT supply for completion certificates
+const MIN_STAKE_PERCENTAGE: i128 = 1000; // 10% minimum stake (in basis points)
+const MAX_STAKE_PERCENTAGE: i128 = 5000; // 50% maximum stake (in basis points)
+const MIN_SECURITY_DEPOSIT_PERCENTAGE: i128 = 500; // 5% minimum security deposit
+const MAX_SECURITY_DEPOSIT_PERCENTAGE: i128 = 2000; // 20% maximum security deposit
 
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
@@ -33,6 +38,7 @@ pub enum GrantStatus {
 pub enum StreamType {
     FixedAmount,
     FixedEndDate,
+    TimeLockedLease,  // NEW: Lease stream to lessor address
 }
 
 #[derive(Clone)]
@@ -53,6 +59,18 @@ pub struct Grant {
     pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
+    // Staking fields
+    pub required_stake: i128,
+    pub staked_amount: i128,
+    pub stake_token: Address,
+    pub slash_reason: Option<String>,
+    // Lease-specific fields
+    pub lessor: Address,           // NEW: Equipment/property owner receiving payments
+    pub property_id: String,        // NEW: Physical asset identifier
+    pub serial_number: String,      // NEW: Equipment serial number
+    pub security_deposit: i128,    // NEW: Security deposit amount
+    pub lease_end_time: u64,      // NEW: Lease termination timestamp
+    pub lease_terminated: bool,   // NEW: Legal oracle termination flag
 }
 
 #[derive(Clone)]
@@ -66,6 +84,9 @@ enum DataKey {
     NativeToken,
     Grant(u64),
     RecipientGrants(Address),
+    // Lease-related keys
+    LeaseAgreement(u64), // Maps grant_id to lease agreement details
+    PropertyRegistry(String), // Maps property_id to lease history
 }
 
 #[contracterror]
@@ -85,6 +106,14 @@ pub enum Error {
     RescueWouldViolateAllocated = 11,
     GranteeMismatch = 12,
     GrantNotInactive = 13,
+    // Lease-related errors
+    InvalidLeaseTerms = 14,
+    LeaseAlreadyTerminated = 15,
+    LeaseNotActive = 16,
+    InvalidPropertyId = 17,
+    InvalidSecurityDeposit = 18,
+    LeaseNotExpired = 19,
+    OracleTerminationFailed = 20,
 }
 
 // --- Internal Helpers ---
@@ -130,6 +159,44 @@ fn read_grant_ids(env: &Env) -> Vec<u64> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
+// Lease Helper Functions
+fn read_lease_agreement(env: &Env, grant_id: u64) -> Result<(Address, String, String, i128, u64), Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::LeaseAgreement(grant_id))
+        .ok_or(Error::GrantNotFound)
+}
+
+fn write_lease_agreement(env: &Env, grant_id: u64, lessor: &Address, property_id: &str, serial_number: &str, security_deposit: i128, lease_end_time: u64) {
+    let agreement = (lessor.clone(), String::from_str(env, property_id), String::from_str(env, serial_number), security_deposit, lease_end_time);
+    env.storage().instance().set(&DataKey::LeaseAgreement(grant_id), &agreement);
+}
+
+fn read_property_history(env: &Env, property_id: &str) -> Vec<(u64, Address, u64)> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PropertyRegistry(String::from_str(env, property_id)))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn write_property_history(env: &Env, property_id: &str, history: &Vec<(u64, Address, u64)>) {
+    env.storage().instance().set(&DataKey::PropertyRegistry(String::from_str(env, property_id)), history);
+}
+
+fn calculate_security_deposit(total_amount: i128, deposit_percentage: i128) -> Result<i128, Error> {
+    if deposit_percentage < MIN_SECURITY_DEPOSIT_PERCENTAGE || deposit_percentage > MAX_SECURITY_DEPOSIT_PERCENTAGE {
+        return Err(Error::InvalidSecurityDeposit);
+    }
+    
+    let deposit = total_amount
+        .checked_mul(deposit_percentage)
+        .ok_or(Error::MathOverflow)?
+        .checked_div(10000) // Convert from basis points
+        .ok_or(Error::MathOverflow)?;
+    
+    Ok(deposit)
+}
+
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let mut total = 0_i128;
     let ids = read_grant_ids(env);
@@ -169,7 +236,7 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
     2500 + (7500 * progress) / 10000
 }
 
-fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
+fn settle_grant(env: &Env, grant: &mut Grant, grant_id: u64, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts { return Err(Error::InvalidState); }
     
     let elapsed = now - grant.last_update_ts;
@@ -177,7 +244,8 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
         return Ok(());
     }
 
-    if grant.status == GrantStatus::Active {
+    // Don't process accruals for terminated leases
+    if grant.status == GrantStatus::Active && !grant.lease_terminated {
         // Handle pending rate increases first
         if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 && now >= grant.effective_timestamp {
             let switch_ts = grant.effective_timestamp;
@@ -207,6 +275,9 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
     if total_accounted >= grant.total_amount {
         grant.claimable = grant.total_amount - grant.withdrawn;
         grant.status = GrantStatus::Completed;
+        
+        // Mint completion certificate if this is the first time completing
+        // (Note: Leases don't get NFTs as they're for physical assets)
     }
 
     grant.last_update_ts = now;
@@ -260,13 +331,21 @@ impl GrantContract {
         recipient: Address,
         total_amount: i128,
         flow_rate: i128,
-        warmup_duration: u64
+        warmup_duration: u64,
+        lessor: Address,
+        property_id: String,
+        serial_number: String,
+        security_deposit_percentage: i128,
+        lease_end_time: u64,
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
         if total_amount <= 0 || flow_rate < 0 {
             return Err(Error::InvalidAmount);
         }
+
+        // Calculate security deposit
+        let security_deposit = calculate_security_deposit(total_amount, security_deposit_percentage)?;
 
         let key = DataKey::Grant(grant_id);
         if env.storage().instance().has(&key) {
@@ -287,12 +366,32 @@ impl GrantContract {
             effective_timestamp: 0,
             status: GrantStatus::Active,
             redirect: None,
-            stream_type: StreamType::FixedAmount,
+            stream_type: StreamType::TimeLockedLease,
             start_time: now,
             warmup_duration,
+            // Staking fields (set to 0 for leases)
+            required_stake: 0,
+            staked_amount: 0,
+            stake_token: Address::generate(&env), // Placeholder
+            slash_reason: None,
+            // Lease-specific fields
+            lessor: lessor.clone(),
+            property_id: property_id.clone(),
+            serial_number: serial_number.clone(),
+            security_deposit,
+            lease_end_time,
+            lease_terminated: false,
         };
 
         env.storage().instance().set(&key, &grant);
+
+        // Store lease agreement details
+        write_lease_agreement(&env, grant_id, &lessor, &property_id, &serial_number, security_deposit, lease_end_time);
+
+        // Update property registry
+        let mut history = read_property_history(&env, &property_id);
+        history.push_back((grant_id, recipient.clone(), now));
+        write_property_history(&env, &property_id, &history);
 
         let mut ids = read_grant_ids(&env);
         ids.push_back(grant_id);
@@ -303,14 +402,29 @@ impl GrantContract {
         user_grants.push_back(grant_id);
         env.storage().instance().set(&recipient_key, &user_grants);
 
+        // Publish lease creation event
+        env.events().publish(
+            (Symbol::new(&env, "lease_created"), grant_id),
+            (recipient, lessor, property_id, security_deposit),
+        );
+
         Ok(())
     }
 
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
-        grant.recipient.require_auth();
+        
+        // For leases, authenticate lessor; for regular grants, authenticate recipient
+        match grant.stream_type {
+            StreamType::TimeLockedLease => {
+                grant.lessor.require_auth();
+            }
+            _ => {
+                grant.recipient.require_auth();
+            }
+        }
 
-        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted {
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted || grant.lease_terminated {
             return Err(Error::InvalidState);
         }
 
@@ -328,7 +442,13 @@ impl GrantContract {
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
-        let target = grant.redirect.unwrap_or(grant.recipient.clone());
+        
+        // For leases, pay lessor; for regular grants, pay recipient
+        let target = match grant.stream_type {
+            StreamType::TimeLockedLease => grant.lessor.clone(),
+            _ => grant.redirect.unwrap_or(grant.recipient.clone()),
+        };
+        
         client.transfer(&env.current_contract_address(), &target, &amount);
 
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
@@ -453,6 +573,63 @@ impl GrantContract {
         read_grant(&env, grant_id)
     }
 
+    // Lease-specific functions
+    pub fn terminate_lease_by_oracle(env: Env, grant_id: u64, reason: String) -> Result<(), Error> {
+        require_oracle_auth(&env)?;
+        
+        let mut grant = read_grant(&env, grant_id)?;
+        
+        // Validate lease can be terminated
+        if grant.stream_type != StreamType::TimeLockedLease {
+            return Err(Error::InvalidLeaseTerms);
+        }
+        
+        if grant.lease_terminated {
+            return Err(Error::LeaseAlreadyTerminated);
+        }
+        
+        // Check if lease has expired
+        let now = env.ledger().timestamp();
+        if now < grant.lease_end_time {
+            return Err(Error::LeaseNotExpired);
+        }
+        
+        // Mark lease as terminated
+        grant.lease_terminated = true;
+        grant.status = GrantStatus::Cancelled;
+        write_grant(&env, grant_id, &grant);
+        
+        // Return security deposit to treasury
+        if grant.security_deposit > 0 {
+            let treasury = read_treasury(&env)?;
+            let token_client = token::Client::new(&env, &read_grant_token(&env)?);
+            token_client.transfer(&env.current_contract_address(), &treasury, &grant.security_deposit);
+        }
+        
+        // Publish termination event
+        env.events().publish(
+            (Symbol::new(&env, "lease_terminated"), grant_id),
+            (grant.lessor, grant.recipient, reason, grant.security_deposit),
+        );
+        
+        Ok(())
+    }
+
+    pub fn get_lease_info(env: Env, grant_id: u64) -> Result<(Address, String, String, i128, u64, bool), Error> {
+        let grant = read_grant(&env, grant_id)?;
+        if grant.stream_type != StreamType::TimeLockedLease {
+            return Err(Error::InvalidLeaseTerms);
+        }
+        
+        let (lessor, property_id, serial_number, security_deposit, lease_end_time) = read_lease_agreement(&env, grant_id)?;
+        
+        Ok((lessor, property_id, serial_number, security_deposit, lease_end_time, grant.lease_terminated))
+    }
+
+    pub fn get_property_history(env: Env, property_id: String) -> Vec<(u64, Address, u64)> {
+        read_property_history(&env, &property_id)
+    }
+
     pub fn claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
             let _ = settle_grant(&mut grant, env.ledger().timestamp());
@@ -474,3 +651,9 @@ fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_nft;
+#[cfg(test)]
+mod test_staking;
+#[cfg(test)]
+mod test_lease;
