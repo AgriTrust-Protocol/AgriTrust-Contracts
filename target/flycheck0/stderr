@@ -1,8 +1,0 @@
-   0.152104333s  INFO prepare_target{force=false package_id=grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts) target="grant_contracts"}: cargo::core::compiler::fingerprint: fingerprint dirty for grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("grant_contracts", ["cdylib"], "/Users/apple/dev/opensource/contracts/contracts/grant_contracts/src/lib.rs", Edition2021) }
-   0.152158916s  INFO prepare_target{force=false package_id=grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts) target="grant_contracts"}: cargo::core::compiler::fingerprint:     dirty: PathToSourceChanged
-   0.179986041s  INFO prepare_target{force=false package_id=grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts) target="grant_contracts"}: cargo::core::compiler::fingerprint: fingerprint dirty for grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("grant_contracts", ["cdylib"], "/Users/apple/dev/opensource/contracts/contracts/grant_contracts/src/lib.rs", Edition2021) }
-   0.180012958s  INFO prepare_target{force=false package_id=grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts) target="grant_contracts"}: cargo::core::compiler::fingerprint:     dirty: PathToSourceChanged
-    Checking grant_contracts v0.1.0 (/Users/apple/dev/opensource/contracts)
-error: could not compile `grant_contracts` (lib test) due to 1 previous error
-warning: build failed, waiting for other jobs to finish...
-error: could not compile `grant_contracts` (lib) due to 1 previous error
