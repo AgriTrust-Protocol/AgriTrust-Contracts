@@ -40,6 +40,7 @@ pub struct Grant {
     pub withdrawn: i128,
     pub claimable: i128,
     pub flow_rate: i128,
+    pub base_flow_rate: i128,
     pub last_update_ts: u64,
     pub rate_updated_at: u64,
     pub last_claim_time: u64,
@@ -50,6 +51,7 @@ pub struct Grant {
     pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
+    pub priority_level: u32,
 }
 
 #[derive(Clone)]
@@ -64,6 +66,7 @@ enum DataKey {
     Grant(u64),
     RecipientGrants(Address),
     MaxFlowRate(u64),
+    PriorityMultipliers,
 }
 
 #[contracterror]
@@ -84,6 +87,7 @@ pub enum Error {
     GranteeMismatch = 12,
     GrantNotInactive = 13,
     ThresholdNotMet = 14,
+    InvalidPriority = 15,
 }
 
 // --- Internal Helpers ---
@@ -168,7 +172,7 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
     2500 + (7500 * progress) / 10000
 }
 
-fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
+fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts { return Err(Error::InvalidState); }
     
     let elapsed = now - grant.last_update_ts;
@@ -178,7 +182,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
 
     if grant.status == GrantStatus::Active {
         // Handle pending rate increases first
-        if grant.pending_rate > grant.flow_rate && grant.effective_timestamp != 0 && now >= grant.effective_timestamp {
+        if grant.pending_rate > grant.base_flow_rate && grant.effective_timestamp != 0 && now >= grant.effective_timestamp {
             let switch_ts = grant.effective_timestamp;
             // Settle up to switch_ts at old rate
             let pre_elapsed = switch_ts - grant.last_update_ts;
@@ -186,7 +190,12 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             grant.claimable = grant.claimable.checked_add(pre_accrued).ok_or(Error::MathOverflow)?;
             
             // Apply new rate
-            grant.flow_rate = grant.pending_rate;
+            grant.base_flow_rate = grant.pending_rate;
+            let mut multiplier = 10000_i128;
+            if let Some(multipliers) = env.storage().instance().get::<_, Vec<i128>>(&DataKey::PriorityMultipliers) {
+                multiplier = multipliers.get((grant.priority_level - 1) as u32).unwrap_or(10000);
+            }
+            grant.flow_rate = (grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)?) / 10000;
             grant.rate_updated_at = switch_ts;
             grant.pending_rate = 0;
             grant.effective_timestamp = 0;
@@ -259,12 +268,16 @@ impl GrantContract {
         recipient: Address,
         total_amount: i128,
         flow_rate: i128,
-        warmup_duration: u64
+        warmup_duration: u64,
+        priority_level: u32
     ) -> Result<(), Error> {
         require_admin_auth(&env)?;
 
         if total_amount <= 0 || flow_rate < 0 {
             return Err(Error::InvalidAmount);
+        }
+        if priority_level < 1 || priority_level > 5 {
+            return Err(Error::InvalidPriority);
         }
 
         let key = DataKey::Grant(grant_id);
@@ -272,13 +285,20 @@ impl GrantContract {
             return Err(Error::GrantAlreadyExists);
         }
 
+        let mut initial_multiplier = 10000_i128;
+        if let Some(multipliers) = env.storage().instance().get::<_, Vec<i128>>(&DataKey::PriorityMultipliers) {
+            initial_multiplier = multipliers.get(priority_level - 1).unwrap_or(10000);
+        }
+        let initial_flow_rate = (flow_rate.checked_mul(initial_multiplier).ok_or(Error::MathOverflow)?) / 10000;
+
         let now = env.ledger().timestamp();
         let grant = Grant {
             recipient: recipient.clone(),
             total_amount,
             withdrawn: 0,
             claimable: 0,
-            flow_rate,
+            flow_rate: initial_flow_rate,
+            base_flow_rate: flow_rate,
             last_update_ts: now,
             rate_updated_at: now,
             last_claim_time: now,
@@ -289,6 +309,7 @@ impl GrantContract {
             stream_type: StreamType::FixedAmount,
             start_time: now,
             warmup_duration,
+            priority_level,
         };
 
         env.storage().instance().set(&key, &grant);
@@ -313,7 +334,7 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
 
         if amount > grant.claimable {
             return Err(Error::InvalidAmount);
@@ -340,7 +361,7 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         grant.status = GrantStatus::Paused;
         write_grant(&env, grant_id, &grant);
         Ok(())
@@ -350,6 +371,12 @@ impl GrantContract {
         require_admin_auth(&env)?;
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
+
+        let mut multiplier = 10000_i128;
+        if let Some(multipliers) = env.storage().instance().get::<_, Vec<i128>>(&DataKey::PriorityMultipliers) {
+            multiplier = multipliers.get(grant.priority_level - 1).unwrap_or(10000);
+        }
+        grant.flow_rate = (grant.base_flow_rate * multiplier) / 10000;
 
         grant.status = GrantStatus::Active;
         grant.last_update_ts = env.ledger().timestamp();
@@ -363,21 +390,27 @@ impl GrantContract {
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         if new_rate < 0 { return Err(Error::InvalidRate); }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         
+        let old_base = grant.base_flow_rate;
         let old_rate = grant.flow_rate;
-        if new_rate > old_rate {
+        if new_rate > old_base {
             grant.pending_rate = new_rate;
             grant.effective_timestamp = env.ledger().timestamp() + RATE_INCREASE_TIMELOCK_SECS;
         } else {
-            grant.flow_rate = new_rate;
+            grant.base_flow_rate = new_rate;
+            let mut multiplier = 10000_i128;
+            if let Some(multipliers) = env.storage().instance().get::<_, Vec<i128>>(&DataKey::PriorityMultipliers) {
+                multiplier = multipliers.get(grant.priority_level - 1).unwrap_or(10000);
+            }
+            grant.flow_rate = (new_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)?) / 10000;
             grant.rate_updated_at = env.ledger().timestamp();
             grant.pending_rate = 0;
             grant.effective_timestamp = 0;
         }
 
         write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("rateupdt"), grant_id), (old_rate, new_rate));
+        env.events().publish((symbol_short!("rateupdt"), grant_id), (old_rate, grant.flow_rate));
         Ok(())
     }
 
@@ -388,10 +421,15 @@ impl GrantContract {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         
         let old_rate = grant.flow_rate;
-        grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        grant.base_flow_rate = grant.base_flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+        let mut current_throttle = 10000_i128;
+        if let Some(multipliers) = env.storage().instance().get::<_, Vec<i128>>(&DataKey::PriorityMultipliers) {
+            current_throttle = multipliers.get(grant.priority_level - 1).unwrap_or(10000);
+        }
+        grant.flow_rate = (grant.base_flow_rate * current_throttle) / 10000;
 
         if grant.pending_rate > 0 {
             grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
@@ -462,28 +500,97 @@ impl GrantContract {
             return Err(Error::ThresholdNotMet);
         }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
 
-        let old_rate = grant.flow_rate;
-        let mut new_rate = old_rate
+        let pre_adj_flow_rate = grant.flow_rate;
+        let mut new_base_rate = grant.base_flow_rate
             .checked_mul(new_index)
             .ok_or(Error::MathOverflow)?
             .checked_div(old_index)
             .ok_or(Error::MathOverflow)?;
 
         if let Some(max_cap) = env.storage().instance().get::<_, i128>(&DataKey::MaxFlowRate(grant_id)) {
-            if new_rate > max_cap {
-                new_rate = max_cap;
+            if new_base_rate > max_cap {
+                new_base_rate = max_cap;
             }
         }
 
+        grant.base_flow_rate = new_base_rate;
+        
+        let mut current_throttle = 10000_i128;
+        if let Some(multipliers) = env.storage().instance().get::<_, Vec<i128>>(&DataKey::PriorityMultipliers) {
+            current_throttle = multipliers.get(grant.priority_level - 1).unwrap_or(10000);
+        }
+        let new_rate = (new_base_rate * current_throttle) / 10000;
         grant.flow_rate = new_rate;
+
         grant.rate_updated_at = env.ledger().timestamp();
         grant.pending_rate = 0;
         grant.effective_timestamp = 0;
 
         write_grant(&env, grant_id, &grant);
-        env.events().publish((symbol_short!("inflatn"), grant_id), (old_rate, new_rate));
+        env.events().publish((symbol_short!("inflatn"), grant_id), (pre_adj_flow_rate, new_rate));
+        
+        Ok(())
+    }
+
+    pub fn manage_liquidity(env: Env, daily_liquidity: i128) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if daily_liquidity < 0 { return Err(Error::InvalidAmount); }
+
+        let available_flow_per_sec = daily_liquidity / 86400;
+        
+        let ids = read_grant_ids(&env);
+        let mut total_flows = vec![&env, 0_i128, 0_i128, 0_i128, 0_i128, 0_i128];
+        
+        for i in 0..ids.len() {
+            let grant_id = ids.get(i).unwrap();
+            let grant = read_grant(&env, grant_id)?;
+            if grant.status == GrantStatus::Active {
+                let idx = grant.priority_level - 1;
+                let current_val = total_flows.get(idx).unwrap_or(0);
+                total_flows.set(idx, current_val + grant.base_flow_rate);
+            }
+        }
+        
+        let mut remaining_flow = available_flow_per_sec;
+        let mut multipliers = vec![&env, 0_i128, 0_i128, 0_i128, 0_i128, 0_i128];
+        
+        for p in 0..5 {
+            let tf = total_flows.get(p).unwrap_or(0);
+            if tf == 0 {
+                multipliers.set(p, 10000); 
+            } else if remaining_flow >= tf {
+                multipliers.set(p, 10000);
+                remaining_flow -= tf;
+            } else if remaining_flow > 0 {
+                let mult = (remaining_flow * 10000) / tf;
+                multipliers.set(p, mult);
+                remaining_flow = 0;
+            } else {
+                multipliers.set(p, 0);
+            }
+        }
+        
+        env.storage().instance().set(&DataKey::PriorityMultipliers, &multipliers);
+        
+        for i in 0..ids.len() {
+            let grant_id = ids.get(i).unwrap();
+            let mut grant = read_grant(&env, grant_id)?;
+            if grant.status == GrantStatus::Active {
+                let idx = grant.priority_level - 1;
+                let new_flow_rate = (grant.base_flow_rate * multipliers.get(idx).unwrap_or(10000)) / 10000;
+                
+                if grant.flow_rate != new_flow_rate {
+                    settle_grant(&env, &mut grant, env.ledger().timestamp())?;
+                    grant.flow_rate = new_flow_rate;
+                    grant.rate_updated_at = env.ledger().timestamp();
+                    write_grant(&env, grant_id, &grant);
+                }
+            }
+        }
+        
+        env.events().publish((symbol_short!("liquidty"),), daily_liquidity);
         
         Ok(())
     }
@@ -494,7 +601,7 @@ impl GrantContract {
 
         if grant.status != GrantStatus::Paused { return Err(Error::InvalidState); }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         
         let claim_amount = grant.claimable;
         grant.claimable = 0;
@@ -524,7 +631,7 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         
         let remaining = grant.total_amount.checked_sub(grant.withdrawn).ok_or(Error::MathOverflow)?;
         grant.status = GrantStatus::Cancelled;
@@ -567,7 +674,7 @@ impl GrantContract {
 
     pub fn claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
-            let _ = settle_grant(&mut grant, env.ledger().timestamp());
+            let _ = settle_grant(&env, &mut grant, env.ledger().timestamp());
             grant.claimable
         } else {
             0
