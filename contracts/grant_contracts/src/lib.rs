@@ -1,9 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Symbol, Env, String, Vec, Map, xdr::ScVal};
-
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Vec,
-    Symbol, vec, IntoVal,
+    Symbol, vec, IntoVal, Map,
 };
 
 // --- Constants ---
@@ -16,6 +14,186 @@ const INACTIVITY_THRESHOLD_SECS: u64 = 90 * 24 * 60 * 60;
 // --- Submodules ---
 // Submodules removed for consolidation and to fix compilation errors.
 // Core logic is now in this file.
+
+// --- Test Modules ---
+#[cfg(test)]
+mod test_batch_init;
+/// Get the next available grant ID
+///
+/// This function finds the next unused grant ID by checking existing grants.
+/// Useful for batch operations to avoid ID conflicts.
+pub fn get_next_grant_id(env: Env) -> u64 {
+    let grant_ids = read_grant_ids(&env);
+
+    if grant_ids.is_empty() {
+        return 1;
+    }
+
+    // Find the maximum existing ID and add 1
+    let mut max_id = 0u64;
+    for id in grant_ids.iter() {
+        if id > max_id {
+            max_id = id;
+        }
+    }
+
+    max_id + 1
+}
+/// Advanced batch initialization with multi-asset support and deposit verification
+///
+/// This function creates multiple grants with different assets in a single transaction.
+/// It verifies deposits for each asset type and provides detailed failure information.
+///
+/// # Arguments
+/// * `grantee_configs` - Array of GranteeConfig with different assets
+/// * `asset_deposits` - Map of asset addresses to deposited amounts for verification
+/// * `starting_grant_id` - Optional starting ID (uses next available if None)
+///
+/// # Returns
+/// * `BatchInitResult` - Detailed results including per-asset totals
+pub fn batch_init_with_deposits(
+    env: Env,
+    grantee_configs: Vec<GranteeConfig>,
+    asset_deposits: Map<Address, i128>,
+    starting_grant_id: Option<u64>,
+) -> Result<BatchInitResult, Error> {
+    require_admin_auth(&env)?;
+
+    if grantee_configs.is_empty() {
+        return Err(Error::InvalidAmount);
+    }
+
+    // Determine starting grant ID
+    let start_id = starting_grant_id.unwrap_or_else(|| {
+        let grant_ids = read_grant_ids(&env);
+        if grant_ids.is_empty() {
+            1
+        } else {
+            let mut max_id = 0u64;
+            for id in grant_ids.iter() {
+                if id > max_id {
+                    max_id = id;
+                }
+            }
+            max_id + 1
+        }
+    });
+
+    // Calculate required amounts per asset
+    let mut asset_requirements = Map::<Address, i128>::new(&env);
+
+    for config in grantee_configs.iter() {
+        if config.total_amount <= 0 || config.flow_rate < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let current_req = asset_requirements.get(config.asset.clone()).unwrap_or(0);
+        let new_req = current_req
+            .checked_add(config.total_amount)
+            .ok_or(Error::MathOverflow)?;
+        asset_requirements.set(config.asset.clone(), new_req);
+    }
+
+    // Verify deposits match requirements
+    for (asset_addr, required_amount) in asset_requirements.iter() {
+        let deposited_amount = asset_deposits.get(asset_addr.clone()).unwrap_or(0);
+
+        if deposited_amount < required_amount {
+            return Err(Error::InsufficientReserve);
+        }
+
+        // Verify contract actually has the balance
+        let token_client = token::Client::new(&env, &asset_addr);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+
+        if contract_balance < required_amount {
+            return Err(Error::InsufficientReserve);
+        }
+    }
+
+    // Create grants atomically
+    let mut successful_grants = Vec::new(&env);
+    let mut failed_grants = Vec::new(&env);
+    let mut total_deposited = 0i128;
+    let mut current_grant_id = start_id;
+
+    let now = env.ledger().timestamp();
+    let mut grant_ids = read_grant_ids(&env);
+
+    for config in grantee_configs.iter() {
+        // Find next available ID if current one exists
+        while env.storage().instance().has(&DataKey::Grant(current_grant_id)) {
+            current_grant_id += 1;
+        }
+
+        let key = DataKey::Grant(current_grant_id);
+
+        // Create the grant
+        let grant = Grant {
+            recipient: config.recipient.clone(),
+            total_amount: config.total_amount,
+            withdrawn: 0,
+            claimable: 0,
+            flow_rate: config.flow_rate,
+            last_update_ts: now,
+            rate_updated_at: now,
+            last_claim_time: now,
+            pending_rate: 0,
+            effective_timestamp: 0,
+            status: GrantStatus::Active,
+            redirect: None,
+            stream_type: StreamType::FixedAmount,
+            start_time: now,
+            warmup_duration: config.warmup_duration,
+            validator: config.validator.clone(),
+            validator_withdrawn: 0,
+            validator_claimable: 0,
+        };
+
+        // Store the grant
+        env.storage().instance().set(&key, &grant);
+        grant_ids.push_back(current_grant_id);
+
+        // Update recipient grants index
+        let recipient_key = DataKey::RecipientGrants(config.recipient.clone());
+        let mut user_grants: Vec<u64> = env.storage()
+            .instance()
+            .get(&recipient_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        user_grants.push_back(current_grant_id);
+        env.storage().instance().set(&recipient_key, &user_grants);
+
+        successful_grants.push_back(current_grant_id);
+        total_deposited = total_deposited
+            .checked_add(config.total_amount)
+            .ok_or(Error::MathOverflow)?;
+
+        current_grant_id += 1;
+    }
+
+    // Update grant IDs list
+    env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
+
+    let result = BatchInitResult {
+        successful_grants: successful_grants.clone(),
+        failed_grants,
+        total_deposited,
+        grants_created: successful_grants.len(),
+    };
+
+    // Emit detailed batch creation event
+    env.events().publish(
+        (symbol_short!("batch_adv"),),
+        (
+            result.grants_created,
+            result.total_deposited,
+            start_id,
+            asset_requirements.len(),
+        ),
+    );
+
+    Ok(result)
+}
 
 // --- Types ---
 
@@ -61,6 +239,28 @@ pub struct Grant {
     pub validator_withdrawn: i128,
     /// Claimable balance accumulator for the validator (5% of stream).
     pub validator_claimable: i128,
+}
+
+/// Configuration for a single grantee in batch initialization
+#[derive(Clone)]
+#[contracttype]
+pub struct GranteeConfig {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub flow_rate: i128,
+    pub asset: Address,
+    pub warmup_duration: u64,
+    pub validator: Option<Address>,
+}
+
+/// Result of batch grant initialization
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct BatchInitResult {
+    pub successful_grants: Vec<u64>,
+    pub failed_grants: Vec<u64>,
+    pub total_deposited: i128,
+    pub grants_created: u32,
 }
 
 #[derive(Clone)]
@@ -353,6 +553,138 @@ impl GrantContract {
 
         Ok(())
     }
+    /// Batch initialize multiple grants in a single transaction
+    ///
+    /// This function creates multiple grants atomically, verifying that the total deposit
+    /// covers the sum of all streams. Critical for "Grant Rounds" where DAOs need to
+    /// distribute funds to dozens of winners simultaneously.
+    ///
+    /// # Arguments
+    /// * `grantee_configs` - Array of GranteeConfig containing recipient, rate, duration, asset
+    /// * `starting_grant_id` - Starting ID for grant numbering (increments for each grant)
+    ///
+    /// # Returns
+    /// * `BatchInitResult` - Details of successful/failed grants and total deposited
+    pub fn batch_init(
+        env: Env,
+        grantee_configs: Vec<GranteeConfig>,
+        starting_grant_id: u64,
+    ) -> Result<BatchInitResult, Error> {
+        require_admin_auth(&env)?;
+
+        if grantee_configs.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Calculate total required deposit per asset
+        let mut asset_totals = Map::<Address, i128>::new(&env);
+
+        for config in grantee_configs.iter() {
+            if config.total_amount <= 0 || config.flow_rate < 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            let current_total = asset_totals.get(config.asset.clone()).unwrap_or(0);
+            let new_total = current_total
+                .checked_add(config.total_amount)
+                .ok_or(Error::MathOverflow)?;
+            asset_totals.set(config.asset.clone(), new_total);
+        }
+
+        // Verify contract has sufficient balance for each asset
+        for (asset_addr, required_amount) in asset_totals.iter() {
+            let token_client = token::Client::new(&env, &asset_addr);
+            let contract_balance = token_client.balance(&env.current_contract_address());
+
+            if contract_balance < required_amount {
+                return Err(Error::InsufficientReserve);
+            }
+        }
+
+        // Create grants atomically
+        let mut successful_grants = Vec::new(&env);
+        let mut failed_grants = Vec::new(&env);
+        let mut total_deposited = 0i128;
+        let mut current_grant_id = starting_grant_id;
+
+        let now = env.ledger().timestamp();
+        let mut grant_ids = read_grant_ids(&env);
+
+        for config in grantee_configs.iter() {
+            // Check if grant ID already exists
+            let key = DataKey::Grant(current_grant_id);
+            if env.storage().instance().has(&key) {
+                failed_grants.push_back(current_grant_id);
+                current_grant_id += 1;
+                continue;
+            }
+
+            // Create the grant
+            let grant = Grant {
+                recipient: config.recipient.clone(),
+                total_amount: config.total_amount,
+                withdrawn: 0,
+                claimable: 0,
+                flow_rate: config.flow_rate,
+                last_update_ts: now,
+                rate_updated_at: now,
+                last_claim_time: now,
+                pending_rate: 0,
+                effective_timestamp: 0,
+                status: GrantStatus::Active,
+                redirect: None,
+                stream_type: StreamType::FixedAmount,
+                start_time: now,
+                warmup_duration: config.warmup_duration,
+                validator: config.validator.clone(),
+                validator_withdrawn: 0,
+                validator_claimable: 0,
+            };
+
+            // Store the grant
+            env.storage().instance().set(&key, &grant);
+            grant_ids.push_back(current_grant_id);
+
+            // Update recipient grants index
+            let recipient_key = DataKey::RecipientGrants(config.recipient.clone());
+            let mut user_grants: Vec<u64> = env.storage()
+                .instance()
+                .get(&recipient_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            user_grants.push_back(current_grant_id);
+            env.storage().instance().set(&recipient_key, &user_grants);
+
+            successful_grants.push_back(current_grant_id);
+            total_deposited = total_deposited
+                .checked_add(config.total_amount)
+                .ok_or(Error::MathOverflow)?;
+
+            current_grant_id += 1;
+        }
+
+        // Update grant IDs list
+        env.storage().instance().set(&DataKey::GrantIds, &grant_ids);
+
+        let result = BatchInitResult {
+            successful_grants: successful_grants.clone(),
+            failed_grants,
+            total_deposited,
+            grants_created: successful_grants.len(),
+        };
+
+        // Emit batch creation event
+        env.events().publish(
+            (symbol_short!("batch"),),
+            (
+                result.grants_created,
+                result.total_deposited,
+                starting_grant_id,
+                now,
+            ),
+        );
+
+        Ok(result)
+    }
 
     pub fn withdraw(env: Env, grant_id: u64, amount: i128) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
@@ -637,8 +969,8 @@ impl GrantContract {
         };
         
         // Integer square root approximation
-        let sqrt_progress_factor = integer_sqrt(progress_factor);
-        let sqrt_factor = integer_sqrt(factor_scaled);
+        let sqrt_progress_factor = Self::integer_sqrt(progress_factor);
+        let sqrt_factor = Self::integer_sqrt(factor_scaled);
         
         if sqrt_factor == 0 {
             return 0;
@@ -694,6 +1026,8 @@ impl GrantContract {
         }
         
         result
+    }
+
     /// Returns the current claimable balance for the validator (5% share).
     pub fn validator_claimable(env: Env, grant_id: u64) -> i128 {
         if let Ok(mut grant) = read_grant(&env, grant_id) {
