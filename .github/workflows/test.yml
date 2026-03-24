@@ -2,7 +2,6 @@ name: Grant Smart Contract Tests
 
 on:
   push:
-    branches: ["main"]
   pull_request:
     branches: ["main"]
 
@@ -30,9 +29,9 @@ jobs:
           sudo mv stellar /usr/local/bin/ || sudo mv stellar-cli-25.1.0-x86_64-unknown-linux-gnu/stellar /usr/local/bin/ || (ls -la && exit 1)
 
       - name: Build Contract
-        run: cargo build --target wasm32-unknown-unknown --release
         working-directory: contracts/grant_contracts
+        run: cargo build --target wasm32-unknown-unknown --release
 
       - name: Run Unit Tests
-        run: cargo test
         working-directory: contracts/grant_contracts
+        run: cargo test
