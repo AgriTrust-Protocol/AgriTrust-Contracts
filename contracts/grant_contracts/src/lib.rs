@@ -67,6 +67,7 @@ enum DataKey {
     RecipientGrants(Address),
     MaxFlowRate(u64),
     PriorityMultipliers,
+    PlatformFeeBps,
 }
 
 #[contracterror]
@@ -349,7 +350,22 @@ impl GrantContract {
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
         let target = grant.redirect.unwrap_or(grant.recipient.clone());
-        client.transfer(&env.current_contract_address(), &target, &amount);
+
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::PlatformFeeBps).unwrap_or(0);
+        let fee_amount = if fee_bps > 0 {
+            (amount.checked_mul(fee_bps as i128).ok_or(Error::MathOverflow)?) / 10000
+        } else {
+            0
+        };
+        let recipient_amount = amount.checked_sub(fee_amount).ok_or(Error::MathOverflow)?;
+
+        if recipient_amount > 0 {
+            client.transfer(&env.current_contract_address(), &target, &recipient_amount);
+        }
+        if fee_amount > 0 {
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &fee_amount);
+        }
 
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
 
@@ -613,11 +629,23 @@ impl GrantContract {
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
-        client.transfer(&env.current_contract_address(), &grant.recipient, &claim_amount);
 
-        if remaining > 0 {
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::PlatformFeeBps).unwrap_or(0);
+        let fee_amount = if fee_bps > 0 {
+            (claim_amount.checked_mul(fee_bps as i128).ok_or(Error::MathOverflow)?) / 10000
+        } else {
+            0
+        };
+        let recipient_amount = claim_amount.checked_sub(fee_amount).ok_or(Error::MathOverflow)?;
+
+        if recipient_amount > 0 {
+            client.transfer(&env.current_contract_address(), &grant.recipient, &recipient_amount);
+        }
+
+        let total_treasury = remaining.checked_add(fee_amount).ok_or(Error::MathOverflow)?;
+        if total_treasury > 0 {
             let treasury = read_treasury(&env)?;
-            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+            client.transfer(&env.current_contract_address(), &treasury, &total_treasury);
         }
 
         Ok(())
@@ -680,6 +708,15 @@ impl GrantContract {
             0
         }
     }
+
+    pub fn set_platform_fee(env: Env, fee_bps: u32) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        if fee_bps > 10000 {
+            return Err(Error::InvalidRate);
+        }
+        env.storage().instance().set(&DataKey::PlatformFeeBps, &fee_bps);
+        Ok(())
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -697,3 +734,5 @@ mod test;
 mod test_inflation;
 #[cfg(test)]
 mod test_yield;
+#[cfg(test)]
+mod test_fee;
