@@ -35,6 +35,9 @@
                 },
                 {
                   "u64": 0
+                },
+                {
+                  "u32": 1
                 }
               ]
             }
@@ -137,6 +140,17 @@
                           "map": [
                             {
                               "key": {
+                                "symbol": "base_flow_rate"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 1050
+                                }
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "claimable"
                               },
                               "val": {
@@ -190,6 +204,14 @@
                                   "hi": 0,
                                   "lo": 0
                                 }
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "priority_level"
+                              },
+                              "val": {
+                                "u32": 1
                               }
                             },
                             {
