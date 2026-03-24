@@ -311,6 +311,7 @@ pub struct Grant {
     pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
+
     // Staking fields
     pub required_stake: i128,
     pub staked_amount: i128,
@@ -520,6 +521,7 @@ enum DataKey {
     NextProposalId, // Next available proposal ID
     MaxFlowRate(u64),
     PriorityMultipliers,
+    PlatformFeeBps,
     // Sub-DAO Authority integration
     SubDaoAuthorityContract, // Address of Sub-DAO authority contract
     // COI (Conflict of Interest) keys
@@ -1602,14 +1604,7 @@ impl GrantContract {
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
-        
-        // For leases, pay lessor; for regular grants, pay recipient
-        let target = match grant.stream_type {
-            StreamType::TimeLockedLease => grant.lessor.clone(),
-            _ => grant.redirect.unwrap_or(grant.recipient.clone()),
-        };
-        
-        client.transfer(&env.current_contract_address(), &target, &amount);
+
 
         try_call_on_withdraw(&env, &grant.recipient, grant_id, amount);
 
@@ -1947,18 +1942,10 @@ impl GrantContract {
 
         let token_addr = read_grant_token(&env)?;
         let client = token::Client::new(&env, &token_addr);
-        client.transfer(&env.current_contract_address(), &grant.recipient, &claim_amount);
 
-        // Pay out the validator's accrued share on rage quit
-        if validator_amount > 0 {
-            if let Some(ref validator_addr) = grant.validator {
-                client.transfer(&env.current_contract_address(), validator_addr, &validator_amount);
-            }
-        }
 
-        if remaining > 0 {
             let treasury = read_treasury(&env)?;
-            client.transfer(&env.current_contract_address(), &treasury, &remaining);
+            client.transfer(&env.current_contract_address(), &treasury, &total_treasury);
         }
 
         Ok(())
@@ -2918,7 +2905,6 @@ pub mod grant {
         let client = token::Client::new(&env, &token_addr);
         client.transfer(&env.current_contract_address(), &validator_addr, &amount);
 
-        env.events().publish((symbol_short!("valwdraw"), grant_id), amount);
         Ok(())
     }
 
@@ -3292,3 +3278,5 @@ mod test_slashing;
 mod test_inflation;
 #[cfg(test)]
 mod test_yield;
+#[cfg(test)]
+mod test_fee;
