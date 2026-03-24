@@ -1491,6 +1491,7 @@ impl GrantContract {
         
         let old_rate = grant.flow_rate;
         grant.flow_rate = grant.flow_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
+      
         if grant.pending_rate > 0 {
             grant.pending_rate = grant.pending_rate.checked_mul(multiplier).ok_or(Error::MathOverflow)? / 10000;
         }
@@ -1499,6 +1500,33 @@ impl GrantContract {
         write_grant(&env, grant_id, &grant);
         env.events().publish((symbol_short!("kpimul"), grant_id), (old_rate, grant.flow_rate, multiplier));
         Ok(())
+    }
+
+    pub fn get_yield(env: Env) -> Result<i128, Error> {
+        let token_addr = read_grant_token(&env)?;
+        let client = token::Client::new(&env, &token_addr);
+        let balance = client.balance(&env.current_contract_address());
+        let principal = total_allocated_funds(&env)?;
+        
+        if balance > principal {
+            Ok(balance - principal)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn harvest_yield(env: Env) -> Result<i128, Error> {
+        require_admin_auth(&env)?;
+        let yield_amount = Self::get_yield(env.clone())?;
+        
+        if yield_amount > 0 {
+            let token_addr = read_grant_token(&env)?;
+            let client = token::Client::new(&env, &token_addr);
+            let treasury = read_treasury(&env)?;
+            client.transfer(&env.current_contract_address(), &treasury, &yield_amount);
+            env.events().publish((symbol_short!("harvest"),), yield_amount);
+        }
+        Ok(yield_amount)
     }
 
     pub fn set_max_flow_rate(env: Env, grant_id: u64, max_flow_rate: i128) -> Result<(), Error> {
@@ -2534,3 +2562,5 @@ mod test_financial_snapshot;
 #[cfg(test)]
 mod test_slashing;
 mod test_inflation;
+#[cfg(test)]
+mod test_yield;
