@@ -46,6 +46,8 @@ mod test_batch_init;
 mod test_atomic_bridge;
 #[cfg(test)]
 mod test_sub_dao_authority;
+#[cfg(test)]
+mod test_coi_voting_exclusion;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -203,6 +205,8 @@ pub struct Grant {
             validator: config.validator.clone(),
             validator_withdrawn: 0,
             validator_claimable: 0,
+            // COI: Store linked addresses
+            linked_addresses: config.linked_addresses.clone(),
         };
 
         // Store the grant
@@ -289,6 +293,23 @@ pub struct Grant {
     pub stream_type: StreamType,
     pub start_time: u64,
     pub warmup_duration: u64,
+    // Staking fields
+    pub required_stake: i128,
+    pub staked_amount: i128,
+    pub stake_token: Address,
+    pub slash_reason: Option<String>,
+    // Lease-specific fields
+    pub lessor: Address,           // NEW: Equipment/property owner receiving payments
+    pub property_id: String,        // NEW: Physical asset identifier
+    pub serial_number: String,      // NEW: Equipment serial number
+    pub security_deposit: i128,    // NEW: Security deposit amount
+    pub lease_end_time: u64,      // NEW: Lease termination timestamp
+    pub lease_terminated: bool,   // NEW: Legal oracle termination flag
+    // Add funds tracking
+    pub remaining_balance: i128,   // NEW: Remaining allocated balance for this grant
+    // COI (Conflict of Interest) fields
+    pub linked_addresses: Vec<Address>, // Linked addresses that cannot vote on this grant
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -300,6 +321,17 @@ pub struct StreamAcceleration {
 }
 
 #[derive(Clone)]
+#[contracttype]
+pub struct GranteeConfig {
+    pub recipient: Address,
+    pub total_amount: i128,
+    pub flow_rate: i128,
+    pub asset: Address,
+    pub warmup_duration: u64,
+    pub validator: Option<Address>,
+    pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
+}
+
 /// Result of batch grant initialization
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -413,6 +445,9 @@ enum DataKey {
     PriorityMultipliers,
     // Sub-DAO Authority integration
     SubDaoAuthorityContract, // Address of Sub-DAO authority contract
+    // COI (Conflict of Interest) keys
+    LinkedAddresses(u64), // Maps grant_id to linked addresses
+    VoterExclusions(u64), // Maps proposal_id to excluded voters with reasons
 }
 
 #[contracterror]
@@ -464,6 +499,12 @@ pub enum Error {
     SubDaoPermissionRevoked = 38,
     SubDaoActionVetoed = 39,
     SubDaoContractNotSet = 40,
+    // COI (Conflict of Interest) errors
+    VoterHasConflictOfInterest = 41,
+    LinkedAddressAlreadyExists = 42,
+    LinkedAddressNotFound = 43,
+    CannotVoteOnOwnGrant = 44,
+    ExcludedFromVoting = 45,
 }
 
 // --- Internal Helpers ---
@@ -2709,6 +2750,70 @@ pub mod grant {
 
         env.events().publish((symbol_short!("valwdraw"), grant_id), amount);
         Ok(())
+    }
+
+    // COI (Conflict of Interest) Public Functions
+
+    /// Add a linked address to a grant (admin only)
+    /// Linked addresses cannot vote on grant-related proposals
+    pub fn add_linked_address(
+        env: Env,
+        admin: Address,
+        grant_id: u64,
+        linked_address: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        // Verify grant exists
+        let _grant = read_grant(&env, grant_id)?;
+        
+        add_linked_address(&env, grant_id, &linked_address)?;
+        
+        env.events().publish(
+            (symbol_short!("linked_addr_added"), grant_id),
+            (admin, linked_address),
+        );
+        
+        Ok(())
+    }
+
+    /// Remove a linked address from a grant (admin only)
+    pub fn remove_linked_address(
+        env: Env,
+        admin: Address,
+        grant_id: u64,
+        linked_address: Address,
+    ) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+        
+        remove_linked_address(&env, grant_id, &linked_address)?;
+        
+        env.events().publish(
+            (symbol_short!("linked_addr_removed"), grant_id),
+            (admin, linked_address),
+        );
+        
+        Ok(())
+    }
+
+    /// Get all linked addresses for a grant
+    pub fn get_linked_addresses(env: Env, grant_id: u64) -> Result<Vec<Address>, Error> {
+        let _grant = read_grant(&env, grant_id)?; // Verify grant exists
+        Ok(get_linked_addresses(&env, grant_id))
+    }
+
+    /// Check if a voter has conflict of interest with a grant
+    pub fn check_voter_conflict(
+        env: Env,
+        voter: Address,
+        grant_id: u64,
+    ) -> Result<bool, Error> {
+        match check_voter_conflict_of_interest(&env, &voter, grant_id) {
+            Ok(()) => Ok(false), // No conflict
+            Err(Error::CannotVoteOnOwnGrant) => Ok(true), // Has conflict
+            Err(Error::VoterHasConflictOfInterest) => Ok(true), // Has conflict
+            Err(e) => Err(e), // Other error
+        }
     }
 }
 

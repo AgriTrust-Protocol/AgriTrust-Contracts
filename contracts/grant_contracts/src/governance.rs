@@ -98,15 +98,17 @@ pub enum GovernanceError {
     ProposalAlreadyExists = 105,
     VotingEnded = 106,
     InvalidWeight = 107,
-    InvalidAmount = 108,
-    MathOverflow = 109,
-    QuorumNotMet = 110,
-    ThresholdNotMet = 111,
+    NotACouncilMember = 108,
+    QuorumNotMet = 109,
+    ThresholdNotMet = 110,
+    MathOverflow = 111,
     AlreadyVoted = 112,
-    NotCouncilMember = 113,
-    InsufficientStake = 113,
-    StakeAlreadyReturned = 114,
-    ProposalNotConcluded = 115,
+    // COI (Conflict of Interest) errors
+    VoterHasConflictOfInterest = 113,
+    NotCouncilMember = 114,
+    InsufficientStake = 115,
+    StakeAlreadyReturned = 116,
+    ProposalNotConcluded = 117,
 }
 
 pub struct GovernanceContract;
@@ -386,6 +388,25 @@ impl GovernanceContract {
 
         if env.storage().instance().has(&GovernanceDataKey::Vote(voter.clone(), proposal_id)) {
             return Err(GovernanceError::AlreadyVoted);
+        }
+
+        // COI Check: Verify voter doesn't have conflict of interest
+        if proposal.grant_payload.is_some() {
+            // This is a grant proposal, check COI for each grantee
+            let grant_configs = proposal.grant_payload.as_ref().unwrap();
+            for config in grant_configs.iter() {
+                // Check if voter is the grantee
+                if voter == config.recipient {
+                    return Err(GovernanceError::VoterHasConflictOfInterest);
+                }
+                
+                // Check if voter is in linked addresses
+                for linked_addr in config.linked_addresses.iter() {
+                    if voter == *linked_addr {
+                        return Err(GovernanceError::VoterHasConflictOfInterest);
+                    }
+                }
+            }
         }
 
         let voting_power = Self::calculate_voting_power(&env, &voter)?;
