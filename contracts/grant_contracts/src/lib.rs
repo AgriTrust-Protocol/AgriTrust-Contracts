@@ -31,6 +31,10 @@ const MIN_VOTING_PARTICIPATION: u32 = 1000; // 10% minimum participation (in bas
 const SLASHING_APPROVAL_THRESHOLD: u32 = 6600; // 66% approval required (in basis points)
 const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 
+// Pause Cooldown Period constants
+const PAUSE_COOLDOWN_PERIOD: u64 = 14 * 24 * 60 * 60; // 14 days in seconds
+const SUPER_MAJORITY_THRESHOLD: u32 = 7500; // 75% super-majority threshold (in basis points)
+
 // Milestone System constants
 const CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days challenge period
 const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason length
@@ -56,6 +60,8 @@ mod test_sub_dao_authority;
 mod test_coi_voting_exclusion;
 #[cfg(test)]
 mod test_optimistic_milestones;
+#[cfg(test)]
+mod test_pause_cooldown;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
@@ -220,6 +226,10 @@ pub struct Grant {
             total_milestones: config.total_milestones,
             claimed_milestones: 0,
             available_milestone_funds: 0, // Will be calculated based on milestone_amount
+            
+            // Pause cooldown fields
+            last_resume_timestamp: None,
+            pause_count: 0,
         };
 
         // Store the grant
@@ -333,6 +343,10 @@ pub struct Grant {
     pub total_milestones: u32,     // Total number of milestones
     pub claimed_milestones: u32,    // Number of milestones claimed so far
     pub available_milestone_funds: i128, // Funds available for milestone claims
+    
+    // Pause cooldown fields
+    pub last_resume_timestamp: Option<u64>, // Timestamp when grant was last resumed
+    pub pause_count: u32, // Number of times this grant has been paused
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +533,7 @@ enum DataKey {
     VotingPower(Address), // Maps voter address to their voting power
     ProposalVotes(u64, Address), // Maps proposal_id + voter to their vote
     NextProposalId, // Next available proposal ID
+    TotalVotingPower, // Total voting power in the system
     MaxFlowRate(u64),
     PriorityMultipliers,
     PlatformFeeBps,
@@ -600,8 +615,11 @@ pub enum Error {
     ChallengeNotActive = 52,
     InvalidChallengeStatus = 53,
     InsufficientMilestoneFunds = 54,
-    MilestoneNotClaimed = 55,
-    MilestoneAlreadyChallenged = 56,
+    MilestoneNotClaimed = 56,
+    MilestoneAlreadyChallenged = 57,
+    // Pause cooldown errors
+    PauseCooldownActive = 58,
+    InsufficientSuperMajority = 59,
 }
 
 // --- Internal Helpers ---
@@ -829,6 +847,19 @@ fn read_voting_power(env: &Env, voter: &Address) -> i128 {
 
 fn write_voting_power(env: &Env, voter: &Address, power: i128) {
     env.storage().instance().set(&DataKey::VotingPower(voter.clone()), &power);
+}
+
+fn get_total_voting_power(env: &Env) -> Result<i128, Error> {
+    // In a real implementation, this would sum up all voting power from all eligible voters
+    // For now, we'll return a placeholder value or read from a stored total
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalVotingPower)
+        .ok_or(Error::NotInitialized)
+}
+
+fn set_total_voting_power(env: &Env, total_power: i128) {
+    env.storage().instance().set(&DataKey::TotalVotingPower, &total_power);
 }
 
 fn read_vote(env: &Env, proposal_id: u64, voter: &Address) -> Option<bool> {
@@ -1252,6 +1283,10 @@ impl GrantContract {
             stream_type: StreamType::TimeLockedLease,
             start_time: now,
             warmup_duration,
+            
+            // Pause cooldown fields
+            last_resume_timestamp: None,
+            pause_count: 0,
 
         };
 
@@ -1414,6 +1449,10 @@ impl GrantContract {
                 validator: config.validator.clone(),
                 validator_withdrawn: 0,
                 validator_claimable: 0,
+                
+                // Pause cooldown fields
+                last_resume_timestamp: None,
+                pause_count: 0,
             };
 
             // Store the grant
@@ -1611,25 +1650,52 @@ impl GrantContract {
         Ok(())
     }
 
-    pub fn pause_stream(env: Env, caller: Address, grant_id: u64, reason: String) -> Result<u64, Error> {
+    pub fn pause_stream(env: Env, caller: Address, grant_id: u64, reason: String, is_emergency: bool, voting_power: Option<i128>) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
         if grant.status != GrantStatus::Active { return Err(Error::InvalidState); }
         
+        // Check cooldown period unless it's an emergency pause with super-majority
+        if let Some(resume_timestamp) = grant.last_resume_timestamp {
+            let current_time = env.ledger().timestamp();
+            let cooldown_end = resume_timestamp + PAUSE_COOLDOWN_PERIOD;
+            
+            if current_time < cooldown_end {
+                // Still in cooldown period, check if this is an emergency pause with super-majority
+                if !is_emergency {
+                    return Err(Error::PauseCooldownActive);
+                }
+                
+                // For emergency pause, verify super-majority voting power
+                if let Some(votes) = voting_power {
+                    let total_voting_power = get_total_voting_power(&env)?;
+                    let approval_percentage = (votes * 10000) / total_voting_power;
+                    
+                    if approval_percentage < SUPER_MAJORITY_THRESHOLD {
+                        return Err(Error::InsufficientSuperMajority);
+                    }
+                } else {
+                    return Err(Error::InsufficientSuperMajority);
+                }
+            }
+        }
+        
         settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         grant.status = GrantStatus::Paused;
+        grant.pause_count += 1;
         write_grant(&env, grant_id, &grant);
-        Ok(())
+        
         // Check authorization: either admin or authorized Sub-DAO
         let action_id = if require_admin_auth(&env).is_ok() {
             // Admin authorized - proceed directly
             settle_grant(&mut grant, env.ledger().timestamp())?;
             grant.status = GrantStatus::Paused;
+            grant.pause_count += 1;
             write_grant(&env, grant_id, &grant);
             
             // Log admin action
             env.events().publish(
                 (symbol_short!("admin_pause"),),
-                (grant_id, caller, reason),
+                (grant_id, caller, reason, is_emergency, grant.pause_count),
             );
             0 // Admin actions don't need Sub-DAO tracking
         } else {
@@ -1642,6 +1708,7 @@ impl GrantContract {
             
             settle_grant(&mut grant, env.ledger().timestamp())?;
             grant.status = GrantStatus::Paused;
+            grant.pause_count += 1;
             write_grant(&env, grant_id, &grant);
             
             // Generate action ID for tracking
@@ -1650,7 +1717,7 @@ impl GrantContract {
             // Emit delegated pause event
             env.events().publish(
                 (symbol_short!("delegated_pause"),),
-                (caller, grant_id, action_id, reason),
+                (caller, grant_id, action_id, reason, is_emergency, grant.pause_count),
             );
             
             action_id
@@ -1671,19 +1738,21 @@ impl GrantContract {
 
         grant.status = GrantStatus::Active;
         grant.last_update_ts = env.ledger().timestamp();
+        grant.last_resume_timestamp = Some(env.ledger().timestamp()); // Set resume timestamp for cooldown
         write_grant(&env, grant_id, &grant);
-        Ok(())
+        
         // Check authorization: either admin or authorized Sub-DAO
         let action_id = if require_admin_auth(&env).is_ok() {
             // Admin authorized - proceed directly
             grant.status = GrantStatus::Active;
             grant.last_update_ts = env.ledger().timestamp();
+            grant.last_resume_timestamp = Some(env.ledger().timestamp());
             write_grant(&env, grant_id, &grant);
             
             // Log admin action
             env.events().publish(
                 (symbol_short!("admin_resume"),),
-                (grant_id, caller, reason),
+                (grant_id, caller, reason, grant.pause_count),
             );
             0 // Admin actions don't need Sub-DAO tracking
         } else {
@@ -1695,6 +1764,7 @@ impl GrantContract {
             
             grant.status = GrantStatus::Active;
             grant.last_update_ts = env.ledger().timestamp();
+            grant.last_resume_timestamp = Some(env.ledger().timestamp());
             write_grant(&env, grant_id, &grant);
             
             // Generate action ID for tracking
@@ -1703,12 +1773,12 @@ impl GrantContract {
             // Emit delegated resume event
             env.events().publish(
                 (symbol_short!("delegated_resume"),),
-                (caller, grant_id, action_id, reason),
+                (caller, grant_id, action_id, reason, grant.pause_count),
             );
             
             action_id
         };
-
+        
         Ok(action_id)
     }
 
