@@ -21,6 +21,12 @@ const MAX_STAKE_PERCENTAGE: i128 = 5000; // 50% maximum stake (in basis points)
 const MIN_SECURITY_DEPOSIT_PERCENTAGE: i128 = 500; // 5% minimum security deposit
 const MAX_SECURITY_DEPOSIT_PERCENTAGE: i128 = 2000; // 20% maximum security deposit
 
+// Proposal Staking Fee constants
+const PROPOSAL_STAKE_AMOUNT: i128 = 100_000_000; // 10 XLM staking fee (in stroops)
+const PROPOSAL_STAKE_TOKEN: &str = "native"; // Use native XLM for staking
+const LANDSLIDE_REJECTION_THRESHOLD: u32 = 7500; // 75% rejection threshold for burning stake
+const MIN_VOTING_PARTICIPATION_FOR_STAKE_BURN: u32 = 5000; // 50% minimum participation for stake burn
+
 // Financial Snapshot constants
 const SNAPSHOT_VERSION: u32 = 1; // Version for future compatibility
 const SNAPSHOT_EXPIRY: u64 = 86400; // 24 hours in seconds
@@ -469,6 +475,29 @@ pub struct MilestoneChallenge {
     pub resolution: Option<String>,
 }
 
+// --- Proposal Staking Escrow Types ---
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ProposalStake {
+    pub grant_id: u64,
+    pub staker: Address,
+    pub amount: i128,
+    pub token_address: Address,
+    pub deposited_at: u64,
+    pub status: StakeStatus,
+    pub burn_reason: Option<String>, // Reason for stake burning if applicable
+    pub returned_at: Option<u64>,   // When stake was returned
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum StakeStatus {
+    Deposited,    // Stake deposited, proposal under consideration
+    Returned,     // Stake returned to staker (proposal approved)
+    Burned,       // Stake burned (proposal rejected by landslide)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum ChallengeStatus {
@@ -551,6 +580,10 @@ enum DataKey {
     GrantMilestones(u64), // Maps grant_id to list of milestone claim IDs
     NextMilestoneClaimId, // Next available milestone claim ID
     NextChallengeId, // Next available challenge ID
+    // Proposal Staking Escrow keys
+    ProposalStake(u64), // Maps grant_id to staking escrow details
+    StakeEscrowBalance, // Total balance of all staked proposals
+    BurnedStakes, // Track total burned stakes for transparency
 }
 
 #[contracterror]
@@ -597,32 +630,39 @@ pub enum Error {
     NoStakeToSlash = 34,
     SlashingAlreadyExecuted = 35,
     InvalidReasonLength = 36,
+    // Proposal Staking Escrow errors
+    InsufficientStake = 37,
+    StakeAlreadyDeposited = 38,
+    StakeNotDeposited = 39,
+    StakeAlreadyReturned = 40,
+    StakeAlreadyBurned = 41,
+    InvalidStakeAmount = 42,
     // Sub-DAO Authority errors
-    SubDaoActionNotAllowed = 37,
-    SubDaoPermissionRevoked = 38,
-    SubDaoActionVetoed = 39,
-    SubDaoContractNotSet = 40,
+    SubDaoActionNotAllowed = 43,
+    SubDaoPermissionRevoked = 44,
+    SubDaoActionVetoed = 45,
+    SubDaoContractNotSet = 46,
     // COI (Conflict of Interest) errors
-    VoterHasConflictOfInterest = 41,
-    LinkedAddressAlreadyExists = 42,
-    LinkedAddressNotFound = 43,
-    CannotVoteOnOwnGrant = 44,
-    ExcludedFromVoting = 45,
+    VoterHasConflictOfInterest = 47,
+    LinkedAddressAlreadyExists = 48,
+    LinkedAddressNotFound = 49,
+    CannotVoteOnOwnGrant = 50,
+    ExcludedFromVoting = 51,
     // Milestone system errors
-    MilestoneNotFound = 46,
-    MilestoneAlreadyClaimed = 47,
-    InvalidMilestoneNumber = 48,
-    ChallengeNotFound = 49,
-    ChallengeAlreadyExists = 50,
-    ChallengePeriodExpired = 51,
-    ChallengeNotActive = 52,
-    InvalidChallengeStatus = 53,
-    InsufficientMilestoneFunds = 54,
-    MilestoneNotClaimed = 56,
-    MilestoneAlreadyChallenged = 57,
+    MilestoneNotFound = 52,
+    MilestoneAlreadyClaimed = 53,
+    InvalidMilestoneNumber = 54,
+    ChallengeNotFound = 55,
+    ChallengeAlreadyExists = 56,
+    ChallengePeriodExpired = 57,
+    ChallengeNotActive = 58,
+    InvalidChallengeStatus = 59,
+    InsufficientMilestoneFunds = 60,
+    MilestoneNotClaimed = 61,
+    MilestoneAlreadyChallenged = 62,
     // Pause cooldown errors
-    PauseCooldownActive = 58,
-    InsufficientSuperMajority = 59,
+    PauseCooldownActive = 63,
+    InsufficientSuperMajority = 64,
 }
 
 // --- Internal Helpers ---
@@ -633,6 +673,14 @@ fn read_admin(env: &Env) -> Result<Address, Error> {
 
 fn read_oracle(env: &Env) -> Result<Address, Error> {
     env.storage().instance().get(&DataKey::Oracle).ok_or(Error::NotInitialized)
+}
+
+fn read_treasury(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::Treasury).ok_or(Error::NotInitialized)
+}
+
+fn read_grant_token(env: &Env) -> Result<Address, Error> {
+    env.storage().instance().get(&DataKey::GrantToken).ok_or(Error::NotInitialized)
 }
 
 fn require_admin_auth(env: &Env) -> Result<(), Error> {
@@ -960,11 +1008,51 @@ fn read_grant_milestones(env: &Env, grant_id: u64) -> Vec<u64> {
     env.storage()
         .instance()
         .get(&DataKey::GrantMilestones(grant_id))
-        .unwrap_or(vec![&env])
+        .unwrap_or(Vec::new())
 }
 
-fn write_grant_milestones(env: &Env, grant_id: u64, claim_ids: &Vec<u64>) {
-    env.storage().instance().set(&DataKey::GrantMilestones(grant_id), claim_ids);
+fn write_grant_milestones(env: &Env, grant_id: u64, milestones: &Vec<u64>) {
+    env.storage().instance().set(&DataKey::GrantMilestones(grant_id), milestones);
+}
+
+// --- Proposal Staking Escrow Helper Functions ---
+
+fn read_proposal_stake(env: &Env, grant_id: u64) -> Result<ProposalStake, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ProposalStake(grant_id))
+        .ok_or(Error::StakeNotDeposited)
+}
+
+fn write_proposal_stake(env: &Env, grant_id: u64, stake: &ProposalStake) {
+    env.storage().instance().set(&DataKey::ProposalStake(grant_id), stake);
+}
+
+fn read_stake_escrow_balance(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StakeEscrowBalance)
+        .unwrap_or(0)
+}
+
+fn write_stake_escrow_balance(env: &Env, balance: i128) {
+    env.storage().instance().set(&DataKey::StakeEscrowBalance, &balance);
+}
+
+fn read_burned_stakes(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::BurnedStakes)
+        .unwrap_or(0)
+}
+
+fn write_burned_stakes(env: &Env, burned_amount: i128) {
+    env.storage().instance().set(&DataKey::BurnedStakes, &burned_amount);
+}
+
+fn get_stake_token_address(env: &Env) -> Address {
+    // For now, use native token. In the future, this could be configurable
+    env.token_contract_address()
 }
 
 fn validate_milestone_number(grant: &Grant, milestone_number: u32) -> Result<(), Error> {
@@ -3323,6 +3411,180 @@ pub mod grant {
         let _grant = read_grant(&env, grant_id)?; // Verify grant exists
         Ok(read_grant_milestones(&env, grant_id))
     }
+
+    // --- Proposal Staking Escrow Functions ---
+
+    /// Deposit stake for grant proposal submission
+    /// This function must be called before creating a grant proposal
+    pub fn deposit_proposal_stake(env: Env, grant_id: u64, staker: Address, amount: i128) -> Result<(), Error> {
+        staker.require_auth();
+
+        // Check if stake already exists for this grant
+        if env.storage().instance().has(&DataKey::ProposalStake(grant_id)) {
+            return Err(Error::StakeAlreadyDeposited);
+        }
+
+        // Validate stake amount
+        if amount != PROPOSAL_STAKE_AMOUNT {
+            return Err(Error::InvalidStakeAmount);
+        }
+
+        // Get stake token address
+        let stake_token = get_stake_token_address(&env);
+
+        // Transfer stake from staker to contract
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&staker, &env.current_contract_address(), &amount);
+
+        // Create stake record
+        let now = env.ledger().timestamp();
+        let stake = ProposalStake {
+            grant_id,
+            staker: staker.clone(),
+            amount,
+            token_address: stake_token,
+            deposited_at: now,
+            status: StakeStatus::Deposited,
+            burn_reason: None,
+            returned_at: None,
+        };
+
+        // Store stake
+        write_proposal_stake(&env, grant_id, &stake);
+
+        // Update escrow balance
+        let current_balance = read_stake_escrow_balance(&env);
+        write_stake_escrow_balance(&env, current_balance + amount);
+
+        // Publish stake deposit event
+        env.events().publish(
+            (Symbol::new(&env, "proposal_stake_deposited"), grant_id),
+            (staker, amount, now),
+        );
+
+        Ok(())
+    }
+
+    /// Return stake to staker when proposal is approved
+    /// This function should be called when a grant proposal passes voting
+    pub fn return_proposal_stake(env: Env, admin: Address, grant_id: u64) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let mut stake = read_proposal_stake(&env, grant_id)?;
+
+        // Check if stake can be returned
+        if stake.status != StakeStatus::Deposited {
+            return Err(Error::StakeAlreadyReturned);
+        }
+
+        // Transfer stake back to staker
+        let token_client = token::Client::new(&env, &stake.token_address);
+        token_client.transfer(&env.current_contract_address(), &stake.staker, &stake.amount);
+
+        // Update stake status
+        stake.status = StakeStatus::Returned;
+        stake.returned_at = Some(env.ledger().timestamp());
+        write_proposal_stake(&env, grant_id, &stake);
+
+        // Update escrow balance
+        let current_balance = read_stake_escrow_balance(&env);
+        write_stake_escrow_balance(&env, current_balance - stake.amount);
+
+        // Publish stake return event
+        env.events().publish(
+            (Symbol::new(&env, "proposal_stake_returned"), grant_id),
+            (stake.staker, stake.amount, env.ledger().timestamp()),
+        );
+
+        Ok(())
+    }
+
+    /// Burn stake when proposal is rejected by landslide
+    /// This function should be called when a grant proposal is rejected with supermajority
+    pub fn burn_proposal_stake(env: Env, admin: Address, grant_id: u64, reason: String) -> Result<(), Error> {
+        require_admin_auth(&env)?;
+
+        let mut stake = read_proposal_stake(&env, grant_id)?;
+
+        // Check if stake can be burned
+        if stake.status != StakeStatus::Deposited {
+            return Err(Error::StakeAlreadyBurned);
+        }
+
+        // Update stake status
+        stake.status = StakeStatus::Burned;
+        stake.burn_reason = Some(reason.clone());
+        write_proposal_stake(&env, grant_id, &stake);
+
+        // Update escrow balance (stake is burned, not returned)
+        let current_balance = read_stake_escrow_balance(&env);
+        write_stake_escrow_balance(&env, current_balance - stake.amount);
+
+        // Update burned stakes total for transparency
+        let current_burned = read_burned_stakes(&env);
+        write_burned_stakes(&env, current_burned + stake.amount);
+
+        // Transfer burned stake to DAO treasury (as compensation)
+        let treasury = read_treasury(&env)?;
+        let token_client = token::Client::new(&env, &stake.token_address);
+        token_client.transfer(&env.current_contract_address(), &treasury, &stake.amount);
+
+        // Publish stake burn event
+        env.events().publish(
+            (Symbol::new(&env, "proposal_stake_burned"), grant_id),
+            (stake.staker, stake.amount, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Check if a grant has a valid stake deposit
+    pub fn has_valid_stake(env: Env, grant_id: u64) -> bool {
+        if let Ok(stake) = read_proposal_stake(&env, grant_id) {
+            stake.status == StakeStatus::Deposited
+        } else {
+            false
+        }
+    }
+
+    /// Get proposal stake details
+    pub fn get_proposal_stake(env: Env, grant_id: u64) -> Result<ProposalStake, Error> {
+        read_proposal_stake(&env, grant_id)
+    }
+
+    /// Get total escrow balance
+    pub fn get_stake_escrow_balance(env: Env) -> i128 {
+        read_stake_escrow_balance(&env)
+    }
+
+    /// Get total burned stakes for transparency
+    pub fn get_burned_stakes_total(env: Env) -> i128 {
+        read_burned_stakes(&env)
+    }
+
+    /// Check if proposal should have stake burned based on voting results
+    /// Returns true if stake should be burned (landslide rejection)
+    pub fn should_burn_stake(votes_for: i128, votes_against: i128, total_voting_power: i128) -> bool {
+        if total_voting_power == 0 {
+            return false;
+        }
+
+        // Check minimum participation (50%)
+        let votes_cast = votes_for + votes_against;
+        let participation_met = (votes_cast * 10000) / total_voting_power >= MIN_VOTING_PARTICIPATION_FOR_STAKE_BURN;
+        
+        if !participation_met {
+            return false;
+        }
+
+        // Check landslide rejection threshold (75% against)
+        if votes_cast == 0 {
+            return false;
+        }
+        
+        let rejection_percentage = (votes_against * 10000) / votes_cast;
+        rejection_percentage >= LANDSLIDE_REJECTION_THRESHOLD
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -3353,3 +3615,5 @@ mod test_inflation;
 mod test_yield;
 #[cfg(test)]
 mod test_fee;
+#[cfg(test)]
+mod test_proposal_staking;
