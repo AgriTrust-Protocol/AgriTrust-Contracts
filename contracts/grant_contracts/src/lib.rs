@@ -245,6 +245,10 @@ pub struct Grant {
         env.storage().instance().set(&key, &grant);
         grant_ids.push_back(current_grant_id);
 
+        // Add grant to registry for landlord tracking
+        let grant_hash = generate_grant_hash(&env, current_grant_id);
+        add_grant_to_registry(&env, &config.recipient, grant_hash);
+
         // Update recipient grants index
         let recipient_key = DataKey::RecipientGrants(config.recipient.clone());
         let mut user_grants: Vec<u64> = env.storage()
@@ -401,6 +405,18 @@ pub struct FinancialSnapshot {
     pub version: u32,            // Snapshot version for compatibility
     pub contract_signature: [u8; 64], // Contract's cryptographic signature
     pub hash: [u8; 32],        // SHA-256 hash of snapshot data
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GrantRegistryStats {
+    pub total_grants: u32,           // Total number of grants
+    pub active_grants: u32,          // Number of active grants
+    pub completed_grants: u32,       // Number of completed grants
+    pub paused_grants: u32,          // Number of paused grants
+    pub cancelled_grants: u32,       // Number of cancelled grants
+    pub total_amount_locked: i128,    // Total amount locked in all grants
+    pub last_updated: u64,            // When stats were last updated
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -584,6 +600,8 @@ enum DataKey {
     ProposalStake(u64), // Maps grant_id to staking escrow details
     StakeEscrowBalance, // Total balance of all staked proposals
     BurnedStakes, // Track total burned stakes for transparency
+    // Grant Registry keys for on-chain indexing
+    GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
 }
 
 #[contracterror]
@@ -976,6 +994,41 @@ fn read_next_challenge_id(env: &Env) -> u64 {
         .instance()
         .get(&DataKey::NextChallengeId)
         .unwrap_or(1)
+}
+
+// --- Grant Registry Helper Functions ---
+
+fn read_grant_registry(env: &Env, landlord: &Address) -> Vec<[u8; 32]> {
+    env.storage()
+        .instance()
+        .get(&DataKey::GrantRegistry(landlord.clone()))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn write_grant_registry(env: &Env, landlord: &Address, grant_hashes: &Vec<[u8; 32]>) {
+    env.storage().instance().set(&DataKey::GrantRegistry(landlord.clone()), grant_hashes);
+}
+
+fn add_grant_to_registry(env: &Env, landlord: &Address, grant_hash: [u8; 32]) {
+    let mut grant_hashes = read_grant_registry(env, landlord);
+    grant_hashes.push_back(grant_hash);
+    write_grant_registry(env, landlord, &grant_hashes);
+}
+
+fn generate_grant_hash(env: &Env, grant_id: u64) -> [u8; 32] {
+    // Generate a deterministic hash for the grant contract
+    // In production, this would use SHA-256 of grant data and contract address
+    let mut hash = [0u8; 32];
+    
+    let contract_address = env.current_contract_address();
+    let combined = format!("{}:{}", grant_id, contract_address);
+    
+    // Simple hash implementation for demonstration
+    for i in 0..32.min(combined.len()) {
+        hash[i] = combined.as_bytes()[i];
+    }
+    
+    hash
 }
 
 fn write_next_challenge_id(env: &Env, challenge_id: u64) {
@@ -3584,6 +3637,81 @@ pub mod grant {
         
         let rejection_percentage = (votes_against * 10000) / votes_cast;
         rejection_percentage >= LANDSLIDE_REJECTION_THRESHOLD
+    }
+
+    /// List all grants by landlord (lessor) - On-Chain Grant Registry Index
+    /// 
+    /// This function allows Meta-DAOs and Ecosystem Dashboards to dynamically pull
+    /// and display all funding activity on the network without relying on a centralized
+    /// off-chain database. Returns an array of contract hashes for all grants associated
+    /// with the given landlord address.
+    /// 
+    /// # Arguments
+    /// * `landlord` - The address of the landlord (lessor) to query grants for
+    /// 
+    /// # Returns
+    /// * `Vec<[u8; 32]>` - Array of contract hashes for all grants by this landlord
+    pub fn list_grants_by_landlord(env: Env, landlord: Address) -> Vec<[u8; 32]> {
+        read_grant_registry(&env, &landlord)
+    }
+
+    /// Get comprehensive grant registry statistics
+    /// 
+    /// Returns detailed statistics about the grant registry including total counts
+    /// and breakdown by status for ecosystem dashboards.
+    /// 
+    /// # Arguments
+    /// * `landlord` - Optional landlord address to filter stats (None for global stats)
+    /// 
+    /// # Returns
+    /// * `GrantRegistryStats` - Comprehensive registry statistics
+    pub fn get_grant_registry_stats(env: Env, landlord: Option<Address>) -> GrantRegistryStats {
+        let grant_ids = if let Some(landlord_addr) = landlord {
+            // For landlord-specific stats, we need to scan all grants and filter by landlord
+            let all_grant_ids = read_grant_ids(&env);
+            let mut landlord_grants = Vec::new(&env);
+            
+            for grant_id in all_grant_ids.iter() {
+                if let Ok(grant) = read_grant(&env, grant_id) {
+                    if grant.lessor == landlord_addr {
+                        landlord_grants.push_back(grant_id);
+                    }
+                }
+            }
+            landlord_grants
+        } else {
+            // Get all grants
+            read_grant_ids(&env)
+        };
+
+        let mut active_count = 0u32;
+        let mut completed_count = 0u32;
+        let mut paused_count = 0u32;
+        let mut cancelled_count = 0u32;
+        let mut total_amount = 0i128;
+
+        for grant_id in grant_ids.iter() {
+            if let Ok(grant) = read_grant(&env, grant_id) {
+                match grant.status {
+                    GrantStatus::Active => active_count += 1,
+                    GrantStatus::Completed => completed_count += 1,
+                    GrantStatus::Paused => paused_count += 1,
+                    GrantStatus::Cancelled => cancelled_count += 1,
+                    _ => {}
+                }
+                total_amount += grant.total_amount;
+            }
+        }
+
+        GrantRegistryStats {
+            total_grants: grant_ids.len() as u32,
+            active_grants: active_count,
+            completed_grants: completed_count,
+            paused_grants: paused_count,
+            cancelled_grants: cancelled_count,
+            total_amount_locked: total_amount,
+            last_updated: env.ledger().timestamp(),
+        }
     }
 }
 
