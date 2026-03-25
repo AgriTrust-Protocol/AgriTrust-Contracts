@@ -48,6 +48,7 @@ const MAX_EVIDENCE_LENGTH: u32 = 2000; // Maximum evidence string length
 pub mod atomic_bridge;
 pub mod governance;
 pub mod sub_dao_authority;
+pub mod grant_appeals;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -62,6 +63,8 @@ mod test_coi_voting_exclusion;
 mod test_optimistic_milestones;
 #[cfg(test)]
 mod test_pause_cooldown;
+#[cfg(test)]
+mod test_grant_appeals;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
