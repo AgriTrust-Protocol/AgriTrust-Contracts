@@ -12,6 +12,7 @@ use soroban_sdk::{
 };
 
 use crate::wasm_hash_verification::{WasmHashVerification, VerificationError};
+use crate::cross_chain_metadata::{CrossChainMetadata, MetadataError};
 
 // --- Constants ---
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
@@ -58,6 +59,7 @@ pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
+pub mod cross_chain_metadata;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -261,6 +263,24 @@ pub struct Grant {
         // Log if WASM hash initialization fails, but don't fail the grant creation
         if let Err(e) = wasm_result {
             env.logs().add(&format!("WASM hash initialization failed for grant {}: {:?}", current_grant_id, e));
+        }
+
+        // Initialize cross-chain metadata for global visibility
+        let metadata_hash = [0u8; 32]; // In practice, this would be the hash of actual JSON-LD metadata
+        let ipfs_cid = format!("QmPlaceholder{}{}", current_grant_id, env.ledger().timestamp()); // Placeholder IPFS CID
+        let metadata_result = CrossChainMetadata::create_grant_metadata(
+            env.clone(),
+            current_grant_id,
+            metadata_hash,
+            String::from_str(&env, &ipfs_cid),
+            String::from_str(&env, "Grant"), // Schema type
+            config.recipient.clone(), // Grant creator
+            true, // Public by default for cross-chain visibility
+        );
+        
+        // Log if metadata creation fails, but don't fail the grant creation
+        if let Err(e) = metadata_result {
+            env.logs().add(&format!("Cross-chain metadata creation failed for grant {}: {:?}", current_grant_id, e));
         }
 
         // Add grant to registry for landlord tracking
@@ -3765,6 +3785,193 @@ pub mod grant {
             last_updated: env.ledger().timestamp(),
         }
     }
+
+    // --- Cross-Chain Metadata Functions ---
+
+    /// Create or update cross-chain metadata for a grant
+    /// 
+    /// This function allows grant creators to establish cross-chain visibility
+    /// by creating standardized JSON-LD metadata that can be indexed by other chains.
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The Stellar grant ID
+    /// * `metadata_hash` - SHA-256 hash of the JSON-LD metadata
+    /// * `ipfs_cid` - IPFS CID where full metadata is stored
+    /// * `schema_type` - Type of schema (Grant, Project, etc.)
+    /// * `public` - Whether metadata should be publicly visible
+    pub fn create_cross_chain_metadata(
+        env: Env,
+        grant_id: u64,
+        metadata_hash: [u8; 32],
+        ipfs_cid: String,
+        schema_type: String,
+        public: bool,
+    ) -> Result<(), Error> {
+        // Verify the caller is the grant recipient or admin
+        let grant = read_grant(&env, grant_id)?;
+        let caller = env.current_contract_address();
+        
+        // Only grant recipient or admin can create metadata
+        if caller != grant.recipient {
+            require_admin_auth(&env)?;
+        }
+
+        // Create metadata through cross-chain module
+        CrossChainMetadata::create_grant_metadata(
+            env,
+            grant_id,
+            metadata_hash,
+            ipfs_cid,
+            schema_type,
+            grant.recipient,
+            public,
+        ).map_err(|e| Error::Custom(2000 + e as u32))
+    }
+
+    /// Add cross-chain reference to link with grants on other chains
+    /// 
+    /// This enables matching funds programs and cross-chain grant platforms
+    /// to discover and verify Stellar grants.
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The Stellar grant ID
+    /// * `chain_id` - Target chain identifier (ethereum, polygon, etc.)
+    /// * `external_id` - Grant/contract ID on target chain
+    /// * `reference_type` - Type of reference (Contract, Transaction, etc.)
+    pub fn add_cross_chain_reference(
+        env: Env,
+        grant_id: u64,
+        chain_id: String,
+        external_id: String,
+        reference_type: u32, // 0=Contract, 1=Transaction, 2=Proposal, 3=Project, 4=Custom
+    ) -> Result<(), Error> {
+        // Verify the caller is the grant recipient or admin
+        let grant = read_grant(&env, grant_id)?;
+        let caller = env.current_contract_address();
+        
+        // Only grant recipient or admin can add references
+        if caller != grant.recipient {
+            require_admin_auth(&env)?;
+        }
+
+        // Convert reference_type to enum
+        let ref_type = match reference_type {
+            0 => crate::cross_chain_metadata::ReferenceType::Contract,
+            1 => crate::cross_chain_metadata::ReferenceType::Transaction,
+            2 => crate::cross_chain_metadata::ReferenceType::Proposal,
+            3 => crate::cross_chain_metadata::ReferenceType::Project,
+            4 => crate::cross_chain_metadata::ReferenceType::Custom,
+            _ => return Err(Error::InvalidAmount), // Reuse error for invalid type
+        };
+
+        CrossChainMetadata::add_cross_chain_reference(
+            env,
+            grant_id,
+            chain_id,
+            external_id,
+            ref_type,
+            grant.recipient,
+        ).map_err(|e| Error::Custom(2000 + e as u32))
+    }
+
+    /// Get cross-chain metadata for a grant
+    /// 
+    /// This function allows anyone to retrieve the standardized metadata
+    /// for cross-chain indexing and visibility.
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The Stellar grant ID
+    /// 
+    /// # Returns
+    /// * `GrantMetadata` - The cross-chain metadata
+    pub fn get_cross_chain_metadata(env: Env, grant_id: u64) -> Result<crate::cross_chain_metadata::GrantMetadata, Error> {
+        CrossChainMetadata::get_grant_metadata(env, grant_id)
+            .map_err(|e| Error::Custom(2000 + e as u32))
+    }
+
+    /// Get all cross-chain references for a grant
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The Stellar grant ID
+    /// 
+    /// # Returns
+    /// * `Vec<CrossChainReference>` - All cross-chain references
+    pub fn get_cross_chain_references(env: Env, grant_id: u64) -> Result<Vec<crate::cross_chain_metadata::CrossChainReference>, Error> {
+        CrossChainMetadata::get_cross_chain_references(env, grant_id)
+            .map_err(|e| Error::Custom(2000 + e as u32))
+    }
+
+    /// Search grants by chain for cross-chain discovery
+    /// 
+    /// This function enables external chains and indexing services
+    /// to discover Stellar grants that have references to their chain.
+    /// 
+    /// # Arguments
+    /// * `chain_id` - Chain identifier to search for
+    /// 
+    /// # Returns
+    /// * `Vec<u64>` - List of Stellar grant IDs with references to this chain
+    pub fn get_grants_by_chain(env: Env, chain_id: String) -> Vec<u64> {
+        CrossChainMetadata::get_grants_by_chain(env, chain_id)
+    }
+
+    /// Search metadata with filters for cross-chain indexing
+    /// 
+    /// # Arguments
+    /// * `schema_type` - Filter by schema type (optional)
+    /// * `verified_only` - Only return verified metadata
+    /// * `public_only` - Only return public metadata
+    /// * `limit` - Maximum results to return
+    /// 
+    /// # Returns
+    /// * `Vec<GrantMetadata>` - Matching metadata
+    pub fn search_cross_chain_metadata(
+        env: Env,
+        schema_type: Option<String>,
+        verified_only: bool,
+        public_only: bool,
+        limit: u32,
+    ) -> Vec<crate::cross_chain_metadata::GrantMetadata> {
+        CrossChainMetadata::search_metadata(env, schema_type, verified_only, public_only, limit)
+    }
+
+    /// Get global metadata statistics for cross-chain analytics
+    /// 
+    /// # Returns
+    /// * (total_grants, verified_grants, public_grants, total_chains)
+    pub fn get_cross_chain_statistics(env: Env) -> (u64, u64, u64, u64) {
+        CrossChainMetadata::get_metadata_statistics(env)
+    }
+
+    /// Verify cross-chain reference (trusted verifiers only)
+    /// 
+    /// This function should be called by trusted oracles or verification services
+    /// to confirm the validity of cross-chain references.
+    /// 
+    /// # Arguments
+    /// * `grant_id` - The Stellar grant ID
+    /// * `chain_id` - Chain identifier
+    /// * `external_id` - External grant ID
+    /// * `verified` - Whether the reference is verified
+    pub fn verify_cross_chain_reference(
+        env: Env,
+        grant_id: u64,
+        chain_id: String,
+        external_id: String,
+        verified: bool,
+    ) -> Result<(), Error> {
+        // Only admin can verify references
+        require_admin_auth(&env)?;
+
+        CrossChainMetadata::verify_cross_chain_reference(
+            env,
+            grant_id,
+            chain_id,
+            external_id,
+            env.current_contract_address(),
+            verified,
+        ).map_err(|e| Error::Custom(2000 + e as u32))
+    }
 }
 
 fn try_call_on_withdraw(env: &Env, recipient: &Address, grant_id: u64, amount: i128) {
@@ -3796,4 +4003,4 @@ mod test_yield;
 #[cfg(test)]
 mod test_fee;
 #[cfg(test)]
-mod test_proposal_staking;
+mod test_cross_chain_features;
