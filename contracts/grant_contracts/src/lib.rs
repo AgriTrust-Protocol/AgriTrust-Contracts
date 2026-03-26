@@ -11,6 +11,8 @@ use soroban_sdk::{
     Symbol, vec, IntoVal, Map,
 };
 
+use crate::wasm_hash_verification::{WasmHashVerification, VerificationError};
+
 // --- Constants ---
 pub const SCALING_FACTOR: i128 = 10_000_000; // 1e7
 const RATE_INCREASE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
@@ -55,6 +57,7 @@ pub mod atomic_bridge;
 pub mod governance;
 pub mod sub_dao_authority;
 pub mod grant_appeals;
+pub mod wasm_hash_verification;
 
 // --- Test Modules ---
 #[cfg(test)]
@@ -244,6 +247,21 @@ pub struct Grant {
         // Store the grant
         env.storage().instance().set(&key, &grant);
         grant_ids.push_back(current_grant_id);
+
+        // Initialize WASM hash verification for this grant
+        let current_wasm_hash = env.current_contract_address().contract_id(); // Get current contract's WASM hash
+        let wasm_result = WasmHashVerification::initialize_grant_wasm_hash(
+            env.clone(),
+            current_grant_id,
+            current_wasm_hash,
+            String::from_str(&env, "v1.0.0"), // Initial version
+            env.current_contract_address(), // Use contract address as admin for initialization
+        );
+        
+        // Log if WASM hash initialization fails, but don't fail the grant creation
+        if let Err(e) = wasm_result {
+            env.logs().add(&format!("WASM hash initialization failed for grant {}: {:?}", current_grant_id, e));
+        }
 
         // Add grant to registry for landlord tracking
         let grant_hash = generate_grant_hash(&env, current_grant_id);
@@ -1667,6 +1685,23 @@ impl GrantContract {
             _ => {
                 grant.recipient.require_auth();
             }
+        }
+
+        // WASM Hash Verification Hook - Ensure user is interacting with the correct contract version
+        let current_wasm_hash = env.current_contract_address().contract_id();
+        let verification_result = WasmHashVerification::verify_grant_wasm_hash(
+            env.clone(),
+            grant_id,
+            current_wasm_hash,
+        );
+        
+        // If verification fails, check if there's a pending upgrade
+        if let Err(VerificationError::GrantNotFound) = verification_result {
+            // Grant might not have WASM hash initialized yet, proceed with warning
+            env.logs().add(&format!("Warning: Grant {} has no WASM hash verification", grant_id));
+        } else if let Err(e) = verification_result {
+            // WASM hash doesn't match - user is interacting with wrong version
+            return Err(Error::Custom(1000 + e as u32)); // Convert to contract error
         }
 
         if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::RageQuitted || grant.lease_terminated {
@@ -3198,6 +3233,23 @@ pub mod grant {
         evidence: String,
     ) -> Result<u64, Error> {
         let mut grant = read_grant(&env, grant_id)?;
+        
+        // WASM Hash Verification Hook - Ensure user is interacting with the correct contract version
+        let current_wasm_hash = env.current_contract_address().contract_id();
+        let verification_result = WasmHashVerification::verify_grant_wasm_hash(
+            env.clone(),
+            grant_id,
+            current_wasm_hash,
+        );
+        
+        // If verification fails, check if there's a pending upgrade
+        if let Err(VerificationError::GrantNotFound) = verification_result {
+            // Grant might not have WASM hash initialized yet, proceed with warning
+            env.logs().add(&format!("Warning: Grant {} has no WASM hash verification", grant_id));
+        } else if let Err(e) = verification_result {
+            // WASM hash doesn't match - user is interacting with wrong version
+            return Err(Error::Custom(1000 + e as u32)); // Convert to contract error
+        }
         
         // Validate milestone number
         validate_milestone_number(&grant, milestone_number)?;
