@@ -55,6 +55,16 @@ pub struct YieldMetrics {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct ProtocolInfo {
+    pub strategy: u32,
+    pub name: Symbol,
+    pub safety_score: u32, // 0-100
+    pub apy: i128,
+    pub is_active: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub enum DataKey {
     Admin,
     Config,
@@ -62,6 +72,7 @@ pub enum DataKey {
     Metrics,
     ReserveBalance,
     YieldToken, // Token address for yield generation
+    Protocols, // Map of strategy ID to ProtocolInfo
 }
 
 #[contracterror]
@@ -264,6 +275,31 @@ impl YieldTreasuryContract {
         
         // Initialize reserve balance
         write_reserve_balance(env, 0);
+
+        // Initialize default protocols
+        let mut protocols = Map::<u32, ProtocolInfo>::new(&env);
+        protocols.set(YIELD_STRATEGY_STELLAR_AQUA, ProtocolInfo {
+            strategy: YIELD_STRATEGY_STELLAR_AQUA,
+            name: symbol_short!("AQUA"),
+            safety_score: 85,
+            apy: 800,
+            is_active: true,
+        });
+        protocols.set(YIELD_STRATEGY_STELLAR_USDC, ProtocolInfo {
+            strategy: YIELD_STRATEGY_STELLAR_USDC,
+            name: symbol_short!("USDC"),
+            safety_score: 95,
+            apy: 500,
+            is_active: true,
+        });
+        protocols.set(YIELD_STRATEGY_LIQUIDITY_POOL, ProtocolInfo {
+            strategy: YIELD_STRATEGY_LIQUIDITY_POOL,
+            name: symbol_short!("POOL"),
+            safety_score: 70,
+            apy: 1200,
+            is_active: true,
+        });
+        env.storage().instance().set(&DataKey::Protocols, &protocols);
         
         env.events().publish(
             (symbol_short!("yield_init"),),
@@ -596,5 +632,84 @@ impl YieldTreasuryContract {
     /// Check if investment is active
     pub fn is_investment_active(env: Env) -> Result<bool, YieldError> {
         Ok(read_yield_position(&env).is_ok())
+    }
+
+    /// Rebalance funds between yield strategies
+    /// DAO can vote to move the treasury's "Yield Bucket" from one protocol to another.
+    /// The contract must verify the "Safety Score" of the target protocol before allowing the transfer.
+    pub fn rebalance_funds(
+        env: Env,
+        new_strategy: u32,
+    ) -> Result<(), YieldError> {
+        require_admin_auth(&env)?;
+
+        // Check if there's an active investment
+        let mut position = read_yield_position(&env)?;
+
+        if position.strategy == new_strategy {
+            return Ok(()); // Already in the target strategy
+        }
+
+        // Get target protocol info
+        let protocols: Map<u32, ProtocolInfo> = env.storage().instance().get(&DataKey::Protocols).ok_or(YieldError::NotInitialized)?;
+        let target_protocol = protocols.get(new_strategy).ok_or(YieldError::InvalidStrategy)?;
+
+        if !target_protocol.is_active {
+            return Err(YieldError::InvalidStrategy);
+        }
+
+        // Verify Safety Score (minimum score required for rebalancing, e.g., 60)
+        const MIN_SAFETY_SCORE: u32 = 60;
+        if target_protocol.safety_score < MIN_SAFETY_SCORE {
+            return Err(YieldError::InvalidStrategy);
+        }
+
+        // Update current yield before moving
+        update_yield_position(&env, &mut position)?;
+
+        // Store old strategy for events
+        let old_strategy = position.strategy;
+
+        // Perform the switch: update strategy, apy, and timestamps
+        position.strategy = new_strategy;
+        position.apy = target_protocol.apy;
+        position.last_yield_update = env.ledger().timestamp();
+        
+        // In a real implementation, this would involve divesting from old and investing in new
+        // For this mock logic, we just update the position metadata
+        
+        write_yield_position(&env, &position);
+
+        // Update metrics
+        let mut metrics = read_metrics(&env)?;
+        metrics.current_apy = target_protocol.apy;
+        metrics.last_yield_calculation = env.ledger().timestamp();
+        write_metrics(&env, &metrics);
+
+        env.events().publish(
+            (symbol_short!("rebalance"),),
+            (old_strategy, new_strategy, target_protocol.safety_score, target_protocol.apy),
+        );
+
+        Ok(())
+    }
+
+    /// Update protocol information (admin only)
+    pub fn update_protocol(
+        env: Env,
+        protocol: ProtocolInfo,
+    ) -> Result<(), YieldError> {
+        require_admin_auth(&env)?;
+        
+        let mut protocols: Map<u32, ProtocolInfo> = env.storage().instance().get(&DataKey::Protocols).ok_or(YieldError::NotInitialized)?;
+        protocols.set(protocol.strategy, protocol.clone());
+        env.storage().instance().set(&DataKey::Protocols, &protocols);
+        
+        env.events().publish(
+            (symbol_short!("prot_updt"),),
+            (protocol.strategy, protocol.safety_score, protocol.apy),
+        );
+        
+        Ok(())
     }
 }
