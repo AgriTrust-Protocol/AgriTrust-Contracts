@@ -44,6 +44,10 @@ const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 const PAUSE_COOLDOWN_PERIOD: u64 = 14 * 24 * 60 * 60; // 14 days in seconds
 const SUPER_MAJORITY_THRESHOLD: u32 = 7500; // 75% super-majority threshold (in basis points)
 
+// Gas Buffer constants
+const DEFAULT_GAS_BUFFER: i128 = 1_000_000; // 0.1 XLM default gas buffer (in stroops)
+const HIGH_NETWORK_FEE_THRESHOLD: i128 = 100_000; // 0.01 XLM threshold for high network fees
+
 // Milestone System constants
 const CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days challenge period
 const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason length
@@ -398,6 +402,10 @@ pub struct Grant {
     // Pause cooldown fields
     pub last_resume_timestamp: Option<u64>, // Timestamp when grant was last resumed
     pub pause_count: u32, // Number of times this grant has been paused
+    
+    // Gas buffer fields for fail-safe withdrawals
+    pub gas_buffer: i128, // Pre-paid XLM buffer for high network fee periods
+    pub gas_buffer_used: i128, // Amount of gas buffer used so far
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,6 +429,7 @@ pub struct GranteeConfig {
     pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
     pub milestone_amount: i128,     // Amount per milestone
     pub total_milestones: u32,     // Total number of milestones
+    pub gas_buffer: i128,          // Pre-paid XLM buffer for high network fee periods
 }
 
 /// Result of batch grant initialization
@@ -640,6 +649,8 @@ enum DataKey {
     BurnedStakes, // Track total burned stakes for transparency
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
+    // Gas buffer keys
+    GasBuffer(u64), // Maps grant_id to gas buffer balance
 }
 
 #[contracterror]
@@ -719,6 +730,9 @@ pub enum Error {
     // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
+    // Gas buffer errors
+    InsufficientGasBuffer = 65,
+    GasBufferNotEnabled = 66,
 }
 
 // --- Internal Helpers ---
@@ -1139,6 +1153,17 @@ fn read_burned_stakes(env: &Env) -> i128 {
 
 fn write_burned_stakes(env: &Env, burned_amount: i128) {
     env.storage().instance().set(&DataKey::BurnedStakes, &burned_amount);
+}
+
+fn read_gas_buffer(env: &Env, grant_id: u64) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GasBuffer(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_gas_buffer(env: &Env, grant_id: u64, balance: i128) {
+    env.storage().instance().set(&DataKey::GasBuffer(grant_id), &balance);
 }
 
 fn get_stake_token_address(env: &Env) -> Address {
