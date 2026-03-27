@@ -733,6 +733,10 @@ pub enum Error {
     // Gas buffer errors
     InsufficientGasBuffer = 65,
     GasBufferNotEnabled = 66,
+    // Self-destruct errors
+    SelfDestructConditionsNotMet = 67,
+    GrantsNotCompleted = 68,
+    BalancesNotZero = 69,
 }
 
 // --- Internal Helpers ---
@@ -3996,6 +4000,112 @@ pub mod grant {
             env.current_contract_address(),
             verified,
         ).map_err(|e| Error::Custom(2000 + e as u32))
+    }
+
+    // --- Self-Destruct Functions ---
+
+    /// Automatically self-destruct the contract when all grants are completed
+    /// 
+    /// This function implements "Ecosystem Hygiene" by cleaning up the contract
+    /// and returning the base reserve XLM to the DAO treasury.
+    /// 
+    /// # Requirements
+    /// - All grants must be in completed, cancelled, or self-terminated state
+    /// - All balances must be zero (no claimable or withdrawn amounts)
+    /// - Only admin can call this function
+    /// 
+    /// # Returns
+    /// - `Ok(())` if self-destruct was successful
+    /// - `Error::GrantsNotCompleted` if any grants are still active/paused
+    /// - `Error::BalancesNotZero` if any balances remain
+    pub fn self_destruct(env: Env) -> Result<(), Error> {
+        // Require admin authentication
+        require_admin_auth(&env)?;
+        
+        // Check if all grants are completed
+        let grant_ids = read_grant_ids(&env);
+        for grant_id in grant_ids.iter() {
+            let grant = read_grant(&env, grant_id)?;
+            
+            // Grant must be completed, cancelled, or self-terminated
+            if grant.status != GrantStatus::Completed && 
+               grant.status != GrantStatus::Cancelled &&
+               grant.status != GrantStatus::RageQuitted {
+                return Err(Error::GrantsNotCompleted);
+            }
+            
+            // Check if grant has any remaining balances
+            if grant.claimable > 0 || grant.withdrawn > 0 {
+                return Err(Error::BalancesNotZero);
+            }
+        }
+        
+        // Get treasury address to return base reserve
+        let treasury = read_treasury(&env)?;
+        
+        // Get contract's native XLM balance
+        let native_token = read_native_token(&env)?;
+        let token_client = token::Client::new(&env, &native_token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        
+        // Transfer all remaining XLM to treasury
+        if contract_balance > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &contract_balance,
+            );
+        }
+        
+        // Emit self-destruct event
+        env.events().publish(
+            (symbol_short!("destruct"),),
+            (
+                env.current_contract_address(),
+                treasury,
+                contract_balance,
+                env.ledger().timestamp(),
+            ),
+        );
+        
+        // Delete all storage
+        env.storage().instance().clear();
+        
+        // Delete the contract instance
+        env.deployer().delete_contract(env.current_contract_address());
+        
+        Ok(())
+    }
+
+    /// Check if contract can be self-destructed
+    /// 
+    /// This function checks the conditions required for self-destruction
+    /// without actually performing the operation.
+    /// 
+    /// # Returns
+    /// - `Ok(true)` if all conditions are met
+    /// - `Ok(false)` if conditions are not met
+    /// - `Error` if there's an issue checking conditions
+    pub fn can_self_destruct(env: Env) -> Result<bool, Error> {
+        // Check if all grants are completed
+        let grant_ids = read_grant_ids(&env);
+        for grant_id in grant_ids.iter() {
+            let grant = read_grant(&env, grant_id)?;
+            
+            // Grant must be completed, cancelled, or self-terminated
+            if grant.status != GrantStatus::Completed && 
+               grant.status != GrantStatus::Cancelled &&
+               grant.status != GrantStatus::RageQuitted {
+                return Ok(false);
+            }
+            
+            // Check if grant has any remaining balances
+            if grant.claimable > 0 || grant.withdrawn > 0 {
+                return Ok(false);
+            }
+        }
+        
+        Ok(true)
     }
 }
 
