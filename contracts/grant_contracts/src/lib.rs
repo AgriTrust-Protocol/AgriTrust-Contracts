@@ -432,6 +432,26 @@ pub struct GranteeConfig {
     pub gas_buffer: i128,          // Pre-paid XLM buffer for high network fee periods
 }
 
+/// Joint grant configuration for collaborative projects
+#[derive(Clone)]
+#[contracttype]
+pub struct JointGrantConfig {
+    pub primary_recipient: Address,    // Primary grantee address
+    pub secondary_recipient: Address,  // Secondary grantee address
+    pub total_amount: i128,            // Total grant amount
+    pub flow_rate: i128,               // Combined flow rate
+    pub asset: Address,                // Token asset address
+    pub warmup_duration: u64,          // Warmup period
+    pub primary_share_bps: u32,        // Primary recipient's share in basis points (0-10000)
+    pub secondary_share_bps: u32,      // Secondary recipient's share in basis points (0-10000)
+    pub require_dual_signature: bool,  // Whether both signatures are required for withdrawal
+    pub validator: Option<Address>,    // Optional validator address
+    pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
+    pub milestone_amount: i128,        // Amount per milestone
+    pub total_milestones: u32,         // Total number of milestones
+    pub gas_buffer: i128,              // Pre-paid XLM buffer for high network fee periods
+}
+
 /// Result of batch grant initialization
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -651,6 +671,9 @@ enum DataKey {
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
     // Gas buffer keys
     GasBuffer(u64), // Maps grant_id to gas buffer balance
+    // Joint grant keys
+    JointGrant(u64), // Maps grant_id to joint grant configuration
+    JointGrantWithdrawalPending(u64, Address), // Maps grant_id + signer to pending withdrawal status
 }
 
 #[contracterror]
@@ -737,6 +760,12 @@ pub enum Error {
     SelfDestructConditionsNotMet = 67,
     GrantsNotCompleted = 68,
     BalancesNotZero = 69,
+    // Joint grant errors
+    NotJointGrantRecipient = 70,
+    DualSignatureRequired = 71,
+    AlreadySigned = 72,
+    InvalidSharePercentage = 73,
+    CannotSplitActiveGrant = 74,
 }
 
 // --- Internal Helpers ---
