@@ -44,6 +44,10 @@ const MAX_SLASHING_REASON_LENGTH: u32 = 500; // Maximum reason string length
 const PAUSE_COOLDOWN_PERIOD: u64 = 14 * 24 * 60 * 60; // 14 days in seconds
 const SUPER_MAJORITY_THRESHOLD: u32 = 7500; // 75% super-majority threshold (in basis points)
 
+// Gas Buffer constants
+const DEFAULT_GAS_BUFFER: i128 = 1_000_000; // 0.1 XLM default gas buffer (in stroops)
+const HIGH_NETWORK_FEE_THRESHOLD: i128 = 100_000; // 0.01 XLM threshold for high network fees
+
 // Milestone System constants
 const CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60; // 7 days challenge period
 const MAX_MILESTONE_REASON_LENGTH: u32 = 1000; // Maximum milestone claim reason length
@@ -410,6 +414,10 @@ pub struct Grant {
     // Pause cooldown fields
     pub last_resume_timestamp: Option<u64>, // Timestamp when grant was last resumed
     pub pause_count: u32, // Number of times this grant has been paused
+    
+    // Gas buffer fields for fail-safe withdrawals
+    pub gas_buffer: i128, // Pre-paid XLM buffer for high network fee periods
+    pub gas_buffer_used: i128, // Amount of gas buffer used so far
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,6 +441,27 @@ pub struct GranteeConfig {
     pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
     pub milestone_amount: i128,     // Amount per milestone
     pub total_milestones: u32,     // Total number of milestones
+    pub gas_buffer: i128,          // Pre-paid XLM buffer for high network fee periods
+}
+
+/// Joint grant configuration for collaborative projects
+#[derive(Clone)]
+#[contracttype]
+pub struct JointGrantConfig {
+    pub primary_recipient: Address,    // Primary grantee address
+    pub secondary_recipient: Address,  // Secondary grantee address
+    pub total_amount: i128,            // Total grant amount
+    pub flow_rate: i128,               // Combined flow rate
+    pub asset: Address,                // Token asset address
+    pub warmup_duration: u64,          // Warmup period
+    pub primary_share_bps: u32,        // Primary recipient's share in basis points (0-10000)
+    pub secondary_share_bps: u32,      // Secondary recipient's share in basis points (0-10000)
+    pub require_dual_signature: bool,  // Whether both signatures are required for withdrawal
+    pub validator: Option<Address>,    // Optional validator address
+    pub linked_addresses: Vec<Address>, // COI: Linked addresses that cannot vote
+    pub milestone_amount: i128,        // Amount per milestone
+    pub total_milestones: u32,         // Total number of milestones
+    pub gas_buffer: i128,              // Pre-paid XLM buffer for high network fee periods
 }
 
 /// Result of batch grant initialization
@@ -716,6 +745,11 @@ enum DataKey {
     BurnedStakes, // Track total burned stakes for transparency
     // Grant Registry keys for on-chain indexing
     GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
+    // Gas buffer keys
+    GasBuffer(u64), // Maps grant_id to gas buffer balance
+    // Joint grant keys
+    JointGrant(u64), // Maps grant_id to joint grant configuration
+    JointGrantWithdrawalPending(u64, Address), // Maps grant_id + signer to pending withdrawal status
     
     // Task 1: Withdraw All - Multi-grant withdrawal tracking
     WithdrawalBuffer(u64, Address), // Maps grant_id + recipient to buffered withdrawal amount
@@ -806,6 +840,19 @@ pub enum Error {
     // Pause cooldown errors
     PauseCooldownActive = 63,
     InsufficientSuperMajority = 64,
+    // Gas buffer errors
+    InsufficientGasBuffer = 65,
+    GasBufferNotEnabled = 66,
+    // Self-destruct errors
+    SelfDestructConditionsNotMet = 67,
+    GrantsNotCompleted = 68,
+    BalancesNotZero = 69,
+    // Joint grant errors
+    NotJointGrantRecipient = 70,
+    DualSignatureRequired = 71,
+    AlreadySigned = 72,
+    InvalidSharePercentage = 73,
+    CannotSplitActiveGrant = 74,
     
     // Task 1: Withdraw All errors
     ClawbackWindowActive = 65,
@@ -1246,6 +1293,17 @@ fn read_burned_stakes(env: &Env) -> i128 {
 
 fn write_burned_stakes(env: &Env, burned_amount: i128) {
     env.storage().instance().set(&DataKey::BurnedStakes, &burned_amount);
+}
+
+fn read_gas_buffer(env: &Env, grant_id: u64) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GasBuffer(grant_id))
+        .unwrap_or(0)
+}
+
+fn write_gas_buffer(env: &Env, grant_id: u64, balance: i128) {
+    env.storage().instance().set(&DataKey::GasBuffer(grant_id), &balance);
 }
 
 fn get_stake_token_address(env: &Env) -> Address {
@@ -4038,6 +4096,110 @@ pub mod grant {
         ).map_err(|e| Error::Custom(2000 + e as u32))
     }
 
+    // --- Self-Destruct Functions ---
+
+    /// Automatically self-destruct the contract when all grants are completed
+    /// 
+    /// This function implements "Ecosystem Hygiene" by cleaning up the contract
+    /// and returning the base reserve XLM to the DAO treasury.
+    /// 
+    /// # Requirements
+    /// - All grants must be in completed, cancelled, or self-terminated state
+    /// - All balances must be zero (no claimable or withdrawn amounts)
+    /// - Only admin can call this function
+    /// 
+    /// # Returns
+    /// - `Ok(())` if self-destruct was successful
+    /// - `Error::GrantsNotCompleted` if any grants are still active/paused
+    /// - `Error::BalancesNotZero` if any balances remain
+    pub fn self_destruct(env: Env) -> Result<(), Error> {
+        // Require admin authentication
+        require_admin_auth(&env)?;
+        
+        // Check if all grants are completed
+        let grant_ids = read_grant_ids(&env);
+        for grant_id in grant_ids.iter() {
+            let grant = read_grant(&env, grant_id)?;
+            
+            // Grant must be completed, cancelled, or self-terminated
+            if grant.status != GrantStatus::Completed && 
+               grant.status != GrantStatus::Cancelled &&
+               grant.status != GrantStatus::RageQuitted {
+                return Err(Error::GrantsNotCompleted);
+            }
+            
+            // Check if grant has any remaining balances
+            if grant.claimable > 0 || grant.withdrawn > 0 {
+                return Err(Error::BalancesNotZero);
+            }
+        }
+        
+        // Get treasury address to return base reserve
+        let treasury = read_treasury(&env)?;
+        
+        // Get contract's native XLM balance
+        let native_token = read_native_token(&env)?;
+        let token_client = token::Client::new(&env, &native_token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        
+        // Transfer all remaining XLM to treasury
+        if contract_balance > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &treasury,
+                &contract_balance,
+            );
+        }
+        
+        // Emit self-destruct event
+        env.events().publish(
+            (symbol_short!("destruct"),),
+            (
+                env.current_contract_address(),
+                treasury,
+                contract_balance,
+                env.ledger().timestamp(),
+            ),
+        );
+        
+        // Delete all storage
+        env.storage().instance().clear();
+        
+        // Delete the contract instance
+        env.deployer().delete_contract(env.current_contract_address());
+        
+        Ok(())
+    }
+
+    /// Check if contract can be self-destructed
+    /// 
+    /// This function checks the conditions required for self-destruction
+    /// without actually performing the operation.
+    /// 
+    /// # Returns
+    /// - `Ok(true)` if all conditions are met
+    /// - `Ok(false)` if conditions are not met
+    /// - `Error` if there's an issue checking conditions
+    pub fn can_self_destruct(env: Env) -> Result<bool, Error> {
+        // Check if all grants are completed
+        let grant_ids = read_grant_ids(&env);
+        for grant_id in grant_ids.iter() {
+            let grant = read_grant(&env, grant_id)?;
+            
+            // Grant must be completed, cancelled, or self-terminated
+            if grant.status != GrantStatus::Completed && 
+               grant.status != GrantStatus::Cancelled &&
+               grant.status != GrantStatus::RageQuitted {
+                return Ok(false);
+            }
+            
+            // Check if grant has any remaining balances
+            if grant.claimable > 0 || grant.withdrawn > 0 {
+                return Ok(false);
+            }
+        }
+        
+        Ok(true)
     // ============================================================
     // TASK 1: WITHDRAW ALL - Multi-Grant Batch Withdrawal
     // ============================================================
