@@ -941,243 +941,8 @@ impl From<GrantError> for soroban_sdk::Error {
             GrantError::InvalidGrantee => soroban_sdk::Error::from_contract_error(12),
             GrantError::InvalidStreamConfig => soroban_sdk::Error::from_contract_error(13),
             GrantError::InvalidAccelerationConfig => soroban_sdk::Error::from_contract_error(14),
-enum DataKey {
-    Admin,
-    GrantToken,
-    GrantIds,
-    Treasury,
-    Oracle,
-    NativeToken,
-    Grant(u64),
-    RecipientGrants(Address),
-    // Lease-related keys
-    LeaseAgreement(u64), // Maps grant_id to lease agreement details
-    PropertyRegistry(String), // Maps property_id to lease history
-    // Financial snapshot keys
-    FinancialSnapshot(u64, u64), // Maps grant_id + timestamp to snapshot
-    SnapshotNonce(u64), // Maps grant_id to nonce for snapshot generation
-    // Slashing proposal keys
-    SlashingProposal(u64), // Maps proposal_id to proposal details
-    SlashingProposalIds, // List of all slashing proposal IDs
-    GrantSlashingProposals(u64), // Maps grant_id to list of slashing proposal IDs
-    VotingPower(Address), // Maps voter address to their voting power
-    ProposalVotes(u64, Address), // Maps proposal_id + voter to their vote
-    NextProposalId, // Next available proposal ID
-    TotalVotingPower, // Total voting power in the system
-    MaxFlowRate(u64),
-    PriorityMultipliers,
-    PlatformFeeBps,
-    // Sub-DAO Authority integration
-    SubDaoAuthorityContract, // Address of Sub-DAO authority contract
-    // COI (Conflict of Interest) keys
-    LinkedAddresses(u64), // Maps grant_id to linked addresses
-    VoterExclusions(u64), // Maps proposal_id to excluded voters with reasons
-    // Milestone system keys
-    MilestoneClaim(u64), // Maps claim_id to milestone claim details
-    MilestoneChallenge(u64), // Maps challenge_id to challenge details
-    GrantMilestones(u64), // Maps grant_id to list of milestone claim IDs
-    NextMilestoneClaimId, // Next available milestone claim ID
-    NextChallengeId, // Next available challenge ID
-    // Proposal Staking Escrow keys
-    ProposalStake(u64), // Maps grant_id to staking escrow details
-    StakeEscrowBalance, // Total balance of all staked proposals
-    BurnedStakes, // Track total burned stakes for transparency
-    // Grant Registry keys for on-chain indexing
-    GrantRegistry(Address), // Maps landlord (lessor) address to array of grant contract hashes
-    // Gas buffer keys
-    GasBuffer(u64), // Maps grant_id to gas buffer balance
-    // Joint grant keys
-    JointGrant(u64), // Maps grant_id to joint grant configuration
-    JointGrantWithdrawalPending(u64, Address), // Maps grant_id + signer to pending withdrawal status
-    
-    // Task 1: Withdraw All - Multi-grant withdrawal tracking
-    WithdrawalBuffer(u64, Address), // Maps grant_id + recipient to buffered withdrawal amount
-    ClawbackWindow(u64), // Maps grant_id to clawback window end timestamp
-    
-    // Task 2: Financial Statement - Certified records
-    FinancialStatementNonce(u64), // Maps grant_id to nonce for statement generation
-    
-    // Task 4: Cross-Asset Matching - DEX price tracking
-    MatchingPool(Address), // Maps pool token address to matching pool info
-    DexPriceBuffer, // Latest DEX price buffer for volatility protection
-
-    // Task #192: Batch refund tracking
-    DonorRecord(u64, Address), // Maps grant_id + donor to contribution amount
-    GrantDonors(u64),          // List of donors for a grant
-    
-    // Issue #200: Clawback-Compatible Regulated Asset Handler storage
-    RegulatedAssetInfo(Address), // Maps asset address to regulated asset info
-    BalanceSyncRecord(u64),     // Maps sync_id to balance sync record
-    NextBalanceSyncId,         // Next available balance sync ID
-    RegulatedAssetClawbackLog(Address), // Maps asset to clawback history
-    
-    // Issue #199: Tax Withholding Escrow storage
-    TaxVault(u64),             // Maps grant_id to tax vault
-    TaxReceipt(u64),          // Maps receipt_id to tax receipt
-    NextTaxReceiptId,          // Next available tax receipt ID
-    GrantTaxRate(u64),         // Maps grant_id to tax rate
-    
-    // Issue #197: Legal Entity Verification storage
-    LegalEntityVerification(Address), // Maps entity address to verification
-    EntityVerificationHook(u64), // Maps grant_id to verification hook
-    IdentityOracleContract,    // Address of identity oracle contract
-    
-    // Issue #195: Flash Loan Provider storage
-    FlashLoan(u64),            // Maps loan_id to flash loan
-    FlashLoanProvider,         // Flash loan provider configuration
-    NextFlashLoanId,           // Next available flash loan ID
-    ActiveFlashLoans,         // Count of active flash loans
-    
-    // Issue #275: Sanction Screening Middleware Hook storage
-    SanctionsRegistryContract, // Address of sanctions registry contract
-    SanctionsCheckCache(Address), // Maps address to cached sanctions check result
-    SanctionsCheckResult(u64, Address), // Maps grant_id + address to check result
-    NextSanctionsCheckId,      // Next available sanctions check ID
-}
-
-#[contracterror]
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-#[repr(u32)]
-pub enum Error {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    NotAuthorized = 3,
-    GrantNotFound = 4,
-    GrantAlreadyExists = 5,
-    InvalidRate = 6,
-    InvalidAmount = 7,
-    InvalidState = 8,
-    MathOverflow = 9,
-    InsufficientReserve = 10,
-    RescueWouldViolateAllocated = 11,
-    GranteeMismatch = 12,
-    GrantNotInactive = 13,
-    WithdrawalLimitExceeded = 200, // Task #193
-}
-
-    // Lease-related errors
-    InvalidLeaseTerms = 14,
-    LeaseAlreadyTerminated = 15,
-    LeaseNotActive = 16,
-    InvalidPropertyId = 17,
-    InvalidSecurityDeposit = 18,
-    LeaseNotExpired = 19,
-    OracleTerminationFailed = 20,
-    // Financial snapshot errors
-    SnapshotExpired = 21,
-    InvalidSnapshot = 22,
-    SnapshotNotFound = 23,
-    InvalidSignature = 24,
-    // Slashing proposal errors
-    ProposalNotFound = 25,
-    ProposalAlreadyExists = 26,
-    InvalidProposalStatus = 27,
-    VotingPeriodEnded = 28,
-    VotingPeriodActive = 29,
-    AlreadyVoted = 30,
-    InsufficientVotingPower = 31,
-    ParticipationThresholdNotMet = 32,
-    ApprovalThresholdNotMet = 33,
-    NoStakeToSlash = 34,
-    SlashingAlreadyExecuted = 35,
-    InvalidReasonLength = 36,
-    // Proposal Staking Escrow errors
-    InsufficientStake = 37,
-    StakeAlreadyDeposited = 38,
-    StakeNotDeposited = 39,
-    StakeAlreadyReturned = 40,
-    StakeAlreadyBurned = 41,
-    InvalidStakeAmount = 42,
-    // Sub-DAO Authority errors
-    SubDaoActionNotAllowed = 43,
-    SubDaoPermissionRevoked = 44,
-    SubDaoActionVetoed = 45,
-    SubDaoContractNotSet = 46,
-    // COI (Conflict of Interest) errors
-    VoterHasConflictOfInterest = 47,
-    LinkedAddressAlreadyExists = 48,
-    LinkedAddressNotFound = 49,
-    CannotVoteOnOwnGrant = 50,
-    ExcludedFromVoting = 51,
-    // Milestone system errors
-    MilestoneNotFound = 52,
-    MilestoneAlreadyClaimed = 53,
-    InvalidMilestoneNumber = 54,
-    ChallengeNotFound = 55,
-    ChallengeAlreadyExists = 56,
-    ChallengePeriodExpired = 57,
-    ChallengeNotActive = 58,
-    InvalidChallengeStatus = 59,
-    InsufficientMilestoneFunds = 60,
-    MilestoneNotClaimed = 61,
-    MilestoneAlreadyChallenged = 62,
-    // Pause cooldown errors
-    PauseCooldownActive = 63,
-    InsufficientSuperMajority = 64,
-    // Gas buffer errors
-    InsufficientGasBuffer = 65,
-    GasBufferNotEnabled = 66,
-    // Self-destruct errors
-    SelfDestructConditionsNotMet = 67,
-    GrantsNotCompleted = 68,
-    BalancesNotZero = 69,
-    // Joint grant errors
-    NotJointGrantRecipient = 70,
-    DualSignatureRequired = 71,
-    AlreadySigned = 72,
-    InvalidSharePercentage = 73,
-    CannotSplitActiveGrant = 74,
-    
-    // Task 1: Withdraw All errors
-    ClawbackWindowActive = 65,
-    WithdrawalBuffered = 66,
-    InvalidWithdrawalAmount = 67,
-    
-    // Task 2: Financial Statement errors
-    StatementNotFound = 68,
-    InvalidStatementData = 69,
-    
-    // Task 3: Clawback errors  
-    ClawbackExpired = 70,
-    ClawbackNotAuthorized = 71,
-    FundsAlreadyReleased = 72,
-    
-    // Task 4: Cross-Asset Matching errors
-    PriceOracleNotFound = 73,
-    InsufficientMatchingPool = 74,
-    PriceVolatilityExceeded = 75,
-    InvalidPriceBuffer = 76,
-    
-    // Issue #200: Clawback-Compatible Regulated Asset Handler errors
-    RegulatedAssetClawbackDetected = 77,
-    BalanceSyncFailed = 78,
-    InsufficientRegulatedBalance = 79,
-    RegulatedAssetNotSupported = 80,
-    
-    // Issue #199: Tax Withholding Escrow errors
-    TaxWithholdingTooHigh = 81,
-    TaxVaultNotFound = 82,
-    InsufficientTaxVault = 83,
-    TaxReceiptAlreadyIssued = 84,
-    
-    // Issue #197: Legal Entity Verification errors
-    EntityNotVerified = 85,
-    EntityVerificationExpired = 86,
-    IdentityOracleNotFound = 87,
-    EntityVerificationRevoked = 88,
-    
-    // Issue #195: Flash Loan Provider errors
-    FlashLoanAmountTooSmall = 89,
-    FlashLoanAmountTooLarge = 90,
-    FlashLoanNotRepaid = 91,
-    FlashLoanFeeNotPaid = 92,
-    FlashLoanInProgress = 93,
-    
-    // Issue #275: Sanction Screening Middleware Hook errors
-    SanctionsRegistryNotSet = 94,
-    AddressOnSanctionsList = 95,
-    SanctionsCheckFailed = 96,
-    SanctionsCheckCacheExpired = 97,
+        }
+    }
 }
 
 // --- Internal Helpers ---
@@ -1673,7 +1438,7 @@ fn calculate_warmup_multiplier(grant: &Grant, now: u64) -> i128 {
     2500 + (7500 * progress) / 10000
 }
 
-
+fn settle_grant(grant: &mut Grant, grant_id: u64, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts { return Err(Error::InvalidState); }
     
     let elapsed = now - grant.last_update_ts;
@@ -3162,25 +2927,25 @@ fn finalize_milestone_approval(
         grant.status = GrantStatus::Completed;
     }
 
-        Self::transfer_tokens(
-            env,
-            &grant.token_address,
-            &grant.admin,
-            &env.current_contract_address(),
-            milestone.amount,
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::Milestone(grant_id.clone(), milestone_id.clone()), milestone);
-        env.storage()
-            .instance()
-            .set(&DataKey::Grant(grant_id.clone()), grant);
+    transfer_tokens(
+        env,
+        &grant.token_address,
+        &grant.admin,
+        &env.current_contract_address(),
+        milestone.amount,
+    );
+    env.storage()
+        .instance()
+        .set(&DataKey::Milestone(grant_id.clone(), milestone_id.clone()), milestone);
+    env.storage()
+        .instance()
+        .set(&DataKey::Grant(grant_id.clone()), grant);
 
-        env.events().publish(
-            (symbol_short!("milestone_approved"), grant_id, milestone_id),
-            (milestone.amount, grant.recipient.clone()),
-        );
-    }
+    env.events().publish(
+        (symbol_short!("milestone_approved"), grant_id, milestone_id),
+        (milestone.amount, grant.recipient.clone()),
+    );
+}
 
     fn compute_withdrawable_amount(
         env: &Env,
