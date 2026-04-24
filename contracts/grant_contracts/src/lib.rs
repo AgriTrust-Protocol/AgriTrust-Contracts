@@ -92,6 +92,8 @@ mod test_optimistic_milestones;
 mod test_pause_cooldown;
 #[cfg(test)]
 mod test_grant_appeals;
+#[cfg(test)]
+mod test_fuzz_invariants;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
