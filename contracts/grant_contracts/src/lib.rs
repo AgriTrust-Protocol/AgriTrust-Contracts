@@ -94,6 +94,8 @@ mod test_pause_cooldown;
 mod test_grant_appeals;
 #[cfg(test)]
 mod test_fuzz_invariants;
+#[cfg(test)]
+mod test_concurrent_bank_run;
 /// Get the next available grant ID
 ///
 /// This function finds the next unused grant ID by checking existing grants.
