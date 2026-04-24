@@ -7,7 +7,7 @@ use soroban_sdk::{
 #[contract]
 pub struct GrantContract;
 
-
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum GrantStatus {
     Active,
@@ -15,8 +15,7 @@ pub enum GrantStatus {
     Cancelled,
 }
 
-<<<<<<< HEAD
-=======
+#[derive(Clone)]
 #[contracttype]
 pub struct JointGrantInfo {
     pub partner: Address,
@@ -24,7 +23,6 @@ pub struct JointGrantInfo {
 
 #[derive(Clone)]
 #[contracttype]
->>>>>>> 20b3953 (feat: implement inter-protocol debt hooks, joint-grant logic, SBT minting, and sustainability treasury)
 pub struct Grant {
     pub grantor: Address,
     pub recipient: Address,
@@ -66,13 +64,11 @@ pub struct OptimisticGrant {
 enum DataKey {
     Admin,
     Grant(u64),
-<<<<<<< HEAD
     TotalDeposited,
     TotalWithdrawn,
     TotalPending,
     Conviction(Address, u64),
     Optimistic(u64),
-=======
     ProtocolConfig,
 }
 
@@ -83,7 +79,6 @@ pub struct ProtocolConfig {
     pub treasury_address: Address,
     pub sbt_minter_address: Address,
     pub debt_divert_bps: i128, // e.g., 2000 for 20%
->>>>>>> 20b3953 (feat: implement inter-protocol debt hooks, joint-grant logic, SBT minting, and sustainability treasury)
 }
 
 #[contracterror]
@@ -123,7 +118,6 @@ fn read_grant(env: &Env, grant_id: u64) -> Result<Grant, Error> {
         .ok_or(Error::GrantNotFound)
 }
 
-<<<<<<< HEAD
 fn get_total_pending(env: &Env) -> i128 {
     env.storage().instance().get(&DataKey::TotalPending).unwrap_or(0)
 }
@@ -138,11 +132,6 @@ fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
         .set(&DataKey::Grant(grant_id), grant);
 }
 
-=======
-fn write_grant(env: &Env, grant_id: u64, grant: &Grant) {
-    env.storage().instance().set(&DataKey::Grant(grant_id), grant);
-}
-
 fn read_config(env: &Env) -> Result<ProtocolConfig, Error> {
     env.storage()
         .instance()
@@ -151,13 +140,10 @@ fn read_config(env: &Env) -> Result<ProtocolConfig, Error> {
 }
 
 fn is_in_default(env: &Env, sorosusu: &Address, user: &Address) -> bool {
-    // Interface with SoroSusu protocol
-    // For this implementation, we assume a "get_default_status" method exists
     env.invoke_contract::<bool>(sorosusu, &symbol_short!("is_deflt"), soroban_sdk::vec![env, user.clone()])
 }
 
 fn mint_sbt(env: &Env, config: &ProtocolConfig, grant_id: u64, recipient: &Address) {
-    // Mint Soulbound Token on completion (Issue #232)
     let _: () = env.invoke_contract(
         &config.sbt_minter_address,
         &symbol_short!("mint_sbt"),
@@ -167,9 +153,6 @@ fn mint_sbt(env: &Env, config: &ProtocolConfig, grant_id: u64, recipient: &Addre
 
 const TAX_THRESHOLD: i128 = 100_000_0000000; // $100,000 in 7-decimal places
 const TAX_BPS: i128 = 1; // 0.01%
->>>>>>> 20b3953 (feat: implement inter-protocol debt hooks, joint-grant logic, SBT minting, and sustainability treasury)
-
-
 
 fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
     if now < grant.last_update_ts {
@@ -212,12 +195,10 @@ fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
     let config = read_config(env)?;
     let mut net_delta = delta;
 
-    // Issue #233: Sustainability Tax (0.01% if > $100k)
     if grant.total_amount >= TAX_THRESHOLD {
         let tax = delta.checked_mul(TAX_BPS).unwrap().checked_div(10000).unwrap();
         if tax > 0 {
-            // Transfer tax straight to treasury
-            env.invoke_contract(
+            env.invoke_contract::<()>(
                 &config.treasury_address,
                 &symbol_short!("deposit"),
                 soroban_sdk::vec![env, tax],
@@ -226,13 +207,11 @@ fn settle_grant(env: &Env, grant: &mut Grant, now: u64) -> Result<(), Error> {
         }
     }
 
-    // Issue #213: Debt Repayment Drip
     if grant.sorosusu_debt_service {
         if is_in_default(env, &config.sorosusu_address, &grant.recipient) {
             let debt_service = delta.checked_mul(config.debt_divert_bps).unwrap().checked_div(10000).unwrap();
             if debt_service > 0 {
-                // Transfer debt service to SoroSusu
-                env.invoke_contract(
+                env.invoke_contract::<()>(
                     &config.sorosusu_address,
                     &symbol_short!("repay"),
                     soroban_sdk::vec![env, grant.recipient.clone(), debt_service],
@@ -368,16 +347,12 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-<<<<<<< HEAD
-        settle_grant(&mut grant, env.ledger().timestamp())?;
+        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
         
         let pending = get_total_pending(&env);
         let remaining = grant.total_amount - grant.withdrawn;
         set_total_pending(&env, pending - remaining);
 
-=======
-        settle_grant(&env, &mut grant, env.ledger().timestamp())?;
->>>>>>> 20b3953 (feat: implement inter-protocol debt hooks, joint-grant logic, SBT minting, and sustainability treasury)
         grant.flow_rate = 0;
         grant.status = GrantStatus::Cancelled;
         write_grant(&env, grant_id, &grant);
@@ -418,7 +393,6 @@ impl GrantContract {
             return Err(Error::InvalidState);
         }
 
-        // Issue #223: Dual-Signatures for Joint Grants
         if let Some(ref joint) = grant.joint_info {
             grant.recipient.require_auth();
             joint.partner.require_auth();
@@ -448,7 +422,6 @@ impl GrantContract {
         }
 
         write_grant(&env, grant_id, &grant);
-<<<<<<< HEAD
 
         let pending = get_total_pending(&env);
         set_total_pending(&env, pending - amount);
@@ -465,14 +438,11 @@ impl GrantContract {
         );
 
         Ok(())
-=======
-        Ok(())
     }
 
     pub fn split_and_separate(env: Env, grant_id: u64, new_grant_id: u64) -> Result<(), Error> {
         let mut grant = read_grant(&env, grant_id)?;
         
-        // Both parties must agree to split
         if let Some(joint) = grant.joint_info {
             grant.recipient.require_auth();
             joint.partner.require_auth();
@@ -483,16 +453,16 @@ impl GrantContract {
             let half_remaining = remaining_total.checked_div(2).ok_or(Error::MathOverflow)?;
             let half_rate = grant.flow_rate.checked_div(2).ok_or(Error::MathOverflow)?;
 
-            // Update original grant to be recipient's independent flow
             grant.total_amount = grant.withdrawn.checked_add(half_remaining).ok_or(Error::MathOverflow)?;
             grant.flow_rate = half_rate;
             grant.joint_info = None;
             write_grant(&env, grant_id, &grant);
 
-            // Create new grant for the partner
             let now = env.ledger().timestamp();
             let partner_grant = Grant {
+                grantor: grant.grantor.clone(),
                 recipient: joint.partner,
+                asset_id: grant.asset_id.clone(),
                 total_amount: half_remaining,
                 withdrawn: 0,
                 claimable: 0,
@@ -510,7 +480,6 @@ impl GrantContract {
         } else {
             Err(Error::InvalidState)
         }
->>>>>>> 20b3953 (feat: implement inter-protocol debt hooks, joint-grant logic, SBT minting, and sustainability treasury)
     }
 
     pub fn update_rate(env: Env, grant_id: u64, new_rate: i128) -> Result<(), Error> {
@@ -554,20 +523,11 @@ impl GrantContract {
     }
 
     pub fn calculate_pool_health(env: Env, asset_id: Address, volatility_bps: u32) -> Result<u32, Error> {
-        // Simple health factor: liquidity / pending_withdrawals
-        // Adjust for volatility (higher volatility = lower health factor for same ratio)
-        
-        // In a real scenario, we'd query the contract's balance of asset_id
-        // For this implementation, we'll use our tracked TotalPending vs assumed contract liquidity
-        // Let's assume contract balance is queried via soroban_sdk token client
-        
         let pending = get_total_pending(&env);
         if pending == 0 {
             return Ok(10000); // 1.0 (bps)
         }
 
-        // Mocking balance for demonstration (in real use, use token client)
-        // Let's assume balance is stored in a DataKey for this example if token client is complex to setup here
         let balance: i128 = 1_000_000; // Mocked balance
 
         let raw_ratio = if pending > 0 {
@@ -576,7 +536,6 @@ impl GrantContract {
             10000
         };
 
-        // Apply volatility adjustment: health = ratio * (1 - volatility)
         let volatility_adj = 10000u32.saturating_sub(volatility_bps);
         let health = (raw_ratio as u32 * volatility_adj) / 10000;
 
@@ -604,8 +563,6 @@ impl GrantContract {
         let now = env.ledger().timestamp();
         let elapsed = now.saturating_sub(vote.last_update);
         
-        // Decay function: conviction = conviction * alpha^t + amount * (1 - alpha^t) / (1 - alpha)
-        // Simplified for small steps: conviction = conviction * alpha + amount
         let alpha = 9000; // 0.9 decay
         
         for _ in 0..elapsed.min(10) { // Limit iterations for safety
