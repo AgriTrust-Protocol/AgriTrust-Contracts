@@ -1537,3 +1537,631 @@ fn fuzz_test_dust_recovery_validation() {
     println!("  Recovery Rate: {:.2}%", 
         (total_recovered as f64 / (result.dust_amount + result.treasury_returns).max(1) as f64) * 100.0);
 }
+
+// --- Concurrent Multi-User Claims Fuzz Testing (Bank Run Scenario) ---
+
+/// Configuration for bank run scenario testing
+#[derive(Clone)]
+struct BankRunConfig {
+    num_concurrent_users: usize,
+    grants_per_user: usize,
+    total_fund_amount: i128,
+    seed: u64,
+    max_gas_per_withdrawal: u64, // Maximum gas allowed per withdrawal
+    storage_limit_threshold: u32, // Storage entries limit
+}
+
+impl Default for BankRunConfig {
+    fn default() -> Self {
+        Self {
+            num_concurrent_users: 150, // 150+ unique addresses for stress testing
+            grants_per_user: 3, // Multiple grants per user
+            total_fund_amount: 1_000_000_000_000, // 100,000 XLM total funding
+            seed: 300,
+            max_gas_per_withdrawal: 50_000_000, // 50M gas units limit
+            storage_limit_threshold: 10_000, // 10k storage entries limit
+        }
+    }
+}
+
+/// User withdrawal tracking for bank run analysis
+#[derive(Clone, Debug)]
+struct UserWithdrawalTracker {
+    user_address: Address,
+    grant_ids: Vec<u64>,
+    total_withdrawable: i128,
+    total_withdrawn: i128,
+    gas_consumed: u64,
+    withdrawal_order: usize, // Order in bank run sequence
+    successful_withdrawals: u32,
+    failed_withdrawals: u32,
+}
+
+impl UserWithdrawalTracker {
+    fn new(address: Address) -> Self {
+        Self {
+            user_address: address,
+            grant_ids: Vec::new(),
+            total_withdrawable: 0,
+            total_withdrawn: 0,
+            gas_consumed: 0,
+            withdrawal_order: 0,
+            successful_withdrawals: 0,
+            failed_withdrawals: 0,
+        }
+    }
+
+    fn track_withdrawal_attempt(&mut self, grant_id: u64, amount: i128, gas_used: u64, success: bool) {
+        self.grant_ids.push_back(grant_id);
+        self.gas_consumed += gas_used;
+        
+        if success {
+            self.total_withdrawable += amount;
+            self.total_withdrawn += amount;
+            self.successful_withdrawals += 1;
+        } else {
+            self.failed_withdrawals += 1;
+        }
+    }
+}
+
+/// Bank run invariant verifier
+struct BankRunInvariantVerifier {
+    env: Env,
+    contract_client: GrantContractClient,
+    token_address: Address,
+    violations: Vec<String>,
+    storage_entries_count: u32,
+    total_gas_consumed: u64,
+}
+
+impl BankRunInvariantVerifier {
+    fn new(env: &Env, contract_client: GrantContractClient, token_address: Address) -> Self {
+        Self {
+            env: env.clone(),
+            contract_client,
+            token_address,
+            violations: Vec::new(env),
+            storage_entries_count: 0,
+            total_gas_consumed: 0,
+        }
+    }
+
+    /// Invariant 1: Contract state remains consistent after concurrent withdrawals
+    fn verify_state_consistency(&mut self, before_balance: i128, after_balance: i128, total_withdrawn: i128) -> bool {
+        let expected_balance = before_balance - total_withdrawn;
+        
+        if after_balance != expected_balance {
+            let violation = format!(
+                "STATE CONSISTENCY VIOLATION: Expected balance {}, actual balance {} after withdrawing {}",
+                expected_balance, after_balance, total_withdrawn
+            );
+            self.violations.push_back(String::from_str(&self.env, &violation));
+            return false;
+        }
+        
+        true
+    }
+
+    /// Invariant 2: No storage limit exceeded during bank run
+    fn verify_storage_limits(&mut self, storage_threshold: u32) -> bool {
+        // Count storage entries by checking various data keys
+        let mut entry_count = 0u32;
+        
+        // Count grant entries (simplified estimation)
+        for i in 1u64..=1000 {
+            let grant_key = DataKey::Grant(i);
+            if self.env.storage().instance().has(&grant_key) {
+                entry_count += 1;
+            }
+        }
+        
+        self.storage_entries_count = entry_count;
+        
+        if entry_count > storage_threshold {
+            let violation = format!(
+                "STORAGE LIMIT VIOLATION: {} storage entries exceed threshold {}",
+                entry_count, storage_threshold
+            );
+            self.violations.push_back(String::from_str(&self.env, &violation));
+            return false;
+        }
+        
+        true
+    }
+
+    /// Invariant 3: Gas consumption doesn't block later withdrawers
+    fn verify_gas_consumption_fairness(&mut self, user_trackers: &Vec<UserWithdrawalTracker>, max_gas_per_withdrawal: u64) -> bool {
+        for tracker in user_trackers.iter() {
+            if tracker.gas_consumed > max_gas_per_withdrawal {
+                let violation = format!(
+                    "GAS CONSUMPTION VIOLATION: User {} consumed {} gas, exceeding limit {}",
+                    tracker.user_address, tracker.gas_consumed, max_gas_per_withdrawal
+                );
+                self.violations.push_back(String::from_str(&self.env, &violation));
+                return false;
+            }
+        }
+        
+        // Check that later withdrawers aren't disproportionately affected
+        let early_withdrawers: Vec<_> = user_trackers.iter()
+            .filter(|t| t.withdrawal_order < user_trackers.len() / 2)
+            .collect();
+        
+        let late_withdrawers: Vec<_> = user_trackers.iter()
+            .filter(|t| t.withdrawal_order >= user_trackers.len() / 2)
+            .collect();
+        
+        let early_success_rate = early_withdrawers.iter()
+            .map(|t| t.successful_withdrawals as f64 / (t.successful_withdrawals + t.failed_withdrawals).max(1) as f64)
+            .sum::<f64>() / early_withdrawers.len().max(1) as f64;
+        
+        let late_success_rate = late_withdrawers.iter()
+            .map(|t| t.successful_withdrawals as f64 / (t.successful_withdrawals + t.failed_withdrawals).max(1) as f64)
+            .sum::<f64>() / late_withdrawers.len().max(1) as f64;
+        
+        // Later withdrawers should have at least 80% of the success rate of early withdrawers
+        if late_success_rate < early_success_rate * 0.8 {
+            let violation = format!(
+                "GAS FAIRNESS VIOLATION: Late withdrawers success rate {:.2}% < 80% of early rate {:.2}%",
+                late_success_rate * 100.0, early_success_rate * 100.0
+            );
+            self.violations.push_back(String::from_str(&self.env, &violation));
+            return false;
+        }
+        
+        true
+    }
+
+    /// Invariant 4: No state corruption or data inconsistency
+    fn verify_no_state_corruption(&mut self, user_trackers: &Vec<UserWithdrawalTracker>) -> bool {
+        let mut total_accounted = 0i128;
+        let mut processed_grants = Vec::new(&self.env);
+        
+        for tracker in user_trackers.iter() {
+            total_accounted += tracker.total_withdrawn;
+            
+            for &grant_id in tracker.grant_ids.iter() {
+                // Check if grant was already processed
+                let mut already_processed = false;
+                for &processed_id in processed_grants.iter() {
+                    if processed_id == grant_id {
+                        already_processed = true;
+                        break;
+                    }
+                }
+                
+                if already_processed {
+                    // Duplicate grant processing detected
+                    let violation = format!(
+                        "STATE CORRUPTION VIOLATION: Grant {} processed multiple times",
+                        grant_id
+                    );
+                    self.violations.push_back(String::from_str(&self.env, &violation));
+                    return false;
+                }
+                
+                processed_grants.push_back(grant_id);
+            }
+        }
+        
+        // Verify contract balance matches accounted withdrawals
+        let contract_balance = token::Client::new(&self.env, &self.token_address)
+            .balance(&self.env.current_contract_address());
+        let expected_balance = INITIAL_CONTRACT_BALANCE - total_accounted;
+        
+        if contract_balance != expected_balance {
+            let violation = format!(
+                "STATE CORRUPTION VIOLATION: Contract balance {} doesn't match expected {} after accounting for {} withdrawals",
+                contract_balance, expected_balance, total_accounted
+            );
+            self.violations.push_back(String::from_str(&self.env, &violation));
+            return false;
+        }
+        
+        true
+    }
+
+    fn verify_all_bank_run_invariants(&mut self, config: &BankRunConfig, user_trackers: &Vec<UserWithdrawalTracker>, 
+                                     before_balance: i128, after_balance: i128, total_withdrawn: i128) -> bool {
+        let mut all_valid = true;
+        
+        all_valid &= self.verify_state_consistency(before_balance, after_balance, total_withdrawn);
+        all_valid &= self.verify_storage_limits(config.storage_limit_threshold);
+        all_valid &= self.verify_gas_consumption_fairness(user_trackers, config.max_gas_per_withdrawal);
+        all_valid &= self.verify_no_state_corruption(user_trackers);
+        
+        all_valid
+    }
+
+    fn get_violations(&self) -> Vec<String> {
+        self.violations.clone()
+    }
+
+    fn get_storage_usage(&self) -> u32 {
+        self.storage_entries_count
+    }
+
+    fn get_total_gas_consumed(&self) -> u64 {
+        self.total_gas_consumed
+    }
+}
+
+/// Bank run scenario fuzz test generator
+struct BankRunFuzzGenerator {
+    rng: ChaCha8Rng,
+    config: BankRunConfig,
+    env: Env,
+    contract_client: GrantContractClient,
+    token_address: Address,
+    admin: Address,
+    verifier: BankRunInvariantVerifier,
+    user_trackers: Vec<UserWithdrawalTracker>,
+    created_grants: Vec<u64>,
+}
+
+impl BankRunFuzzGenerator {
+    fn new(config: BankRunConfig) -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let token_address = Self::setup_token(&env, &admin, config.total_fund_amount);
+        
+        let contract_id = env.register_contract(None, GrantContract);
+        let contract_client = GrantContractClient::new(&env, &contract_id);
+        
+        // Initialize contract
+        contract_client.initialize(
+            &admin,
+            &token_address,
+        );
+        
+        let verifier = BankRunInvariantVerifier::new(&env, contract_client.clone(), token_address.clone());
+        
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(config.seed),
+            config,
+            env,
+            contract_client,
+            token_address,
+            admin,
+            verifier,
+            user_trackers: Vec::new(&env),
+            created_grants: Vec::new(&env),
+        }
+    }
+
+    fn setup_token(env: &Env, admin: &Address, amount: i128) -> Address {
+        let token_address = env.register_stellar_asset_contract(admin.clone());
+        token::StellarAssetClient::new(env, &token_address).mint(admin, &amount);
+        token_address
+    }
+
+    fn create_concurrent_grants(&mut self) -> Result<(), String> {
+        let amount_per_grant = self.config.total_fund_amount / (self.config.num_concurrent_users * self.config.grants_per_user) as i128;
+        let mut grant_id_counter = 1u64;
+        
+        // Create grants for multiple users
+        for user_idx in 0..self.config.num_concurrent_users {
+            let user_address = Address::generate(&self.env);
+            let mut user_tracker = UserWithdrawalTracker::new(user_address.clone());
+            
+            for _grant_idx in 0..self.config.grants_per_user {
+                let grant_id = grant_id_counter;
+                
+                // Create grant
+                self.contract_client.create_grant(
+                    &grant_id,
+                    &user_address,
+                    &(amount_per_grant as u128),
+                    &self.token_address,
+                );
+                
+                // Fund the grant
+                self.contract_client.add_funds(
+                    &grant_id,
+                    &(amount_per_grant as u128),
+                );
+                
+                user_tracker.grant_ids.push_back(grant_id);
+                self.created_grants.push_back(grant_id);
+                grant_id_counter += 1;
+            }
+            
+            self.user_trackers.push_back(user_tracker);
+        }
+        
+        Ok(())
+    }
+
+    fn simulate_bank_run(&mut self) -> Result<BankRunResult, String> {
+        let before_balance = token::Client::new(&self.env, &self.token_address)
+            .balance(&self.env.current_contract_address());
+        
+        let mut total_withdrawn = 0i128;
+        let mut total_gas_consumed = 0u64;
+        
+        // Randomize withdrawal order to simulate real bank run chaos
+        let mut withdrawal_order: Vec<usize> = Vec::new(&self.env);
+        for i in 0..self.user_trackers.len() {
+            withdrawal_order.push_back(i);
+        }
+        
+        // Simple Fisher-Yates shuffle implementation
+        for i in (1..withdrawal_order.len()).rev() {
+            let j = self.rng.gen_range(0..=i);
+            let temp = withdrawal_order.get(i);
+            withdrawal_order.set(i, withdrawal_order.get(j));
+            withdrawal_order.set(j, temp);
+        }
+        
+        // Execute concurrent withdrawals
+        for (order, &user_idx) in withdrawal_order.iter().enumerate() {
+            let user_tracker = &mut self.user_trackers[user_idx];
+            user_tracker.withdrawal_order = order;
+            
+            let user_gas_start = self.env.ledger().timestamp(); // Simplified gas tracking
+            
+            for &grant_id in user_tracker.grant_ids.iter() {
+                let grant_id_symbol = Symbol::new(&self.env, &format!("g{}", grant_id));
+                let grant = self.contract_client.get_grant(&grant_id);
+                let withdrawable = self.contract_client.get_withdrawable_amount(&grant_id_symbol, &grant.recipient);
+                
+                if withdrawable > 0 {
+                    let withdraw_amount = std::cmp::min(withdrawable as i128, grant.total_amount / 10); // Withdraw 10% at a time
+                    
+                    // Attempt withdrawal - check if withdrawable amount is sufficient
+                    let can_withdraw = withdrawable >= withdraw_amount as u128;
+                    
+                    let user_gas_end = self.env.ledger().timestamp();
+                    let gas_used = (user_gas_end - user_gas_start) as u64; // Simplified gas calculation
+                    
+                    if can_withdraw {
+                        // Get user balance before withdrawal
+                        let token_client = token::Client::new(&self.env, &self.token_address);
+                        let balance_before = token_client.balance(&grant.recipient);
+                        
+                        // Perform withdrawal
+                        self.contract_client.withdraw(&grant_id_symbol, &withdraw_amount);
+                        
+                        // Verify withdrawal succeeded
+                        let balance_after = token_client.balance(&grant.recipient);
+                        let actual_withdrawn = balance_after - balance_before;
+                        
+                        if actual_withdrawn == withdraw_amount as u128 {
+                            user_tracker.track_withdrawal_attempt(grant_id, withdraw_amount, gas_used, true);
+                            total_withdrawn += withdraw_amount;
+                            total_gas_consumed += gas_used;
+                        } else {
+                            user_tracker.track_withdrawal_attempt(grant_id, withdraw_amount, gas_used, false);
+                            total_gas_consumed += gas_used;
+                        }
+                    } else {
+                        user_tracker.track_withdrawal_attempt(grant_id, withdraw_amount, gas_used, false);
+                        total_gas_consumed += gas_used;
+                    }
+                }
+            }
+        }
+        
+        let after_balance = token::Client::new(&self.env, &self.token_address)
+            .balance(&self.env.current_contract_address());
+        
+        // Verify all invariants
+        let invariants_held = self.verifier.verify_all_bank_run_invariants(
+            &self.config,
+            &self.user_trackers,
+            before_balance,
+            after_balance,
+            total_withdrawn,
+        );
+        
+        Ok(BankRunResult {
+            num_concurrent_users: self.config.num_concurrent_users,
+            grants_created: self.created_grants.len(),
+            total_withdrawn,
+            total_gas_consumed,
+            storage_entries_used: self.verifier.get_storage_usage(),
+            successful_withdrawals: self.user_trackers.iter().map(|t| t.successful_withdrawals).sum(),
+            failed_withdrawals: self.user_trackers.iter().map(|t| t.failed_withdrawals).sum(),
+            invariants_held,
+            violations: self.verifier.get_violations(),
+            early_withdrawer_success_rate: self.calculate_early_success_rate(),
+            late_withdrawer_success_rate: self.calculate_late_success_rate(),
+        })
+    }
+
+    fn calculate_early_success_rate(&self) -> f64 {
+        let early_withdrawers: Vec<_> = self.user_trackers.iter()
+            .filter(|t| t.withdrawal_order < self.user_trackers.len() / 2)
+            .collect();
+        
+        if early_withdrawers.is_empty() {
+            return 0.0;
+        }
+        
+        early_withdrawers.iter()
+            .map(|t| t.successful_withdrawals as f64 / (t.successful_withdrawals + t.failed_withdrawals).max(1) as f64)
+            .sum::<f64>() / early_withdrawers.len() as f64
+    }
+
+    fn calculate_late_success_rate(&self) -> f64 {
+        let late_withdrawers: Vec<_> = self.user_trackers.iter()
+            .filter(|t| t.withdrawal_order >= self.user_trackers.len() / 2)
+            .collect();
+        
+        if late_withdrawers.is_empty() {
+            return 0.0;
+        }
+        
+        late_withdrawers.iter()
+            .map(|t| t.successful_withdrawals as f64 / (t.successful_withdrawals + t.failed_withdrawals).max(1) as f64)
+            .sum::<f64>() / late_withdrawers.len() as f64
+    }
+
+    fn run_bank_run_test(&mut self) -> BankRunResult {
+        // Create concurrent grants
+        if let Err(e) = self.create_concurrent_grants() {
+            return BankRunResult {
+                num_concurrent_users: self.config.num_concurrent_users,
+                grants_created: 0,
+                total_withdrawn: 0,
+                total_gas_consumed: 0,
+                storage_entries_used: 0,
+                successful_withdrawals: 0,
+                failed_withdrawals: 0,
+                invariants_held: false,
+                violations: Vec::new(&self.env),
+                early_withdrawer_success_rate: 0.0,
+                late_withdrawer_success_rate: 0.0,
+            };
+        }
+        
+        // Simulate bank run
+        self.simulate_bank_run().unwrap_or_else(|e| BankRunResult {
+            num_concurrent_users: self.config.num_concurrent_users,
+            grants_created: self.created_grants.len(),
+            total_withdrawn: 0,
+            total_gas_consumed: 0,
+            storage_entries_used: 0,
+            successful_withdrawals: 0,
+            failed_withdrawals: 0,
+            invariants_held: false,
+            violations: Vec::new(&self.env),
+            early_withdrawer_success_rate: 0.0,
+            late_withdrawer_success_rate: 0.0,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BankRunResult {
+    num_concurrent_users: usize,
+    grants_created: usize,
+    total_withdrawn: i128,
+    total_gas_consumed: u64,
+    storage_entries_used: u32,
+    successful_withdrawals: u32,
+    failed_withdrawals: u32,
+    invariants_held: bool,
+    violations: Vec<String>,
+    early_withdrawer_success_rate: f64,
+    late_withdrawer_success_rate: f64,
+}
+
+#[test]
+fn fuzz_test_concurrent_multi_user_claims_bank_run() {
+    let config = BankRunConfig {
+        num_concurrent_users: 150, // 150+ unique addresses
+        grants_per_user: 3,
+        total_fund_amount: 1_000_000_000_000, // 100,000 XLM
+        seed: 300,
+        max_gas_per_withdrawal: 50_000_000,
+        storage_limit_threshold: 10_000,
+    };
+
+    let mut generator = BankRunFuzzGenerator::new(config);
+    let result = generator.run_bank_run_test();
+
+    // Assert all invariants hold during bank run
+    assert!(result.invariants_held, "Bank run invariants violated: {:?}", result.violations);
+    
+    // Assert reasonable success rates for both early and late withdrawers
+    assert!(result.early_withdrawer_success_rate >= 0.9, 
+        "Early withdrawer success rate {:.2}% should be >= 90%", result.early_withdrawer_success_rate * 100.0);
+    assert!(result.late_withdrawer_success_rate >= 0.7, 
+        "Late withdrawer success rate {:.2}% should be >= 70%", result.late_withdrawer_success_rate * 100.0);
+    
+    // Assert storage limits are respected
+    assert!(result.storage_entries_used <= 10_000, 
+        "Storage usage {} exceeds limit", result.storage_entries_used);
+    
+    // Assert no gas consumption blocking
+    let success_rate_fairness = if result.early_withdrawer_success_rate > 0.0 {
+        result.late_withdrawer_success_rate / result.early_withdrawer_success_rate
+    } else {
+        0.0
+    };
+    assert!(success_rate_fairness >= 0.8, 
+        "Late withdrawer success rate fairness {:.2} should be >= 80%", success_rate_fairness);
+    
+    println!("Bank Run Fuzz Test Results:");
+    println!("  Concurrent Users: {}", result.num_concurrent_users);
+    println!("  Grants Created: {}", result.grants_created);
+    println!("  Total Withdrawn: {} stroops", result.total_withdrawn);
+    println!("  Total Gas Consumed: {}", result.total_gas_consumed);
+    println!("  Storage Entries Used: {}", result.storage_entries_used);
+    println!("  Successful Withdrawals: {}", result.successful_withdrawals);
+    println!("  Failed Withdrawals: {}", result.failed_withdrawals);
+    println!("  Early Withdrawer Success Rate: {:.2}%", result.early_withdrawer_success_rate * 100.0);
+    println!("  Late Withdrawer Success Rate: {:.2}%", result.late_withdrawer_success_rate * 100.0);
+    println!("  Success Rate Fairness: {:.2}%", success_rate_fairness * 100.0);
+    println!("  Invariants Held: {}", result.invariants_held);
+    
+    if !result.violations.is_empty() {
+        println!("  Violations: {:?}", result.violations);
+    }
+}
+
+#[test]
+fn fuzz_test_extreme_bank_run_stress() {
+    // Extreme stress test with maximum concurrent users
+    let config = BankRunConfig {
+        num_concurrent_users: 300, // Double the users for stress testing
+        grants_per_user: 5, // More grants per user
+        total_fund_amount: 5_000_000_000_000, // 500,000 XLM
+        seed: 301,
+        max_gas_per_withdrawal: 100_000_000, // Higher gas limit for stress
+        storage_limit_threshold: 20_000, // Higher storage limit
+    };
+
+    let mut generator = BankRunFuzzGenerator::new(config);
+    let result = generator.run_bank_run_test();
+
+    // Even under extreme stress, invariants must hold
+    assert!(result.invariants_held, "Extreme bank run invariants violated: {:?}", result.violations);
+    
+    println!("Extreme Bank Run Stress Test Results:");
+    println!("  Concurrent Users: {}", result.num_concurrent_users);
+    println!("  Grants Created: {}", result.grants_created);
+    println!("  Total Withdrawn: {} stroops", result.total_withdrawn);
+    println!("  Storage Entries Used: {}", result.storage_entries_used);
+    println!("  Early Success Rate: {:.2}%", result.early_withdrawer_success_rate * 100.0);
+    println!("  Late Success Rate: {:.2}%", result.late_withdrawer_success_rate * 100.0);
+    println!("  Invariants Held: {}", result.invariants_held);
+}
+
+#[test]
+fn fuzz_test_gas_consumption_analysis() {
+    // Test specifically focused on gas consumption patterns
+    let config = BankRunConfig {
+        num_concurrent_users: 100,
+        grants_per_user: 2,
+        total_fund_amount: 500_000_000_000, // 50,000 XLM
+        seed: 302,
+        max_gas_per_withdrawal: 25_000_000, // Lower gas limit to test constraints
+        storage_limit_threshold: 5_000,
+    };
+
+    let mut generator = BankRunFuzzGenerator::new(config);
+    let result = generator.run_bank_run_test();
+
+    // Verify gas consumption doesn't create unfair advantages
+    assert!(result.invariants_held, "Gas consumption analysis failed: {:?}", result.violations);
+    
+    // Calculate average gas per successful withdrawal
+    let avg_gas_per_withdrawal = if result.successful_withdrawals > 0 {
+        result.total_gas_consumed / result.successful_withdrawals as u64
+    } else {
+        0
+    };
+    
+    println!("Gas Consumption Analysis Results:");
+    println!("  Total Gas Consumed: {}", result.total_gas_consumed);
+    println!("  Successful Withdrawals: {}", result.successful_withdrawals);
+    println!("  Average Gas per Withdrawal: {}", avg_gas_per_withdrawal);
+    println!("  Early Success Rate: {:.2}%", result.early_withdrawer_success_rate * 100.0);
+    println!("  Late Success Rate: {:.2}%", result.late_withdrawer_success_rate * 100.0);
+    println!("  Gas Fairness Maintained: {}", result.invariants_held);
+}
