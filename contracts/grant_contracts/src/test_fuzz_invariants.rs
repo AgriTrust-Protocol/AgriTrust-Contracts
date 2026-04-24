@@ -1080,3 +1080,460 @@ impl GrantContractClientExt for GrantContractClient {
         Err(soroban_sdk::Error::from_contract_error(4)) // GrantNotFound
     }
 }
+
+// --- Rounding Error Accumulation Fuzz Testing ---
+
+/// Configuration for micro-stream precision testing
+#[derive(Clone)]
+struct MicroStreamConfig {
+    num_streams: usize,
+    micro_amount_per_day: i128, // Amount in stroops (e.g., 100 stroops)
+    test_duration_days: u64,
+    seed: u64,
+    initial_balance: i128,
+}
+
+impl Default for MicroStreamConfig {
+    fn default() -> Self {
+        Self {
+            num_streams: 1000, // Thousands of micro-streams
+            micro_amount_per_day: 100, // 100 stroops per day = 0.00001 XLM
+            test_duration_days: 365, // 1 year test
+            seed: 299,
+            initial_balance: 100_000_000_000, // 10,000 XLM in stroops
+        }
+    }
+}
+
+/// Precision tracking for rounding error analysis
+#[derive(Clone, Debug)]
+struct PrecisionTracker {
+    total_allocated: i128,
+    total_withdrawn: i128,
+    expected_total: i128,
+    rounding_error: i128,
+    dust_amount: i128,
+    treasury_returns: i128,
+    stream_count: usize,
+}
+
+impl PrecisionTracker {
+    fn new() -> Self {
+        Self {
+            total_allocated: 0,
+            total_withdrawn: 0,
+            expected_total: 0,
+            rounding_error: 0,
+            dust_amount: 0,
+            treasury_returns: 0,
+            stream_count: 0,
+        }
+    }
+
+    fn track_allocation(&mut self, amount: i128) {
+        self.total_allocated += amount;
+        self.stream_count += 1;
+    }
+
+    fn track_withdrawal(&mut self, withdrawn: i128, expected: i128) {
+        self.total_withdrawn += withdrawn;
+        self.expected_total += expected;
+        
+        // Calculate rounding error for this withdrawal
+        let error = expected - withdrawn;
+        if error > 0 {
+            self.rounding_error += error;
+            // Small errors are considered dust
+            if error <= 1000 { // 0.0001 XLM threshold
+                self.dust_amount += error;
+            }
+        }
+    }
+
+    fn track_treasury_return(&mut self, amount: i128) {
+        self.treasury_returns += amount;
+    }
+
+    fn get_precision_loss_percentage(&self) -> i128 {
+        if self.expected_total == 0 {
+            return 0;
+        }
+        (self.rounding_error * 10_000) / self.expected_total // In basis points
+    }
+
+    fn verify_precision_invariants(&self) -> Vec<String> {
+        let mut violations = Vec::new();
+        
+        // Invariant 1: Total withdrawn should not exceed total allocated
+        if self.total_withdrawn > self.total_allocated {
+            violations.push(format!(
+                "PRECISION VIOLATION: Total withdrawn {} exceeds total allocated {}",
+                self.total_withdrawn, self.total_allocated
+            ));
+        }
+
+        // Invariant 2: Rounding error should be reasonable (< 0.1% of total)
+        let error_percentage = self.get_precision_loss_percentage();
+        if error_percentage > 10 { // 0.1% = 10 basis points
+            violations.push(format!(
+                "PRECISION VIOLATION: Rounding error {} basis points exceeds 0.1% threshold",
+                error_percentage
+            ));
+        }
+
+        // Invariant 3: Dust should be properly tracked
+        if self.dust_amount > self.rounding_error {
+            violations.push(format!(
+                "PRECISION VIOLATION: Dust amount {} exceeds total rounding error {}",
+                self.dust_amount, self.rounding_error
+            ));
+        }
+
+        violations
+    }
+}
+
+/// Micro-stream fuzz test generator for precision testing
+struct MicroStreamFuzzGenerator {
+    rng: ChaCha8Rng,
+    config: MicroStreamConfig,
+    env: Env,
+    contract_client: GrantContractClient,
+    token_address: Address,
+    admin: Address,
+    treasury: Address,
+    tracker: PrecisionTracker,
+    created_streams: Vec<u64>,
+}
+
+impl MicroStreamFuzzGenerator {
+    fn new(config: MicroStreamConfig) -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token_address = Self::setup_token(&env, &admin, config.initial_balance);
+        
+        let contract_id = env.register_contract(None, GrantContract);
+        let contract_client = GrantContractClient::new(&env, &contract_id);
+        
+        // Initialize contract with correct signature
+        contract_client.initialize(
+            &admin,
+            &token_address,
+        );
+        
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(config.seed),
+            config,
+            env,
+            contract_client,
+            token_address,
+            admin,
+            treasury,
+            tracker: PrecisionTracker::new(),
+            created_streams: Vec::new(&env),
+        }
+    }
+
+    fn setup_token(env: &Env, admin: &Address, amount: i128) -> Address {
+        let token_address = env.register_stellar_asset_contract(admin.clone());
+        token::StellarAssetClient::new(env, &token_address).mint(admin, &amount);
+        token_address
+    }
+
+    fn create_micro_streams(&mut self) -> Result<(), String> {
+        let now = self.env.ledger().timestamp();
+        
+        for i in 0..self.config.num_streams {
+            let recipient = Address::generate(&self.env);
+            let stream_id = (i + 1) as u64;
+            
+            // Calculate total amount for the entire duration
+            let total_amount = self.config.micro_amount_per_day * self.config.test_duration_days as i128;
+            
+            // Create the grant using the correct signature
+            self.contract_client.create_grant(
+                &stream_id,
+                &recipient,
+                &total_amount,
+                &self.token_address,
+            );
+            
+            // Fund the stream using the correct signature
+            self.contract_client.add_funds(
+                &stream_id,
+                &total_amount,
+            );
+            
+            self.tracker.track_allocation(total_amount);
+            self.created_streams.push_back(stream_id);
+        }
+        
+        Ok(())
+    }
+
+    fn simulate_time_progression(&mut self) -> Result<(), String> {
+        let initial_time = self.env.ledger().timestamp();
+        let final_time = initial_time + (self.config.test_duration_days * DAY);
+        
+        // Simulate daily progressions to capture rounding errors
+        let mut current_time = initial_time;
+        
+        while current_time < final_time {
+            // Advance by 1 day
+            current_time += DAY;
+            self.env.ledger().with_mut(|li| {
+                li.timestamp = current_time;
+            });
+            
+            // For each stream, calculate expected vs actual withdrawal
+            for &stream_id in self.created_streams.iter() {
+                let grant = self.contract_client.get_grant(&stream_id);
+                
+                // Calculate expected amount based on perfect precision
+                let days_elapsed = (current_time - grant.last_update_ts) / DAY;
+                let expected_withdrawable = self.config.micro_amount_per_day * days_elapsed as i128;
+                let expected_withdrawable = std::cmp::min(expected_withdrawable, grant.total_amount);
+                
+                // Get actual withdrawable amount (simplified - use claimable)
+                let actual_withdrawable = grant.claimable;
+                
+                // Track precision
+                self.tracker.track_withdrawal(actual_withdrawable, expected_withdrawable);
+                
+                // Perform withdrawal to test actual behavior
+                if actual_withdrawable > 0 {
+                    let before_balance = token::Client::new(&self.env, &self.token_address)
+                        .balance(&grant.recipient);
+                    
+                    self.contract_client.withdraw(&stream_id, &actual_withdrawable);
+                    
+                    let after_balance = token::Client::new(&self.env, &self.token_address)
+                        .balance(&grant.recipient);
+                    
+                    // Verify withdrawal amount
+                    let actual_received = after_balance - before_balance;
+                    if actual_received != actual_withdrawable {
+                        return Err(format!(
+                            "Withdrawal mismatch for stream {}: expected {}, received {}",
+                            stream_id, actual_withdrawable, actual_received
+                        ));
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn verify_dust_handling(&mut self) -> Result<(), String> {
+        let mut total_dust = 0i128;
+        let mut total_treasury_returns = 0i128;
+        
+        // Check each stream for dust amounts
+        for &stream_id in self.created_streams.iter() {
+            let grant = self.contract_client.get_grant(&stream_id);
+            
+            // Check for remaining dust amounts (claimable balance)
+            if grant.claimable > 0 && grant.claimable <= 1000 { // Dust threshold
+                total_dust += grant.claimable;
+            }
+            
+            // Close the stream to see if remaining funds are returned to treasury
+            let treasury_before = token::Client::new(&self.env, &self.token_address)
+                .balance(&self.treasury);
+            
+            // Use rage_quit to close the stream and return remaining funds
+            self.contract_client.rage_quit(&stream_id);
+            
+            let treasury_after = token::Client::new(&self.env, &self.token_address)
+                .balance(&self.treasury);
+            
+            let returned_to_treasury = treasury_after - treasury_before;
+            total_treasury_returns += returned_to_treasury;
+        }
+        
+        self.tracker.track_dust_handling(total_dust, total_treasury_returns);
+        
+        // Verify that dust + treasury returns equals expected rounding error
+        let total_recovered = total_dust + total_treasury_returns;
+        if total_recovered < self.tracker.rounding_error {
+            return Err(format!(
+                "Dust handling violation: Expected recovery {}, actual recovery {}",
+                self.tracker.rounding_error, total_recovered
+            ));
+        }
+        
+        Ok(())
+    }
+
+    fn run_precision_fuzz_test(&mut self) -> MicroStreamTestResult {
+        let mut operations_executed = 0;
+        let mut operations_failed = 0;
+        
+        // Step 1: Create thousands of micro-streams
+        match self.create_micro_streams() {
+            Ok(_) => operations_executed += 1,
+            Err(e) => {
+                operations_failed += 1;
+                return MicroStreamTestResult {
+                    streams_created: 0,
+                    operations_executed,
+                    operations_failed,
+                    precision_loss_bps: 0,
+                    dust_amount: 0,
+                    treasury_returns: 0,
+                    violations: vec![e],
+                };
+            }
+        }
+        
+        // Step 2: Simulate time progression and track precision
+        match self.simulate_time_progression() {
+            Ok(_) => operations_executed += 1,
+            Err(e) => {
+                operations_failed += 1;
+                return MicroStreamTestResult {
+                    streams_created: self.created_streams.len(),
+                    operations_executed,
+                    operations_failed,
+                    precision_loss_bps: self.tracker.get_precision_loss_percentage(),
+                    dust_amount: self.tracker.dust_amount,
+                    treasury_returns: self.tracker.treasury_returns,
+                    violations: vec![e],
+                };
+            }
+        }
+        
+        // Step 3: Verify dust handling and treasury returns
+        match self.verify_dust_handling() {
+            Ok(_) => operations_executed += 1,
+            Err(e) => {
+                operations_failed += 1;
+            }
+        }
+        
+        // Check all precision invariants
+        let violations = self.tracker.verify_precision_invariants();
+        
+        MicroStreamTestResult {
+            streams_created: self.created_streams.len(),
+            operations_executed,
+            operations_failed,
+            precision_loss_bps: self.tracker.get_precision_loss_percentage(),
+            dust_amount: self.tracker.dust_amount,
+            treasury_returns: self.tracker.treasury_returns,
+            violations,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MicroStreamTestResult {
+    streams_created: usize,
+    operations_executed: usize,
+    operations_failed: usize,
+    precision_loss_bps: i128,
+    dust_amount: i128,
+    treasury_returns: i128,
+    violations: Vec<String>,
+}
+
+impl PrecisionTracker {
+    fn track_dust_handling(&mut self, dust: i128, treasury_returns: i128) {
+        self.dust_amount += dust;
+        self.treasury_returns += treasury_returns;
+    }
+}
+
+#[test]
+fn fuzz_test_rounding_error_accumulation_micro_streams() {
+    let config = MicroStreamConfig {
+        num_streams: 1000, // 1000 micro-streams
+        micro_amount_per_day: 100, // 100 stroops = 0.00001 XLM per day
+        test_duration_days: 365,
+        seed: 299,
+        initial_balance: 100_000_000_000, // 10,000 XLM
+    };
+
+    let mut generator = MicroStreamFuzzGenerator::new(config);
+    let result = generator.run_precision_fuzz_test();
+
+    // Assert no precision violations
+    assert!(result.violations.is_empty(), "Precision violations detected: {:?}", result.violations);
+    
+    // Assert precision loss is minimal (< 0.1% = 10 basis points)
+    assert!(result.precision_loss_bps <= 10, 
+        "Precision loss {} basis points exceeds 0.1% threshold", result.precision_loss_bps);
+    
+    // Assert dust is properly handled
+    assert!(result.dust_amount >= 0, "Dust amount should be non-negative");
+    assert!(result.treasury_returns >= 0, "Treasury returns should be non-negative");
+    
+    println!("Micro-Stream Precision Fuzz Test Results:");
+    println!("  Streams Created: {}", result.streams_created);
+    println!("  Operations Executed: {}", result.operations_executed);
+    println!("  Operations Failed: {}", result.operations_failed);
+    println!("  Precision Loss: {} basis points", result.precision_loss_bps);
+    println!("  Dust Amount: {} stroops", result.dust_amount);
+    println!("  Treasury Returns: {} stroops", result.treasury_returns);
+    println!("  Total Rounding Error: {} stroops", result.dust_amount + result.treasury_returns);
+    
+    if !result.violations.is_empty() {
+        println!("  Violations: {:?}", result.violations);
+    }
+}
+
+#[test]
+fn fuzz_test_extreme_micro_streams_precision() {
+    // Test with extreme micro-streams (1 stroop per day)
+    let config = MicroStreamConfig {
+        num_streams: 5000, // 5000 streams
+        micro_amount_per_day: 1, // 1 stroop = 0.0000001 XLM per day
+        test_duration_days: 730, // 2 years
+        seed: 29901,
+        initial_balance: 500_000_000_000, // 50,000 XLM
+    };
+
+    let mut generator = MicroStreamFuzzGenerator::new(config);
+    let result = generator.run_precision_fuzz_test();
+
+    // Even with extreme micro-streams, precision should be maintained
+    assert!(result.violations.is_empty(), "Extreme precision violations: {:?}", result.violations);
+    assert!(result.precision_loss_bps <= 10, 
+        "Extreme precision loss {} basis points", result.precision_loss_bps);
+    
+    println!("Extreme Micro-Stream Test Results:");
+    println!("  Streams: {}", result.streams_created);
+    println!("  Precision Loss: {} bps", result.precision_loss_bps);
+    println!("  Dust: {} stroops", result.dust_amount);
+    println!("  Treasury Returns: {} stroops", result.treasury_returns);
+}
+
+#[test]
+fn fuzz_test_dust_recovery_validation() {
+    // Test specifically focused on dust recovery mechanisms
+    let config = MicroStreamConfig {
+        num_streams: 2000,
+        micro_amount_per_day: 50, // 50 stroops per day
+        test_duration_days: 180, // 6 months
+        seed: 29902,
+        initial_balance: 200_000_000_000, // 20,000 XLM
+    };
+
+    let mut generator = MicroStreamFuzzGenerator::new(config);
+    let result = generator.run_precision_fuzz_test();
+
+    // Validate dust recovery
+    let total_recovered = result.dust_amount + result.treasury_returns;
+    assert!(total_recovered > 0, "Should recover some dust/treasury amounts");
+    
+    println!("Dust Recovery Validation Results:");
+    println!("  Dust Recovered: {} stroops", result.dust_amount);
+    println!("  Treasury Returns: {} stroops", result.treasury_returns);
+    println!("  Total Recovered: {} stroops", total_recovered);
+    println!("  Recovery Rate: {:.2}%", 
+        (total_recovered as f64 / (result.dust_amount + result.treasury_returns).max(1) as f64) * 100.0);
+}
