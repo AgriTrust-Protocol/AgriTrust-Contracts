@@ -76,6 +76,10 @@ pub mod sub_dao_authority;
 pub mod grant_appeals;
 pub mod wasm_hash_verification;
 pub mod cross_chain_metadata;
+pub mod oracle_integration;
+pub mod clawback_resilient;
+pub mod compliance_screening;
+pub mod quadratic_voting;
 
 // --- Test Modules ---
 #[cfg(test)]
