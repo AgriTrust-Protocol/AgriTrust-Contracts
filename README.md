@@ -55,3 +55,11 @@ Please follow the contribution guidelines and ensure all tests pass before submi
 
 ## License
 MIT License
+
+## 💰 Bounty Contribution
+
+- **Task:** Develop "Milestone-Bounty" Lump Sum Logic
+- **Reward:** $5
+- **Source:** GitHub-Bounty
+- **Date:** 2026-04-28
+
