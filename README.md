@@ -55,3 +55,11 @@ Please follow the contribution guidelines and ensure all tests pass before submi
 
 ## License
 MIT License
+
+## 💰 Bounty Contribution
+
+- **Task:** Built-in Tax Withholding Hook for Institutional Grants
+- **Reward:** $100
+- **Source:** GitHub-Paid
+- **Date:** 2026-04-28
+
