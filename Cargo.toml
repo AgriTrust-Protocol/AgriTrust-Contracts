@@ -5,7 +5,8 @@ members = [
     "contracts/vesting_contracts",
     "contracts/arbitration",
     "contracts/compliance",
-    "contracts/zk_kyc"
+    "contracts/zk_kyc",
+    "contracts/contrib"
 ]
 
 [workspace.dependencies]
