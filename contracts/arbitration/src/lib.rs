@@ -1,9 +1,6 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 use treasury::SpeedBumpContractClient;
-
-// ---------------------------------------------------------------------
-// Data keys for the Arbitration contract
-// ---------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,17 +47,21 @@ impl ArbitrationContract {
         env.storage().instance().set(&DataKey::DisputeCounter, &0u32);
     }
 
-    pub fn raise_dispute(env: Env, grant_id: u32, funder: Address, grantee: Address, amount: i128, arbitrator: Address) -> u32 {
+    pub fn raise_dispute(
+        env: Env,
+        grant_id: u32,
+        funder: Address,
+        grantee: Address,
+        amount: i128,
+        arbitrator: Address,
+    ) -> u32 {
         funder.require_auth();
-        
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token_addr);
         token_client.transfer(&funder, &env.current_contract_address(), &amount);
-
         let mut counter: u32 = env.storage().instance().get(&DataKey::DisputeCounter).unwrap();
         counter += 1;
         env.storage().instance().set(&DataKey::DisputeCounter, &counter);
-
         let dispute = Dispute {
             grant_id,
             funder,
@@ -69,7 +70,6 @@ impl ArbitrationContract {
             status: DisputeStatus::Pending,
             arbitrator,
         };
-
         env.storage().persistent().set(&DataKey::Dispute(counter), &dispute);
         counter
     }
@@ -77,24 +77,22 @@ impl ArbitrationContract {
     pub fn resolve_dispute(env: Env, dispute_id: u32, funder_award: i128, grantee_award: i128) {
         let mut dispute: Dispute = env.storage().persistent().get(&DataKey::Dispute(dispute_id)).unwrap();
         dispute.arbitrator.require_auth();
-        
-        if dispute.status == DisputeStatus::Resolved { panic!("Already resolved"); }
-        if funder_award + grantee_award > dispute.amount { panic!("Awards exceed amount"); }
-
+        if dispute.status == DisputeStatus::Resolved {
+            panic!("Already resolved");
+        }
+        if funder_award + grantee_award > dispute.amount {
+            panic!("Awards exceed amount");
+        }
         dispute.status = DisputeStatus::Resolved;
 
-        // Use Treasury speed‑bump for payouts
         let treasury_addr: Address = env.storage().instance().get(&DataKey::Treasury).expect("Treasury not set");
-        let treasury_client = crate::contracts::treasury::SpeedBumpContractClient::new(&env, &treasury_addr);
-
+        let treasury_client = SpeedBumpContractClient::new(&env, &treasury_addr);
         if funder_award > 0 {
-            // Transfer from treasury to funder via speed‑bump
             treasury_client.release_with_speedbump(&env.current_contract_address(), &dispute.funder, &(funder_award as u64));
         }
         if grantee_award > 0 {
             treasury_client.release_with_speedbump(&env.current_contract_address(), &dispute.grantee, &(grantee_award as u64));
         }
-
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
     }
 }
