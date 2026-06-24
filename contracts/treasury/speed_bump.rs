@@ -203,7 +203,7 @@ impl SpeedBumpContract {
     ///
     /// Returns `true` if the transfer was executed immediately, `false` if it
     /// was queued for later execution.
-    pub fn release_with_speedbump(env: Env, caller: Address, recipient: Address, amount: u64) -> bool {
+    pub fn release_with_speedbump(env: Env, _caller: Address, recipient: Address, amount: u64) -> bool {
         // Anyone can call this; we only enforce the speed‑bump based on the
         // treasury balance and threshold.
         let treasury: u64 = env.storage().instance().get(&TreasuryKey::TotalTreasury).unwrap_or(0);

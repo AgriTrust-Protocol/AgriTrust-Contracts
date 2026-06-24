@@ -2,7 +2,6 @@
 
 use super::*;
 use soroban_sdk::{testutils::Address as _, Address, Env};
-use soroban_sdk::token::Client as TokenClient;
 
 #[test]
 fn test_arbitration() {

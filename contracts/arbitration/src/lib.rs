@@ -101,3 +101,6 @@ impl ArbitrationContract {
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
     }
 }
+
+#[cfg(test)]
+mod test;

@@ -349,3 +349,6 @@ impl ComplianceContract {
         env.storage().persistent().set(&DataKey::PendingRevocation(pending.address.clone()), &pending);
     }
 }
+
+#[cfg(test)]
+mod test;

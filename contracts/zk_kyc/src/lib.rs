@@ -36,3 +36,6 @@ impl ZKKYCContract {
         env.storage().persistent().get(&DataKey::KycStatus(user)).unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod test;
