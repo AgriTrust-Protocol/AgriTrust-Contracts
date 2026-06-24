@@ -1,11 +1,16 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use treasury::SpeedBumpContractClient;
+
+// ---------------------------------------------------------------------
+// Data keys for the Arbitration contract
+// ---------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     Token,
+    Treasury,
     DisputeCounter,
     Dispute(u32),
 }
@@ -34,13 +39,14 @@ pub struct ArbitrationContract;
 
 #[contractimpl]
 impl ArbitrationContract {
-    pub fn init(env: Env, admin: Address, token: Address) {
+    pub fn init(env: Env, admin: Address, token: Address, treasury: Address) {
         admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::DisputeCounter, &0u32);
     }
 
@@ -77,14 +83,16 @@ impl ArbitrationContract {
 
         dispute.status = DisputeStatus::Resolved;
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = token::Client::new(&env, &token_addr);
+        // Use Treasury speed‑bump for payouts
+        let treasury_addr: Address = env.storage().instance().get(&DataKey::Treasury).expect("Treasury not set");
+        let treasury_client = crate::contracts::treasury::SpeedBumpContractClient::new(&env, &treasury_addr);
 
         if funder_award > 0 {
-            token_client.transfer(&env.current_contract_address(), &dispute.funder, &funder_award);
+            // Transfer from treasury to funder via speed‑bump
+            treasury_client.release_with_speedbump(&env.current_contract_address(), &dispute.funder, &(funder_award as u64));
         }
         if grantee_award > 0 {
-            token_client.transfer(&env.current_contract_address(), &dispute.grantee, &grantee_award);
+            treasury_client.release_with_speedbump(&env.current_contract_address(), &dispute.grantee, &(grantee_award as u64));
         }
 
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);

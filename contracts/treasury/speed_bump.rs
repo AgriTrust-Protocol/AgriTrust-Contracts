@@ -194,4 +194,58 @@ impl SpeedBumpContract {
             panic!("Unauthorized: caller is not admin");
         }
     }
+
+    // ---------------------------------------------------------------------
+    // New public APIs for batch execution and external release with speed‑bump
+    // ---------------------------------------------------------------------
+
+    /// Release funds to a recipient, applying the speed‑bump logic.
+    ///
+    /// Returns `true` if the transfer was executed immediately, `false` if it
+    /// was queued for later execution.
+    pub fn release_with_speedbump(env: Env, caller: Address, recipient: Address, amount: u64) -> bool {
+        // Anyone can call this; we only enforce the speed‑bump based on the
+        // treasury balance and threshold.
+        let treasury: u64 = env.storage().instance().get(&TreasuryKey::TotalTreasury).unwrap_or(0);
+        let threshold = (treasury * THRESHOLD_BPS) / 10_000;
+        if amount > threshold {
+            // High‑value: queue with speed bump
+            Self::queue_transfer(&env, recipient, amount);
+            false
+        } else {
+            // Low‑value: execute immediately
+            Self::do_transfer(&env, &recipient, amount);
+            true
+        }
+    }
+
+    /// Execute all pending transfers that have passed their delay window.
+    /// Skips transfers still under the speed‑bump without failing.
+    pub fn batch_execute(env: Env, caller: Address) {
+        // Ensure only admin can trigger batch execution (optional – adjust as needed)
+        Self::assert_admin(&env, &caller);
+        let mut transfers: Vec<PendingTransfer> = env
+            .storage()
+            .instance()
+            .get(&TreasuryKey::PendingTransfers)
+            .unwrap_or(Vec::new(&env));
+        let now = env.ledger().timestamp();
+        // Iterate backwards so we can safely remove items while iterating.
+        let mut i: i32 = transfers.len() as i32 - 1;
+        while i >= 0 {
+            let transfer = transfers.get(i as u32).unwrap();
+            if transfer.vetoed {
+                // Remove vetoed transfers silently.
+                transfers.remove(i as u32);
+            } else if now >= transfer.executable_after {
+                // Execute and remove.
+                Self::do_transfer(&env, &transfer.recipient, transfer.amount);
+                transfers.remove(i as u32);
+            } else {
+                // Still pending – keep it.
+            }
+            i -= 1;
+        }
+        env.storage().instance().set(&TreasuryKey::PendingTransfers, &transfers);
+    }
 }

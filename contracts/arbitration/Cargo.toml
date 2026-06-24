@@ -8,6 +8,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+# Add treasury contract as a path dependency for client usage
+treasury = { path = "../treasury" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
