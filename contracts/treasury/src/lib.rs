@@ -1,3 +1,5 @@
+#![no_std]
+
 //! Treasury contract library
 
 #[path = "../speed_bump.rs"]
