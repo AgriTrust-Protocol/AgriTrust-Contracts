@@ -1,0 +1,7 @@
+[build]
+# Default target for cargo commands
+target = "wasm32-unknown-unknown"
+
+# Use the built‑in LLVM‑lld linker for the MSVC toolchain to avoid needing link.exe
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

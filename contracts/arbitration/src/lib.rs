@@ -87,10 +87,15 @@ impl ArbitrationContract {
 
         let treasury_addr: Address = env.storage().instance().get(&DataKey::Treasury).expect("Treasury not set");
         let treasury_client = SpeedBumpContractClient::new(&env, &treasury_addr);
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_addr);
+
         if funder_award > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury_addr, &funder_award);
             treasury_client.release_with_speedbump(&env.current_contract_address(), &dispute.funder, &(funder_award as u64));
         }
         if grantee_award > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury_addr, &grantee_award);
             treasury_client.release_with_speedbump(&env.current_contract_address(), &dispute.grantee, &(grantee_award as u64));
         }
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
