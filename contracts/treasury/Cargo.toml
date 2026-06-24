@@ -9,6 +9,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 
-[[test]]
-name = "speed_bump_test"
-path = "speed_bump_test.rs"
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
