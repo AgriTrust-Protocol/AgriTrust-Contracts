@@ -443,3 +443,50 @@ fn test_comprehensive_workflow() {
         assert_eq!(change.status, ChangeStatus::Executed);
     }
 }
+
+#[test]
+fn test_admin_rotation_grace_period() {
+    let env = Env::new();
+    let admin = Address::generate(&env);
+    
+    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    
+    // Simulate admin rotation at ledger 1000
+    env.ledger().set_sequence(1000);
+    GovernanceActivityMonitor::record_activity(env.clone(), admin.clone());
+    
+    // Run monitor check at ledger 1001
+    env.ledger().set_sequence(1001);
+    
+    let events_before = env.events().all().len();
+    GovernanceActivityMonitor::check_activity(env.clone(), admin.clone());
+    let events_after = env.events().all().len();
+    
+    // Assert no warning emitted
+    assert_eq!(events_before, events_after);
+}
+
+#[test]
+fn test_integration_rapid_rotation() {
+    let env = Env::new();
+    let mut admin = Address::generate(&env);
+    
+    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    
+    let mut ledger = 1000;
+    for _ in 0..5 {
+        ledger += 10;
+        env.ledger().set_sequence(ledger);
+        
+        let new_admin = Address::generate(&env);
+        GovernanceActivityMonitor::record_activity(env.clone(), new_admin.clone());
+        admin = new_admin;
+        
+        let events_before = env.events().all().len();
+        GovernanceActivityMonitor::check_activity(env.clone(), admin.clone());
+        let events_after = env.events().all().len();
+        
+        // Assert no false warnings
+        assert_eq!(events_before, events_after);
+    }
+}

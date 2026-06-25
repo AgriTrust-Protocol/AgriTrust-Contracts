@@ -117,6 +117,12 @@ pub enum MonitorKey {
     MaxChangesPerLedger,
     /// Configuration: mandatory timelock duration
     MandatoryTimelockSecs,
+    /// Last heartbeat ledger for an admin
+    MonitorLastHeartbeat(Address),
+    /// Ledger sequence when the admin was established
+    AdminSince(Address),
+    /// Monotonically increasing activity counter
+    ActivityCounter,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -365,6 +371,39 @@ impl GovernanceActivityMonitor {
     }
 
     // ── View Functions ─────────────────────────────────────────────────────────
+
+    /// Check if the admin is active or inactive
+    pub fn check_activity(env: Env, admin: Address) {
+        let now = env.ledger().sequence();
+        let admin_since: u32 = env.storage().instance().get(&MonitorKey::AdminSince(admin.clone())).unwrap_or(0);
+        let last_heartbeat: u32 = env.storage().instance().get(&MonitorKey::MonitorLastHeartbeat(admin.clone())).unwrap_or(0);
+
+        // Grace period for new admins (1440 ledgers = ~2h)
+        if now <= admin_since + 1440 {
+            return;
+        }
+
+        // Check if inactive based on heartbeat
+        if now > last_heartbeat + 17280 {
+            env.events().publish((symbol_short!("warn_inac"),), admin.clone());
+        }
+    }
+
+    /// Bootstrap the new admin's heartbeat
+    pub fn record_activity(env: Env, admin: Address) {
+        admin.require_auth();
+        let current_ledger = env.ledger().sequence();
+        
+        env.storage().instance().set(&MonitorKey::MonitorLastHeartbeat(admin.clone()), &current_ledger);
+        
+        if !env.storage().instance().has(&MonitorKey::AdminSince(admin.clone())) {
+            env.storage().instance().set(&MonitorKey::AdminSince(admin.clone()), &current_ledger);
+        }
+
+        let mut counter: u64 = env.storage().instance().get(&MonitorKey::ActivityCounter).unwrap_or(0);
+        counter += 1;
+        env.storage().instance().set(&MonitorKey::ActivityCounter, &counter);
+    }
 
     /// Get a parameter change by ID
     pub fn get_parameter_change(env: Env, change_id: u64) -> Result<ParameterChange, MonitorError> {

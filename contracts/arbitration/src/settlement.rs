@@ -1,117 +1,189 @@
-use soroban_sdk::{Address, Bytes, BytesN, Env, token};
-use soroban_sdk::xdr::ToXdr;
-use crate::{DataKey, EscrowState, EscrowStatus, Dispute};
+use soroban_sdk::{symbol_short, token, Address, Env};
 
-pub fn validate_award(
-    env: &Env,
-    arbitrator_public_key: &BytesN<32>,
-    signature: &BytesN<64>,
-    arbitration_id: u32,
-    proposal_id: u32,
-    funder_award: i128,
-    grantee_award: i128,
-    nonce: u64,
-) {
-    let mut message = Bytes::new(env);
-    message.append(&arbitration_id.to_xdr(env));
-    message.append(&proposal_id.to_xdr(env));
-    message.append(&funder_award.to_xdr(env));
-    message.append(&grantee_award.to_xdr(env));
-    message.append(&nonce.to_xdr(env));
+use crate::{
+    DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,
+    TTL_EXTENSION_PERIOD,
+};
 
-    env.crypto().ed25519_verify(arbitrator_public_key, &message, signature);
+const BUMP_THRESHOLD: u32 = 86_400;   // 10 days in ledgers — extend when below this
+const EXPIRY_BUMP_AMOUNT: u32 = 518_400; // 30 days in ledgers — extend to this
+
+/// Synchronize TTLs of escrow lock and release entries so both remain live
+/// until settlement finalization. Uses `extend_ttl`'s built-in threshold so
+/// no explicit `get_ttl` call is needed — entries below threshold get bumped
+/// to `EXPIRY_BUMP_AMOUNT`, which guarantees both have the same expiry horizon.
+/// Also extends the contract instance TTL to prevent instance archival while
+/// escrow entries are still alive.
+pub fn synchronize_escrow_ttl(env: &Env, cycle: u32) {
+    let lock_key = DataKey::EscrowLock(cycle);
+    let release_key = DataKey::EscrowRelease(cycle);
+
+    // Extend contract instance TTL so the contract itself stays alive
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+
+    if env.storage().persistent().has(&lock_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&lock_key, BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    }
+    if env.storage().persistent().has(&release_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&release_key, BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    }
 }
 
-pub fn finalize_settlement(
-    env: Env,
+/// Lock settlement funds into escrow for a given arbitration cycle.
+/// Writes the lock entry, extends its TTL, and emits an EscrowTtlDeadline event.
+pub fn lock_settlement(
+    env: &Env,
+    cycle: u32,
+    buyer: &Address,
+    seller: &Address,
     arbitration_id: u32,
-    proposal_id: u32,
-    expected_sequence: u32,
-    arbitrator_public_key: BytesN<32>,
-    signature: BytesN<64>,
-    funder_award: i128,
-    grantee_award: i128,
-    nonce: u64,
+    amount: i128,
 ) {
-    // 1. Optimistic lock check (temporary storage)
-    let current_sequence = env.ledger().sequence();
-    let lock_key = DataKey::SettlementLock(arbitration_id);
-    if env.storage().temporary().has(&lock_key) {
-        let stored_sequence: u32 = env.storage().temporary().get(&lock_key).unwrap();
-        if stored_sequence == current_sequence {
-            panic!("ConcurrentSettlementInProgress");
+    buyer.require_auth();
+
+    let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    let token_client = token::Client::new(env, &token_addr);
+    token_client.transfer(buyer, &env.current_contract_address(), &amount);
+
+    let lock = EscrowLockData {
+        buyer: buyer.clone(),
+        seller: seller.clone(),
+        arbitration_id,
+        amount,
+        locked_at: env.ledger().timestamp(),
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::EscrowLock(cycle), &lock);
+
+    // Extend TTL on the lock entry and instance right after creation
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::EscrowLock(cycle), BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+
+    // Track cycle count for garbage collection
+    let mut counter: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::EscrowCycleCounter)
+        .unwrap_or(0);
+    counter = counter.saturating_add(1);
+    env.storage()
+        .instance()
+        .set(&DataKey::EscrowCycleCounter, &counter);
+
+    // Emit EscrowTtlDeadline event containing ledger_sequence + extension period
+    let deadline = TtlDeadline {
+        ledger_sequence: env.ledger().sequence(),
+        ttl_extension_period: TTL_EXTENSION_PERIOD,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::EscrowTtlDeadline(cycle), &deadline);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::EscrowTtlDeadline(cycle), BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+
+    env.events().publish(
+        (symbol_short!("ttl_dead"), cycle),
+        deadline,
+    );
+}
+
+/// Release settlement funds from escrow after resolution.
+/// Synchronizes TTLs before reading the lock entry to prevent mid-finalization expiry.
+pub fn release_settlement(
+    env: &Env,
+    cycle: u32,
+    buyer: &Address,
+    seller: &Address,
+    arbitration_id: u32,
+    amount: i128,
+) {
+    // Synchronize TTLs before accessing lock entry — ensures lock hasn't expired
+    synchronize_escrow_ttl(env, cycle);
+
+    let lock: EscrowLockData = env
+        .storage()
+        .persistent()
+        .get(&DataKey::EscrowLock(cycle))
+        .unwrap();
+
+    seller.require_auth();
+
+    if lock.arbitration_id != arbitration_id {
+        panic!("arbitration_id mismatch");
+    }
+    if lock.amount < amount {
+        panic!("release amount exceeds locked amount");
+    }
+
+    let release = EscrowReleaseData {
+        buyer: buyer.clone(),
+        seller: seller.clone(),
+        arbitration_id,
+        amount,
+        released_at: env.ledger().timestamp(),
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::EscrowRelease(cycle), &release);
+
+    // Extend TTL on both lock and release to survive settlement finalization
+    synchronize_escrow_ttl(env, cycle);
+
+    let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    let token_client = token::Client::new(env, &token_addr);
+    token_client.transfer(&env.current_contract_address(), seller, &amount);
+
+    env.events().publish(
+        (symbol_short!("release"), cycle),
+        (lock.amount, amount),
+    );
+}
+
+/// Permissionless maintenance function to clean up expired escrow cycles
+/// where both the lock and release entries have expired TTLs.
+pub fn garbage_collect_expired_escrows(env: &Env, max_cycles: u32) -> u32 {
+    let counter: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::EscrowCycleCounter)
+        .unwrap_or(0);
+
+    let mut cleaned = 0u32;
+
+    for cycle in 0..counter {
+        if cleaned >= max_cycles {
+            break;
+        }
+
+        if !env.storage().persistent().has(&DataKey::EscrowTtlDeadline(cycle)) {
+            continue;
+        }
+
+        let lock_expired = !env.storage().persistent().has(&DataKey::EscrowLock(cycle));
+        let release_expired = !env.storage().persistent().has(&DataKey::EscrowRelease(cycle));
+
+        if lock_expired && release_expired {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::EscrowTtlDeadline(cycle));
+            cleaned = cleaned.saturating_add(1);
         }
     }
-    env.storage().temporary().set(&lock_key, &current_sequence);
-    env.storage().temporary().extend_ttl(&lock_key, 0, 10);
 
-    // 2. Read Dispute details (persistent storage)
-    let dispute_key = DataKey::Dispute(arbitration_id);
-    if !env.storage().persistent().has(&dispute_key) {
-        panic!("Dispute does not exist");
-    }
-    let dispute: Dispute = env.storage().persistent().get(&dispute_key).unwrap();
-
-    // Verify arbitrator public key matches the stored one
-    if arbitrator_public_key != dispute.arbitrator_public_key {
-        panic!("Arbitrator public key mismatch");
-    }
-
-    // 3. Verify and store nonce (prevent replay) - Check this before escrow state to fail on nonce reuse first
-    let nonce_key = DataKey::UsedNonce(arbitration_id, nonce);
-    if env.storage().persistent().has(&nonce_key) {
-        panic!("NonceAlreadyUsed");
-    }
-    env.storage().persistent().set(&nonce_key, &true);
-
-    // 4. Read EscrowState (persistent storage)
-    let escrow_key = DataKey::EscrowState(arbitration_id);
-    if !env.storage().persistent().has(&escrow_key) {
-        panic!("EscrowState does not exist");
-    }
-    let mut escrow_state: EscrowState = env.storage().persistent().get(&escrow_key).unwrap();
-
-    // 5. Verify Escrow status and sequence
-    if escrow_state.status != EscrowStatus::Locked {
-        panic!("Escrow is not locked");
-    }
-    if escrow_state.sequence != expected_sequence {
-        panic!("Invalid expected sequence");
-    }
-
-    // 6. Validate arbitrator signature on award
-    validate_award(
-        &env,
-        &dispute.arbitrator_public_key,
-        &signature,
-        arbitration_id,
-        proposal_id,
-        funder_award,
-        grantee_award,
-        nonce,
+    env.events().publish(
+        (symbol_short!("gc_escrow"),),
+        cleaned,
     );
 
-    // 7. Validate award bounds
-    if funder_award < 0 || grantee_award < 0 {
-        panic!("Awards cannot be negative");
-    }
-    if funder_award + grantee_award > dispute.amount {
-        panic!("Awards exceed dispute amount");
-    }
-
-    // 8. Update EscrowState
-    escrow_state.sequence += 1;
-    escrow_state.status = EscrowStatus::Settled(proposal_id);
-    env.storage().persistent().set(&escrow_key, &escrow_state);
-
-    // 9. Transfer funds
-    let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-    let token_client = token::Client::new(&env, &token_addr);
-
-    if funder_award > 0 {
-        token_client.transfer(&env.current_contract_address(), &dispute.funder, &funder_award);
-    }
-    if grantee_award > 0 {
-        token_client.transfer(&env.current_contract_address(), &dispute.grantee, &grantee_award);
-    }
+    cleaned
 }

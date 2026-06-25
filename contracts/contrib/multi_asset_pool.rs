@@ -1,4 +1,4 @@
-use soroban_sdk::{Env, Address, panic};
+use soroban_sdk::{Env, Address, panic, Symbol, IntoVal, Val};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -6,6 +6,42 @@ pub struct GrantPool {
     pub pool_id: String,
     pub balances: HashMap<Address, i128>, // Map of asset address → balance
     pub oracle: Address,                  // Oracle for price conversions
+}
+
+pub fn emit_deposit_event(env: &Env, pool_id: String, asset: Address, operator: Address, amount: i128) {
+    let topics = (
+        Symbol::new(env, "deposit"),
+        pool_id,
+        asset,
+        operator,
+    );
+    let timestamp = env.ledger().timestamp();
+    let data = (amount, timestamp, Option::<Val>::None);
+    env.events().publish(topics, data);
+}
+
+pub fn emit_withdrawal_event(env: &Env, pool_id: String, asset: Address, operator: Address, amount: i128) {
+    let topics = (
+        Symbol::new(env, "withdraw"),
+        pool_id,
+        asset,
+        operator,
+    );
+    let timestamp = env.ledger().timestamp();
+    let data = (amount, timestamp, Option::<Val>::None);
+    env.events().publish(topics, data);
+}
+
+pub fn emit_rebalance_event(env: &Env, pool_id: String, asset: Address, operator: Address, amount: i128) {
+    let topics = (
+        Symbol::new(env, "rebalance"),
+        pool_id,
+        asset,
+        operator,
+    );
+    let timestamp = env.ledger().timestamp();
+    let data = (amount, timestamp, Option::<Val>::None);
+    env.events().publish(topics, data);
 }
 
 pub fn deposit(env: &Env, pool_id: String, asset: Address, amount: i128) {
@@ -21,10 +57,8 @@ pub fn deposit(env: &Env, pool_id: String, asset: Address, amount: i128) {
 
     env.storage().set(&format!("pool:{}", pool_id), &pool);
 
-    env.events().publish(
-        (["pool", "deposit"],),
-        (pool_id, asset, amount),
-    );
+    let operator = env.invoker();
+    emit_deposit_event(env, pool_id, asset, operator, amount);
 }
 
 pub fn withdraw(env: &Env, pool_id: String, grantee: Address, amount: i128, preferred_asset: Option<Address>) {
@@ -44,10 +78,7 @@ pub fn withdraw(env: &Env, pool_id: String, grantee: Address, amount: i128, pref
         }
         *balance -= converted_amount;
 
-        env.events().publish(
-            (["pool", "withdraw"],),
-            (pool_id, grantee, asset, converted_amount),
-        );
+        emit_withdrawal_event(env, pool_id, asset, grantee, converted_amount);
     } else {
         // Basket withdrawal: pro-rata across all assets
         let total_value = total_pool_value(env, &pool);
@@ -58,10 +89,7 @@ pub fn withdraw(env: &Env, pool_id: String, grantee: Address, amount: i128, pref
         for (asset, bal) in pool.balances.iter_mut() {
             let share = (*bal as i128 * amount) / total_value;
             *bal -= share;
-            env.events().publish(
-                (["pool", "withdraw"],),
-                (pool_id.clone(), grantee.clone(), asset.clone(), share),
-            );
+            emit_withdrawal_event(env, pool_id.clone(), asset.clone(), grantee.clone(), share);
         }
     }
 
@@ -81,4 +109,30 @@ fn total_pool_value(env: &Env, pool: &GrantPool) -> i128 {
         total += bal * rate;
     }
     total
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{Env, Address};
+
+    #[test]
+    fn test_event_topic_limit() {
+        let env = Env::default();
+        let pool_id = String::from("test_pool");
+        let asset = Address::random(&env);
+        let operator = Address::random(&env);
+        let amount = 1000i128;
+
+        emit_deposit_event(&env, pool_id.clone(), asset.clone(), operator.clone(), amount);
+        emit_withdrawal_event(&env, pool_id.clone(), asset.clone(), operator.clone(), amount);
+        emit_rebalance_event(&env, pool_id.clone(), asset.clone(), operator.clone(), amount);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 3);
+
+        for event in events.iter() {
+            assert!(event.topics.len() <= 4);
+        }
+    }
 }

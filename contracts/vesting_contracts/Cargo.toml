@@ -9,6 +9,7 @@ crate-type = ["lib", "cdylib"]
 doctest = false
 
 [dependencies]
+agritrust_common = { path = "../common" }
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
