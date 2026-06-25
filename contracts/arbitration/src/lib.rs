@@ -1,6 +1,26 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
+pub mod settlement;
+#[cfg(test)]
+mod test;
+
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    Locked,
+    Settled(u32), // proposal_id
+    Released,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowState {
+    pub sequence: u32,
+    pub status: EscrowStatus,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -8,6 +28,9 @@ pub enum DataKey {
     Token,
     DisputeCounter,
     Dispute(u32),
+    EscrowState(u32),
+    SettlementLock(u32),
+    UsedNonce(u32, u64),
 }
 
 #[contracttype]
@@ -27,6 +50,7 @@ pub struct Dispute {
     pub amount: i128,
     pub status: DisputeStatus,
     pub arbitrator: Address,
+    pub arbitrator_public_key: soroban_sdk::BytesN<32>,
 }
 
 #[contract]
@@ -44,7 +68,15 @@ impl ArbitrationContract {
         env.storage().instance().set(&DataKey::DisputeCounter, &0u32);
     }
 
-    pub fn raise_dispute(env: Env, grant_id: u32, funder: Address, grantee: Address, amount: i128, arbitrator: Address) -> u32 {
+    pub fn raise_dispute(
+        env: Env,
+        grant_id: u32,
+        funder: Address,
+        grantee: Address,
+        amount: i128,
+        arbitrator: Address,
+        arbitrator_public_key: soroban_sdk::BytesN<32>,
+    ) -> u32 {
         funder.require_auth();
         
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -62,9 +94,17 @@ impl ArbitrationContract {
             amount,
             status: DisputeStatus::Pending,
             arbitrator,
+            arbitrator_public_key,
         };
 
         env.storage().persistent().set(&DataKey::Dispute(counter), &dispute);
+
+        let escrow_state = EscrowState {
+            sequence: 0,
+            status: EscrowStatus::Locked,
+        };
+        env.storage().persistent().set(&DataKey::EscrowState(counter), &escrow_state);
+
         counter
     }
 
@@ -89,4 +129,33 @@ impl ArbitrationContract {
 
         env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
     }
+
+    pub fn finalize_settlement(
+        env: Env,
+        arbitration_id: u32,
+        proposal_id: u32,
+        expected_sequence: u32,
+        arbitrator_public_key: soroban_sdk::BytesN<32>,
+        signature: soroban_sdk::BytesN<64>,
+        funder_award: i128,
+        grantee_award: i128,
+        nonce: u64,
+    ) {
+        settlement::finalize_settlement(
+            env,
+            arbitration_id,
+            proposal_id,
+            expected_sequence,
+            arbitrator_public_key,
+            signature,
+            funder_award,
+            grantee_award,
+            nonce,
+        );
+    }
+
+    pub fn get_escrow_state(env: Env, arbitration_id: u32) -> EscrowState {
+        env.storage().persistent().get(&DataKey::EscrowState(arbitration_id)).unwrap()
+    }
 }
+
