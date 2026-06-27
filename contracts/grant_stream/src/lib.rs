@@ -50,6 +50,7 @@ pub mod audit_log;
 pub mod multi_threshold;
 pub mod security_council;
 pub mod matching_pool;
+pub mod precision;
 
 #[cfg(all(test, feature = "legacy-tests"))]
 mod test_dispute_circuit_breaker;
