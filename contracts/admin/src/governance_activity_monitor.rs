@@ -9,12 +9,8 @@
 //! This prevents rapid protocol changes and provides community oversight
 //! for significant parameter modifications.
 
-#![no_std]
-
-use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short, 
-    Address, Env, Vec, Map, String,
-};
+use crate::depth_tracker;
+use soroban_sdk::{ contracttype, contracterror, symbol_short, Address, Env, Vec, String};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -144,18 +140,18 @@ pub enum MonitorError {
 
 // ── Contract Implementation ───────────────────────────────────────────────────
 
-#[contract]
-pub struct GovernanceActivityMonitor;
+pub struct GovernanceActivityMonitorModule;
 
-#[contractimpl]
-impl GovernanceActivityMonitor {
+impl GovernanceActivityMonitorModule {
     /// Initialize the monitor with an admin address
     pub fn initialize(env: Env, admin: Address) -> Result<(), MonitorError> {
         if env.storage().instance().has(&MonitorKey::Admin) {
             return Err(MonitorError::NotInitialized);
         }
 
+        depth_tracker::push_depth(&env).unwrap_or(0);
         admin.require_auth();
+        depth_tracker::pop_depth(&env).unwrap_or(0);
         
         env.storage().instance().set(&MonitorKey::Admin, &admin);
         env.storage().instance().set(&MonitorKey::Enabled, &true);
@@ -165,7 +161,7 @@ impl GovernanceActivityMonitor {
         env.storage().instance().set(&MonitorKey::MandatoryTimelockSecs, &MANDATORY_TIMELOCK_SECS);
 
         env.events().publish(
-            (symbol_short!("monitor_init"),),
+            (symbol_short!("mon_init"),),
             (admin, env.ledger().timestamp()),
         );
 
@@ -249,9 +245,9 @@ impl GovernanceActivityMonitor {
         
         // Emit event
         let event_symbol = if triggers_breaker {
-            symbol_short!("breaker_trig")
+            symbol_short!("brk_trig")
         } else {
-            symbol_short!("param_change")
+            symbol_short!("prm_chg")
         };
         
         env.events().publish(
@@ -262,7 +258,7 @@ impl GovernanceActivityMonitor {
         // If circuit breaker triggered, emit additional warning event
         if triggers_breaker {
             env.events().publish(
-                (symbol_short!("breaker_warn"),),
+                (symbol_short!("brk_warn"),),
                 (activity.change_count, max_changes, mandatory_timelock),
             );
         }
@@ -296,7 +292,7 @@ impl GovernanceActivityMonitor {
         env.storage().instance().set(&MonitorKey::Change(change_id), &change);
 
         env.events().publish(
-            (symbol_short!("param_exec"), change_id),
+            (symbol_short!("prm_exec"), change_id),
             (admin, change.parameter_name, now),
         );
 
@@ -322,7 +318,7 @@ impl GovernanceActivityMonitor {
         env.storage().instance().set(&MonitorKey::Change(change_id), &change);
 
         env.events().publish(
-            (symbol_short!("param_cancel"), change_id),
+            (symbol_short!("prm_canc"), change_id),
             (admin, change.parameter_name),
         );
 
@@ -337,7 +333,7 @@ impl GovernanceActivityMonitor {
         env.storage().instance().set(&MonitorKey::Enabled, &enabled);
 
         env.events().publish(
-            (symbol_short!("monitor_toggle"),),
+            (symbol_short!("mon_tgl"),),
             (admin, enabled),
         );
 
@@ -363,7 +359,7 @@ impl GovernanceActivityMonitor {
         }
 
         env.events().publish(
-            (symbol_short!("config_update"),),
+            (symbol_short!("cfg_upd"),),
             (admin, max_changes_per_ledger, mandatory_timelock_secs),
         );
 
@@ -390,7 +386,7 @@ impl GovernanceActivityMonitor {
     }
 
     /// Bootstrap the new admin's heartbeat
-    pub fn record_activity(env: Env, admin: Address) {
+    pub fn record_activity(env: &Env, admin: Address) {
         admin.require_auth();
         let current_ledger = env.ledger().sequence();
         
@@ -493,7 +489,7 @@ impl GovernanceActivityMonitor {
 
     fn get_or_create_ledger_activity(env: &Env, ledger_number: u32) -> Result<LedgerActivity, MonitorError> {
         // Try to get current activity
-        if let Some(activity) = env.storage().instance().get(&MonitorKey::CurrentLedgerActivity) {
+        if let Some(activity) = env.storage().instance().get::<MonitorKey, LedgerActivity>(&MonitorKey::CurrentLedgerActivity) {
             if activity.ledger_number == ledger_number {
                 return Ok(activity);
             }
@@ -511,7 +507,7 @@ impl GovernanceActivityMonitor {
     }
 
     fn get_ledger_activity(env: &Env, ledger_number: u32) -> Result<LedgerActivity, MonitorError> {
-        if let Some(activity) = env.storage().instance().get(&MonitorKey::CurrentLedgerActivity) {
+        if let Some(activity) = env.storage().instance().get::<MonitorKey, LedgerActivity>(&MonitorKey::CurrentLedgerActivity) {
             if activity.ledger_number == ledger_number {
                 return Ok(activity);
             }

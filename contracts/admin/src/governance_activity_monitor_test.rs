@@ -11,8 +11,8 @@ use soroban_sdk::{
     Address, Env, Bytes, String, Vec,
 };
 
-use crate::admin::governance_activity_monitor::{
-    GovernanceActivityMonitor, ParameterType, ChangeStatus, 
+use crate::governance_activity_monitor::{
+    GovernanceActivityMonitorModule, ParameterType, ChangeStatus,
     ParameterChange, LedgerActivity, MonitorError, MonitorKey
 };
 
@@ -28,7 +28,7 @@ impl TestContract {
         let param_name = String::from_str(&env, "protocol_fee");
         let reason = String::from_str(&env, "Adjust protocol fee for sustainability");
         
-        GovernanceActivityMonitor::record_parameter_change(
+        GovernanceActivityMonitorModule::record_parameter_change(
             env,
             admin,
             ParameterType::Fee,
@@ -45,7 +45,7 @@ impl TestContract {
         let param_name = String::from_str(&env, "quorum_threshold");
         let reason = String::from_str(&env, "Update quorum requirements");
         
-        GovernanceActivityMonitor::record_parameter_change(
+        GovernanceActivityMonitorModule::record_parameter_change(
             env,
             admin,
             ParameterType::Threshold,
@@ -62,7 +62,7 @@ impl TestContract {
         let param_name = String::from_str(&env, "treasury_address");
         let reason = String::from_str(&env, "Update treasury address");
         
-        GovernanceActivityMonitor::record_parameter_change(
+        GovernanceActivityMonitorModule::record_parameter_change(
             env,
             admin,
             ParameterType::Address,
@@ -74,55 +74,113 @@ impl TestContract {
     }
 }
 
-#[test]
+    // ── Wrappers for GovernanceActivityMonitorModule ──
+
+    pub fn initialize(env: Env, admin: Address) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::initialize(env, admin);
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::get_admin(&env).unwrap()
+    }
+
+    pub fn is_enabled(env: Env) -> bool {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::is_enabled(&env)
+    }
+
+    pub fn record_parameter_change(env: Env, admin: Address, parameter_type: ParameterType, parameter_name: String, old_value: Bytes, new_value: Bytes, reason: String) -> u64 {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::record_parameter_change(env, admin, parameter_type, parameter_name, old_value, new_value, reason).unwrap()
+    }
+
+    pub fn get_parameter_change(env: Env, change_id: u64) -> ParameterChange {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::get_parameter_change(&env, change_id).unwrap()
+    }
+
+    pub fn get_current_ledger_activity(env: Env) -> LedgerActivity {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::get_current_ledger_activity(&env).unwrap()
+    }
+
+    pub fn get_all_changes(env: Env) -> Vec<ParameterChange> {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::get_all_changes(env).unwrap()
+    }
+
+    pub fn get_pending_changes(env: Env, admin: Address) -> Vec<ParameterChange> {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::get_pending_changes(env, admin).unwrap()
+    }
+
+    pub fn execute_parameter_change(env: Env, admin: Address, change_id: u64) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::execute_parameter_change(env, admin, change_id).unwrap();
+    }
+
+    pub fn cancel_parameter_change(env: Env, admin: Address, change_id: u64) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::cancel_parameter_change(env, admin, change_id).unwrap();
+    }
+
+    pub fn set_enabled(env: Env, admin: Address, enabled: bool) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::set_enabled(env, admin, enabled).unwrap();
+    }
+
+    pub fn update_config(env: Env, admin: Address, max_changes_per_ledger: Option<u32>, mandatory_timelock_secs: Option<u64>) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::update_config(env, admin, max_changes_per_ledger, mandatory_timelock_secs).unwrap();
+    }
+
+    pub fn check_activity(env: Env, admin: Address) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::check_activity(env, admin);
+    }
+
+    pub fn record_activity(env: Env, admin: Address) {
+        crate::governance_activity_monitor::GovernanceActivityMonitorModule::record_activity(env, admin);
+    }
+
+
 fn test_initialization() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Test successful initialization
-    assert!(GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).is_ok());
+    assert!(TestContract::initialize(env.clone(), admin.clone()).is_ok());
     
     // Verify admin is set
-    assert_eq!(GovernanceActivityMonitor::get_admin(&env).unwrap(), admin);
+    assert_eq!(TestContract::get_admin(&env).unwrap(), admin);
     
     // Verify monitor is enabled
-    assert!(GovernanceActivityMonitor::is_enabled(&env));
+    assert!(TestContract::is_enabled(&env));
     
     // Test double initialization fails
-    let result = GovernanceActivityMonitor::initialize(env.clone(), admin.clone());
+    let result = TestContract::initialize(env.clone(), admin.clone());
     assert_eq!(result.unwrap_err(), MonitorError::NotInitialized);
 }
 
-#[test]
+[test]
 fn test_single_parameter_change() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Record a single parameter change
     let change_id = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
     
     // Verify change was recorded
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change_id).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change_id).unwrap();
     assert_eq!(change.admin, admin);
     assert_eq!(change.parameter_type, ParameterType::Fee);
     assert_eq!(change.status, ChangeStatus::Pending);
     
     // Verify current ledger activity
-    let activity = GovernanceActivityMonitor::get_current_ledger_activity(env.clone()).unwrap();
+    let activity = TestContract::get_current_ledger_activity(env.clone()).unwrap();
     assert_eq!(activity.change_count, 1);
     assert_eq!(activity.change_ids.len(), 1);
 }
 
-#[test]
+[test]
 fn test_circuit_breaker_not_triggered_under_limit() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make exactly 3 changes (should not trigger breaker)
     let change1 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
@@ -132,22 +190,22 @@ fn test_circuit_breaker_not_triggered_under_limit() {
     
     // All changes should have normal timelock
     for change_id in [change1, change2, change3] {
-        let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change_id).unwrap();
+        let change = TestContract::get_parameter_change(env.clone(), change_id).unwrap();
         assert_eq!(change.status, ChangeStatus::Pending);
     }
     
     // Verify ledger activity
-    let activity = GovernanceActivityMonitor::get_current_ledger_activity(env.clone()).unwrap();
+    let activity = TestContract::get_current_ledger_activity(env.clone()).unwrap();
     assert_eq!(activity.change_count, 3);
 }
 
-#[test]
+[test]
 fn test_circuit_breaker_triggered_on_fourth_change() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make 3 changes (normal timelock)
     TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
@@ -158,21 +216,21 @@ fn test_circuit_breaker_triggered_on_fourth_change() {
     // 4th change should trigger circuit breaker
     let change4 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 150, 200);
     
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change4).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change4).unwrap();
     assert_eq!(change.status, ChangeStatus::MandatoryTimelock);
     
     // Verify ledger activity shows breaker triggered
-    let activity = GovernanceActivityMonitor::get_current_ledger_activity(env.clone()).unwrap();
+    let activity = TestContract::get_current_ledger_activity(env.clone()).unwrap();
     assert_eq!(activity.change_count, 4);
 }
 
-#[test]
+[test]
 fn test_mandatory_timelock_duration() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make 4 changes to trigger breaker
     TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
@@ -181,108 +239,108 @@ fn test_mandatory_timelock_duration() {
         Address::generate(&env), Address::generate(&env));
     let change4 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 150, 200);
     
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change4).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change4).unwrap();
     
     // Should have 7-day timelock (604800 seconds)
     let expected_executable = change.proposed_at + 7 * 24 * 60 * 60;
     assert_eq!(change.executable_at, expected_executable);
 }
 
-#[test]
+[test]
 fn test_execute_after_timelock() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make a change
     let change_id = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
     
     // Try to execute immediately (should fail)
-    let result = GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change_id);
+    let result = TestContract::execute_parameter_change(env.clone(), admin.clone(), change_id);
     assert_eq!(result.unwrap_err(), MonitorError::TimelockNotExpired);
     
     // Advance time past timelock
     env.ledger().set_timestamp(env.ledger().timestamp() + 25 * 60 * 60); // 25 hours
     
     // Should succeed now
-    assert!(GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change_id).is_ok());
+    assert!(TestContract::execute_parameter_change(env.clone(), admin.clone(), change_id).is_ok());
     
     // Verify status changed
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change_id).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change_id).unwrap();
     assert_eq!(change.status, ChangeStatus::Executed);
 }
 
-#[test]
+[test]
 fn test_cancel_parameter_change() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make a change
     let change_id = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
     
     // Cancel the change
-    assert!(GovernanceActivityMonitor::cancel_parameter_change(env.clone(), admin.clone(), change_id).is_ok());
+    assert!(TestContract::cancel_parameter_change(env.clone(), admin.clone(), change_id).is_ok());
     
     // Verify status changed
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change_id).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change_id).unwrap();
     assert_eq!(change.status, ChangeStatus::Cancelled);
 }
 
-#[test]
+[test]
 fn test_unauthorized_access() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     let unauthorized = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Try to execute change as unauthorized user
     let change_id = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
-    let result = GovernanceActivityMonitor::execute_parameter_change(env.clone(), unauthorized.clone(), change_id);
+    let result = TestContract::execute_parameter_change(env.clone(), unauthorized.clone(), change_id);
     assert_eq!(result.unwrap_err(), MonitorError::NotAuthorized);
 }
 
-#[test]
+[test]
 fn test_monitor_disable_enable() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Disable monitor
-    assert!(GovernanceActivityMonitor::set_enabled(env.clone(), admin.clone(), false).is_ok());
-    assert!(!GovernanceActivityMonitor::is_enabled(&env));
+    assert!(TestContract::set_enabled(env.clone(), admin.clone(), false).is_ok());
+    assert!(!TestContract::is_enabled(&env));
     
     // When disabled, record_parameter_change should return 0 (no tracking)
     let result = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
     assert_eq!(result, 0);
     
     // Re-enable monitor
-    assert!(GovernanceActivityMonitor::set_enabled(env.clone(), admin.clone(), true).is_ok());
-    assert!(GovernanceActivityMonitor::is_enabled(&env));
+    assert!(TestContract::set_enabled(env.clone(), admin.clone(), true).is_ok());
+    assert!(TestContract::is_enabled(&env));
     
     // Now tracking should work again
     let result = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
     assert!(result > 0);
 }
 
-#[test]
+[test]
 fn test_configuration_update() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Update configuration
-    assert!(GovernanceActivityMonitor::update_config(
+    assert!(TestContract::update_config(
         env.clone(), 
         admin.clone(), 
         Some(5), // Increase max changes to 5
@@ -295,12 +353,12 @@ fn test_configuration_update() {
     }
     
     // Verify no circuit breaker triggered
-    let activity = GovernanceActivityMonitor::get_current_ledger_activity(env.clone()).unwrap();
+    let activity = TestContract::get_current_ledger_activity(env.clone()).unwrap();
     assert_eq!(activity.change_count, 5);
     
     // 6th change should trigger
     let change6 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 105, 155);
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change6).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change6).unwrap();
     assert_eq!(change.status, ChangeStatus::MandatoryTimelock);
     
     // Verify new timelock duration (10 days)
@@ -308,14 +366,14 @@ fn test_configuration_update() {
     assert_eq!(change.executable_at, expected_executable);
 }
 
-#[test]
+[test]
 fn test_get_pending_changes() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     let other_admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make changes as different admins
     let change1 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
@@ -323,7 +381,7 @@ fn test_get_pending_changes() {
     let change3 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 150, 200);
     
     // Get pending changes for first admin
-    let pending = GovernanceActivityMonitor::get_pending_changes(env.clone(), admin.clone()).unwrap();
+    let pending = TestContract::get_pending_changes(env.clone(), admin.clone()).unwrap();
     assert_eq!(pending.len(), 2);
     
     // Verify correct changes are returned
@@ -333,16 +391,16 @@ fn test_get_pending_changes() {
     assert!(!change_ids.contains(&change2));
 }
 
-#[test]
+[test]
 fn test_edge_cases() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Test executing non-existent change
-    let result = GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), 999);
+    let result = TestContract::execute_parameter_change(env.clone(), admin.clone(), 999);
     assert_eq!(result.unwrap_err(), MonitorError::ChangeNotFound);
     
     // Make a change
@@ -350,30 +408,30 @@ fn test_edge_cases() {
     
     // Execute it
     env.ledger().set_timestamp(env.ledger().timestamp() + 25 * 60 * 60);
-    assert!(GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change_id).is_ok());
+    assert!(TestContract::execute_parameter_change(env.clone(), admin.clone(), change_id).is_ok());
     
     // Try to execute again
-    let result = GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change_id);
+    let result = TestContract::execute_parameter_change(env.clone(), admin.clone(), change_id);
     assert_eq!(result.unwrap_err(), MonitorError::AlreadyExecuted);
     
     // Try to cancel executed change
-    let result = GovernanceActivityMonitor::cancel_parameter_change(env.clone(), admin.clone(), change_id);
+    let result = TestContract::cancel_parameter_change(env.clone(), admin.clone(), change_id);
     assert_eq!(result.unwrap_err(), MonitorError::AlreadyExecuted);
 }
 
-#[test]
+[test]
 fn test_ledger_boundary() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Make changes in first ledger
     TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 150);
     TestContract::simulate_threshold_change(env.clone(), admin.clone(), 50, 60);
     
-    let activity1 = GovernanceActivityMonitor::get_current_ledger_activity(env.clone()).unwrap();
+    let activity1 = TestContract::get_current_ledger_activity(env.clone()).unwrap();
     assert_eq!(activity1.change_count, 2);
     
     // Advance to next ledger
@@ -385,18 +443,18 @@ fn test_ledger_boundary() {
     TestContract::simulate_address_change(env.clone(), admin.clone(), 
         Address::generate(&env), Address::generate(&env));
     
-    let activity2 = GovernanceActivityMonitor::get_current_ledger_activity(env.clone()).unwrap();
+    let activity2 = TestContract::get_current_ledger_activity(env.clone()).unwrap();
     assert_eq!(activity2.change_count, 3); // Should be reset for new ledger
     assert_ne!(activity2.ledger_number, activity1.ledger_number);
 }
 
-#[test]
+[test]
 fn test_comprehensive_workflow() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
     // Initialize
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Phase 1: Normal operations (under limit)
     let change1 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 100, 120);
@@ -404,7 +462,7 @@ fn test_comprehensive_workflow() {
     
     // Verify normal timelocks
     for change_id in [change1, change2] {
-        let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change_id).unwrap();
+        let change = TestContract::get_parameter_change(env.clone(), change_id).unwrap();
         assert_eq!(change.status, ChangeStatus::Pending);
     }
     
@@ -414,64 +472,64 @@ fn test_comprehensive_workflow() {
     let change4 = TestContract::simulate_fee_change(env.clone(), admin.clone(), 120, 130); // This triggers
     
     // Verify circuit breaker triggered
-    let change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change4).unwrap();
+    let change = TestContract::get_parameter_change(env.clone(), change4).unwrap();
     assert_eq!(change.status, ChangeStatus::MandatoryTimelock);
     
     // Phase 3: Try to execute normal changes
     env.ledger().set_timestamp(env.ledger().timestamp() + 25 * 60 * 60);
     
-    assert!(GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change1).is_ok());
-    assert!(GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change2).is_ok());
-    assert!(GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change3).is_ok());
+    assert!(TestContract::execute_parameter_change(env.clone(), admin.clone(), change1).is_ok());
+    assert!(TestContract::execute_parameter_change(env.clone(), admin.clone(), change2).is_ok());
+    assert!(TestContract::execute_parameter_change(env.clone(), admin.clone(), change3).is_ok());
     
     // Phase 4: Try to execute mandatory timelock change (should fail)
-    let result = GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change4);
+    let result = TestContract::execute_parameter_change(env.clone(), admin.clone(), change4);
     assert_eq!(result.unwrap_err(), MonitorError::TimelockNotExpired);
     
     // Phase 5: Advance time and execute mandatory timelock change
     env.ledger().set_timestamp(env.ledger().timestamp() + 7 * 24 * 60 * 60);
-    assert!(GovernanceActivityMonitor::execute_parameter_change(env.clone(), admin.clone(), change4).is_ok());
+    assert!(TestContract::execute_parameter_change(env.clone(), admin.clone(), change4).is_ok());
     
     // Verify final state
-    let final_change = GovernanceActivityMonitor::get_parameter_change(env.clone(), change4).unwrap();
+    let final_change = TestContract::get_parameter_change(env.clone(), change4).unwrap();
     assert_eq!(final_change.status, ChangeStatus::Executed);
     
     // Check all changes are executed
-    let all_changes = GovernanceActivityMonitor::get_all_changes(env.clone()).unwrap();
+    let all_changes = TestContract::get_all_changes(env.clone()).unwrap();
     assert_eq!(all_changes.len(), 4);
     for change in all_changes.iter() {
         assert_eq!(change.status, ChangeStatus::Executed);
     }
 }
 
-#[test]
+[test]
 fn test_admin_rotation_grace_period() {
-    let env = Env::new();
+    let env = Env::default();
     let admin = Address::generate(&env);
     
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     // Simulate admin rotation at ledger 1000
     env.ledger().set_sequence(1000);
-    GovernanceActivityMonitor::record_activity(env.clone(), admin.clone());
+    TestContract::record_activity(env.clone(), admin.clone());
     
     // Run monitor check at ledger 1001
     env.ledger().set_sequence(1001);
     
     let events_before = env.events().all().len();
-    GovernanceActivityMonitor::check_activity(env.clone(), admin.clone());
+    TestContract::check_activity(env.clone(), admin.clone());
     let events_after = env.events().all().len();
     
     // Assert no warning emitted
     assert_eq!(events_before, events_after);
 }
 
-#[test]
+[test]
 fn test_integration_rapid_rotation() {
-    let env = Env::new();
+    let env = Env::default();
     let mut admin = Address::generate(&env);
     
-    GovernanceActivityMonitor::initialize(env.clone(), admin.clone()).unwrap();
+    TestContract::initialize(env.clone(), admin.clone()).unwrap();
     
     let mut ledger = 1000;
     for _ in 0..5 {
@@ -479,11 +537,11 @@ fn test_integration_rapid_rotation() {
         env.ledger().set_sequence(ledger);
         
         let new_admin = Address::generate(&env);
-        GovernanceActivityMonitor::record_activity(env.clone(), new_admin.clone());
+        TestContract::record_activity(env.clone(), new_admin.clone());
         admin = new_admin;
         
         let events_before = env.events().all().len();
-        GovernanceActivityMonitor::check_activity(env.clone(), admin.clone());
+        TestContract::check_activity(env.clone(), admin.clone());
         let events_after = env.events().all().len();
         
         // Assert no false warnings
