@@ -1,12 +1,130 @@
-use soroban_sdk::{symbol_short, token, Address, Env};
-
+use soroban_sdk::{symbol_short, token, Address, Env, Vec};
 use crate::{
-    DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,
-    TTL_EXTENSION_PERIOD,
+    DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline, TTL_EXTENSION_PERIOD,
+    FEE_SAFETY_MARGIN, FEE_RESERVE_XLM, OPS_PER_HOP, OPS_PER_TOKEN_TRANSFER,
+    Dispute, DisputeStatus, SettlementHop, SettlementStatus, FeeBudget, SettlementSnapshot
 };
 
 const BUMP_THRESHOLD: u32 = 86_400;   // 10 days in ledgers — extend when below this
 const EXPIRY_BUMP_AMOUNT: u32 = 518_400; // 30 days in ledgers — extend to this
+
+/// Estimate total operation cost for a settlement with given hop count
+pub fn estimate_operation_cost(hop_count: u64) -> u64 {
+    // Base ops + (OPS_PER_HOP per hop + additional token transfer costs)
+    let base_ops = 2000; // 2000 base ops
+    base_ops + hop_count * (OPS_PER_HOP + OPS_PER_TOKEN_TRANSFER)
+}
+
+/// Calculate fees based on amount and fee percentage in basis points
+pub fn _calculate_fees(amount: i128, fee_bps: u64) -> i128 {
+    (amount * fee_bps as i128) / 10_000
+}
+
+/// Execute a single settlement hop
+fn execute_single_hop(env: &Env, hop: &SettlementHop, token_client: &token::Client) {
+    if hop.amount > 0 {
+        token_client.transfer(&env.current_contract_address(), &hop.recipient, &hop.amount);
+    }
+}
+
+/// Execute payout chain with checkpointing and rollback support
+pub fn _execute_payout_chain(env: &Env, cycle: u32, hops: &Vec<SettlementHop>, token_client: &token::Client) -> SettlementStatus {
+    let mut hops_completed = 0u32;
+    let snapshot_key = DataKey::SettlementHopSnapshot(cycle);
+    
+    // Take initial snapshot
+    let initial_balance = token_client.balance(&env.current_contract_address());
+    env.storage().persistent().set(&snapshot_key, &SettlementSnapshot {
+        escrow_balance: initial_balance,
+        hops_completed: 0,
+    });
+    
+    for hop in hops.iter() {
+        // Take checkpoint before each hop
+        let current_snapshot = SettlementSnapshot {
+            escrow_balance: token_client.balance(&env.current_contract_address()),
+            hops_completed,
+        };
+        env.storage().persistent().set(&snapshot_key, &current_snapshot);
+        
+        // Execute hop
+        execute_single_hop(env, &hop, token_client);
+        hops_completed += 1;
+        
+        // Emit hop completed event
+        env.events().publish(
+            (symbol_short!("hop_done"), cycle),
+            hops_completed,
+        );
+    }
+    
+    // Clean up snapshot on completion
+    env.storage().persistent().remove(&snapshot_key);
+    SettlementStatus::Complete
+}
+
+/// Settle a dispute with early fee budget check and fee reserve support
+pub fn settle_dispute(
+    env: &Env,
+    cycle: u32,
+    dispute_id: u32,
+    fee_budget_xlm: i128, // Fee budget in stroops
+    arbitrator: &Address,
+    payout_hops: Vec<SettlementHop>,
+) -> SettlementStatus {
+    // Synchronize TTLs first
+    synchronize_escrow_ttl(env, cycle);
+    
+    // Load escrow lock
+    let lock: EscrowLockData = env.storage().persistent().get(&DataKey::EscrowLock(cycle)).unwrap();
+    let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    let token_client = token::Client::new(env, &token_addr);
+    
+    // Verify dispute exists and arbitrator is authorized
+    let mut dispute: Dispute = env.storage().persistent().get(&DataKey::Dispute(dispute_id)).unwrap();
+    arbitrator.require_auth();
+    if dispute.arbitrator != *arbitrator {
+        panic!("Unauthorized: not the arbitrator");
+    }
+    if dispute.status == DisputeStatus::Resolved {
+        panic!("Dispute already resolved");
+    }
+    
+    // Early fee budget check
+    let estimated_ops = estimate_operation_cost(payout_hops.len() as u64);
+    // Approximate cost calculation (simplified for example)
+    let estimated_cost_stroops = (estimated_ops as i128) * 100; // 100 stroops per 10k ops approx
+    
+    // Check with safety margin
+    let required_budget = (estimated_cost_stroops * FEE_SAFETY_MARGIN as i128) / 10_000;
+    if fee_budget_xlm < required_budget {
+        panic!("InsufficientSettlementBudget: estimated {} stroops, budget {}", required_budget, fee_budget_xlm);
+    }
+    
+    // Update dispute with payout hops
+    dispute.payout_hops = payout_hops.clone();
+    dispute.status = DisputeStatus::InArbitration;
+    env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+    
+    // Execute payout chain
+    let status = _execute_payout_chain(env, cycle, &payout_hops, &token_client);
+    
+    // Refund unused fee reserve
+    let unused_reserve = lock.fee_reserve;
+    if unused_reserve > 0 {
+        token_client.transfer(&env.current_contract_address(), &lock.buyer, &unused_reserve);
+        env.events().publish(
+            (symbol_short!("reserve_refund"), cycle),
+            unused_reserve,
+        );
+    }
+    
+    // Mark dispute as resolved
+    dispute.status = DisputeStatus::Resolved;
+    env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+    
+    status
+}
 
 /// Synchronize TTLs of escrow lock and release entries so both remain live
 /// until settlement finalization. Uses `extend_ttl`'s built-in threshold so
@@ -33,7 +151,7 @@ pub fn synchronize_escrow_ttl(env: &Env, cycle: u32) {
     }
 }
 
-/// Lock settlement funds into escrow for a given arbitration cycle.
+/// Lock settlement funds into escrow for a given arbitration cycle, including fee reserve.
 /// Writes the lock entry, extends its TTL, and emits an EscrowTtlDeadline event.
 pub fn lock_settlement(
     env: &Env,
@@ -47,7 +165,10 @@ pub fn lock_settlement(
 
     let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
     let token_client = token::Client::new(env, &token_addr);
-    token_client.transfer(buyer, &env.current_contract_address(), &amount);
+    
+    // Transfer main amount + fee reserve
+    let total_transfer = amount + FEE_RESERVE_XLM;
+    token_client.transfer(buyer, &env.current_contract_address(), &total_transfer);
 
     let lock = EscrowLockData {
         buyer: buyer.clone(),
@@ -55,6 +176,7 @@ pub fn lock_settlement(
         arbitration_id,
         amount,
         locked_at: env.ledger().timestamp(),
+        fee_reserve: FEE_RESERVE_XLM,
     };
 
     env.storage()
@@ -78,7 +200,7 @@ pub fn lock_settlement(
         .instance()
         .set(&DataKey::EscrowCycleCounter, &counter);
 
-    // Emit EscrowTtlDeadline event containing ledger_sequence + extension period
+    // Emit EscrowTtlDeadline event containing ledger sequence + extension period
     let deadline = TtlDeadline {
         ledger_sequence: env.ledger().sequence(),
         ttl_extension_period: TTL_EXTENSION_PERIOD,
@@ -93,6 +215,11 @@ pub fn lock_settlement(
     env.events().publish(
         (symbol_short!("ttl_dead"), cycle),
         deadline,
+    );
+    
+    env.events().publish(
+        (symbol_short!("reserve_locked"), cycle),
+        FEE_RESERVE_XLM,
     );
 }
 

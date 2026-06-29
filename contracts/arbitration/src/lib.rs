@@ -10,6 +10,10 @@ pub mod settlement;
 
 pub const TTL_EXTENSION_PERIOD: u32 = 518_400; // 30 days in ledgers (~5s per ledger)
 pub const MAX_SETTLEMENT_WINDOW: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+pub const FEE_SAFETY_MARGIN: u64 = 8000; // 80% in basis points
+pub const FEE_RESERVE_XLM: i128 = 5_000_000; // 5 XLM in stroops (1 XLM = 10^7 stroops)
+pub const OPS_PER_HOP: u64 = 6000; // ~6000 operations per hop (2 reads + 1 write + 1 token transfer + 1 event)
+pub const OPS_PER_TOKEN_TRANSFER: u64 = 5000; // Token transfer host function cost
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +27,8 @@ pub enum DataKey {
     EscrowTtlDeadline(u32),
     EscrowCycleCounter,
     ExpiredEscrows,
+    FeeReserve, // i128 - total fee reserve held by contract
+    SettlementHopSnapshot(u32), // Snapshot for rollback during partial settlement
 }
 
 #[contracttype]
@@ -33,6 +39,7 @@ pub struct EscrowLockData {
     pub arbitration_id: u32,
     pub amount: i128,
     pub locked_at: u64,
+    pub fee_reserve: i128, // Fee reserve held for this escrow
 }
 
 #[contracttype]
@@ -58,6 +65,7 @@ pub enum DisputeStatus {
     Pending,
     InArbitration,
     Resolved,
+    PartiallyResolved,
 }
 
 #[contracttype]
@@ -69,6 +77,36 @@ pub struct Dispute {
     pub amount: i128,
     pub status: DisputeStatus,
     pub arbitrator: Address,
+    pub payout_hops: Vec<SettlementHop>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementHop {
+    pub recipient: Address,
+    pub amount: i128,
+    pub is_fee: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettlementStatus {
+    Complete,
+    Partial(u32), // Number of hops completed
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeBudget {
+    pub estimated_ops: u64,
+    pub fee_reserve_used: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementSnapshot {
+    pub escrow_balance: i128,
+    pub hops_completed: u32,
 }
 
 #[contract]
@@ -106,10 +144,23 @@ impl ArbitrationContract {
             amount,
             status: DisputeStatus::Pending,
             arbitrator,
+            payout_hops: Vec::new(&env),
         };
 
         env.storage().persistent().set(&DataKey::Dispute(counter), &dispute);
         counter
+    }
+    
+    /// Settle a dispute with early fee budget check and fee reserve support
+    pub fn settle_dispute(
+        env: Env,
+        cycle: u32,
+        dispute_id: u32,
+        fee_budget_xlm: i128,
+        arbitrator: Address,
+        payout_hops: Vec<SettlementHop>,
+    ) -> SettlementStatus {
+        settlement::settle_dispute(&env, cycle, dispute_id, fee_budget_xlm, &arbitrator, payout_hops)
     }
 
     pub fn resolve_dispute(env: Env, dispute_id: u32, funder_award: i128, grantee_award: i128) {
