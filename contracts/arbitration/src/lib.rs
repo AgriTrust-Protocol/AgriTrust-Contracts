@@ -1,7 +1,7 @@
 #![no_std]
 #[cfg(test)]
 extern crate std;
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
 
 #[cfg(test)]
 mod test;

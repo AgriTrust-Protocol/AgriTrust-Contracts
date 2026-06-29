@@ -70,7 +70,7 @@ fn test_lock_and_release_settlement() {
     set_ledger(&env, 1000, 1_700_000_000);
 
     let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    token_admin_client.mint(&buyer, &amount);
+    token_admin_client.mint(&buyer, &(amount + crate::FEE_RESERVE_XLM));
 
     client.lock_settlement(&cycle, &buyer, &seller, &arbitration_id, &amount);
 
@@ -123,13 +123,14 @@ fn test_synchronize_escrow_ttl_extends_short_ttl_entries() {
     set_ledger(&env, 1000, 1_700_000_000);
 
     // Write a lock entry via raw storage with a moderate TTL
-    let lock = crate::EscrowLockData {
-        buyer: buyer.clone(),
-        seller: seller.clone(),
-        arbitration_id,
-        amount,
-        locked_at: 1_700_000_000,
-    };
+        let lock = crate::EscrowLockData {
+            buyer: buyer.clone(),
+            seller: seller.clone(),
+            arbitration_id,
+            amount,
+            locked_at: 1_700_000_000,
+            fee_reserve: 0, // No fee reserve needed for this test
+        };
     env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
@@ -199,7 +200,7 @@ fn test_delayed_release_ttl_extension() {
     let amount: i128 = 100_000_000_000;
 
     let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    token_admin_client.mint(&buyer, &amount);
+    token_admin_client.mint(&buyer, &(amount + crate::FEE_RESERVE_XLM));
 
     // Lock settlement
     client.lock_settlement(&cycle, &buyer, &seller, &arbitration_id, &amount);
@@ -309,7 +310,7 @@ fn test_release_arbitration_id_mismatch() {
     set_ledger(&env, 1000, 1_700_000_000);
 
     let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    token_admin_client.mint(&buyer, &100_000_000_000);
+    token_admin_client.mint(&buyer, &(100_000_000_000 + crate::FEE_RESERVE_XLM));
 
     client.lock_settlement(&1u32, &buyer, &seller, &42u32, &100_000_000_000);
 
@@ -336,7 +337,7 @@ fn test_release_amount_exceeds_lock() {
     set_ledger(&env, 1000, 1_700_000_000);
 
     let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    token_admin_client.mint(&buyer, &200_000_000_000);
+    token_admin_client.mint(&buyer, &(200_000_000_000 + crate::FEE_RESERVE_XLM));
 
     client.lock_settlement(&1u32, &buyer, &seller, &42u32, &100_000_000_000);
 
