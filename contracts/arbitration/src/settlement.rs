@@ -66,7 +66,7 @@ pub fn settle_dispute(
     cycle: u32,
     dispute_id: u32,
     fee_budget_xlm: i128, // Fee budget in stroops
-    arbitrator: &Address,
+    arbitrator: Address,
     payout_hops: Vec<SettlementHop>,
 ) -> SettlementStatus {
     // Synchronize TTLs first
@@ -80,7 +80,7 @@ pub fn settle_dispute(
     // Verify dispute exists and arbitrator is authorized
     let mut dispute: Dispute = env.storage().persistent().get(&DataKey::Dispute(dispute_id)).unwrap();
     arbitrator.require_auth();
-    if dispute.arbitrator != *arbitrator {
+    if dispute.arbitrator != arbitrator {
         panic!("Unauthorized: not the arbitrator");
     }
     if dispute.status == DisputeStatus::Resolved {
