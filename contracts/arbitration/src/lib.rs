@@ -154,7 +154,7 @@ impl ArbitrationContract {
         arbitrator: Address,
         payout_hops: Vec<SettlementHop>,
     ) -> SettlementStatus {
-        settlement::settle_dispute(&env, cycle, dispute_id, fee_budget_xlm, &arbitrator, payout_hops)
+        settlement::settle_dispute(&env, cycle, dispute_id, fee_budget_xlm, arbitrator, payout_hops)
     }
 
     pub fn resolve_dispute(env: Env, dispute_id: u32, funder_award: i128, grantee_award: i128) {
