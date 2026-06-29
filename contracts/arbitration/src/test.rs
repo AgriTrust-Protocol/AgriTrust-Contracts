@@ -122,7 +122,8 @@ fn test_synchronize_escrow_ttl_extends_short_ttl_entries() {
 
     set_ledger(&env, 1000, 1_700_000_000);
 
-    // Write a lock entry via raw storage with a moderate TTL
+    env.as_contract(&contract_id, || {
+        // Write a lock entry via raw storage with a moderate TTL
         let lock = crate::EscrowLockData {
             buyer: buyer.clone(),
             seller: seller.clone(),
@@ -131,7 +132,6 @@ fn test_synchronize_escrow_ttl_extends_short_ttl_entries() {
             locked_at: 1_700_000_000,
             fee_reserve: 0, // No fee reserve needed for this test
         };
-    env.as_contract(&contract_id, || {
         env.storage()
             .persistent()
             .set(&DataKey::EscrowLock(cycle), &lock);

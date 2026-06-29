@@ -27,7 +27,6 @@ pub enum DataKey {
     EscrowTtlDeadline(u32),
     EscrowCycleCounter,
     ExpiredEscrows,
-    FeeReserve, // i128 - total fee reserve held by contract
     SettlementHopSnapshot(u32), // Snapshot for rollback during partial settlement
 }
 
@@ -95,12 +94,7 @@ pub enum SettlementStatus {
     Partial(u32), // Number of hops completed
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FeeBudget {
-    pub estimated_ops: u64,
-    pub fee_reserve_used: i128,
-}
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

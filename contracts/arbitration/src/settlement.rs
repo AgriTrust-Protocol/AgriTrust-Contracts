@@ -2,7 +2,7 @@ use soroban_sdk::{symbol_short, token, Address, Env, Vec};
 use crate::{
     DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline, TTL_EXTENSION_PERIOD,
     FEE_SAFETY_MARGIN, FEE_RESERVE_XLM, OPS_PER_HOP, OPS_PER_TOKEN_TRANSFER,
-    Dispute, DisputeStatus, SettlementHop, SettlementStatus, FeeBudget, SettlementSnapshot
+    Dispute, DisputeStatus, SettlementHop, SettlementStatus, SettlementSnapshot
 };
 
 const BUMP_THRESHOLD: u32 = 86_400;   // 10 days in ledgers — extend when below this
@@ -15,10 +15,7 @@ pub fn estimate_operation_cost(hop_count: u64) -> u64 {
     base_ops + hop_count * (OPS_PER_HOP + OPS_PER_TOKEN_TRANSFER)
 }
 
-/// Calculate fees based on amount and fee percentage in basis points
-pub fn _calculate_fees(amount: i128, fee_bps: u64) -> i128 {
-    (amount * fee_bps as i128) / 10_000
-}
+
 
 /// Execute a single settlement hop
 fn execute_single_hop(env: &Env, hop: &SettlementHop, token_client: &token::Client) {
