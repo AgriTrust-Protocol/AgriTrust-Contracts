@@ -11,9 +11,11 @@ const express = require("express");
 const escrowRoutes = require("./routes/escrow");
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
+const { tracingMiddleware } = require("./middleware/tracing");
 
 const app = express();
 
+app.use(tracingMiddleware());
 app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────

@@ -69,6 +69,7 @@ pub struct Dispute {
     pub amount: i128,
     pub status: DisputeStatus,
     pub arbitrator: Address,
+    pub arbitrator_public_key: soroban_sdk::BytesN<32>,
 }
 
 #[contract]
@@ -88,7 +89,15 @@ impl ArbitrationContract {
         env.storage().instance().extend_ttl(0, 518_400);
     }
 
-    pub fn raise_dispute(env: Env, grant_id: u32, funder: Address, grantee: Address, amount: i128, arbitrator: Address) -> u32 {
+    pub fn raise_dispute(
+        env: Env,
+        grant_id: u32,
+        funder: Address,
+        grantee: Address,
+        amount: i128,
+        arbitrator: Address,
+        arbitrator_public_key: soroban_sdk::BytesN<32>,
+    ) -> u32 {
         funder.require_auth();
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -106,9 +115,17 @@ impl ArbitrationContract {
             amount,
             status: DisputeStatus::Pending,
             arbitrator,
+            arbitrator_public_key,
         };
 
         env.storage().persistent().set(&DataKey::Dispute(counter), &dispute);
+
+        let escrow_state = EscrowState {
+            sequence: 0,
+            status: EscrowStatus::Locked,
+        };
+        env.storage().persistent().set(&DataKey::EscrowState(counter), &escrow_state);
+
         counter
     }
 
@@ -178,3 +195,4 @@ impl ArbitrationContract {
         env.storage().persistent().get(&DataKey::EscrowTtlDeadline(cycle))
     }
 }
+
