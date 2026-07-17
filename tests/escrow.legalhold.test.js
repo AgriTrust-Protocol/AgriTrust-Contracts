@@ -22,6 +22,9 @@ const { onChainAdapter } = require("../src/adapters/onChainAdapter");
 
 const app = require("../src/index");
 const { readEscrow, normalise, validateEscrowId } = require("../src/services/escrowRead");
+const { getDegradationSnapshot, resetDegradation } = require("../src/services/degradation");
+
+beforeEach(() => resetDegradation());
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -444,5 +447,81 @@ describe("Edge cases", () => {
     expect(res.status).toBe(200);
     expect(res.body.balance).toBe("0");
     expect(res.body.legal_hold).toBe(false);
+  });
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Graceful degradation — feature flags and capacity shedding
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Graceful degradation controls", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("returns 503 before escrow mutation work when mutation feature flag is off", async () => {
+    resetDegradation({ flags: { mutationEndpoints: false } });
+    const res = await request(app)
+      .post(`/escrow/${ESCROW_ID}/fund`)
+      .send({ amount: "100" });
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({
+      error: "Feature temporarily disabled",
+      feature: "mutationEndpoints",
+    });
+    expect(onChainAdapter.getEscrow).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 before escrow reads when read feature flag is off", async () => {
+    resetDegradation({ flags: { escrowRead: false } });
+    const res = await request(app).get(`/escrow/${ESCROW_ID}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.feature).toBe("escrowRead");
+    expect(onChainAdapter.getEscrow).not.toHaveBeenCalled();
+  });
+
+  it("sheds capacity with Retry-After when in-flight requests exceed the configured ceiling", async () => {
+    resetDegradation({ flags: { shedCapacity: true }, maxInFlight: 1 });
+    let releaseFirstRequest;
+    onChainAdapter.getEscrow.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releaseFirstRequest = () => resolve(baseRaw);
+      })
+    );
+
+    const first = request(app).get(`/escrow/${ESCROW_ID}`);
+    const firstResponse = first.then((response) => response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const second = await request(app).get(`/escrow/${ESCROW_ID}`);
+    expect(second.status).toBe(503);
+    expect(second.headers["retry-after"]).toBe("1");
+    expect(second.body.error).toBe("Capacity temporarily unavailable");
+
+    releaseFirstRequest();
+    const completedFirst = await firstResponse;
+    expect(completedFirst.status).toBe(200);
+  });
+
+  it("exposes degradation telemetry for monitoring and dashboards", async () => {
+    resetDegradation({ flags: { shedCapacity: true }, maxInFlight: 3 });
+    const res = await request(app).get("/ops/degradation");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      flags: { shedCapacity: true, mutationEndpoints: true, escrowRead: true },
+      capacity: { in_flight: 0, max_in_flight: 3, shedding_enabled: true },
+      counters: { accepted: 0, completed: 0, shed: 0, disabled: 0 },
+    });
+  });
+
+  it("records disabled and shed counters in snapshots", async () => {
+    resetDegradation({ flags: { mutationEndpoints: false } });
+    await request(app).post(`/escrow/${ESCROW_ID}/release`).send({});
+    const snapshot = getDegradationSnapshot();
+
+    expect(snapshot.counters.disabled).toBe(1);
+    expect(snapshot.counters.shed).toBe(0);
   });
 });
