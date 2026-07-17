@@ -9,10 +9,14 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
+const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 
 const app = express();
 
 app.use(express.json());
+
+// Apply a system-wide per-tenant token bucket before all service routes.
+app.use(createTenantRateLimiter());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
