@@ -9,10 +9,20 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
+const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 
 const app = express();
 
 app.use(express.json());
+app.use(capacityShedding);
+
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.get("/ops/degradation", (_req, res) => {
+  res.status(200).json(getDegradationSnapshot());
+});
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
