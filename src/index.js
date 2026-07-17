@@ -10,6 +10,8 @@
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
 const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
+const { createHealthRouter } = require("./routes/health");
+const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { tracingMiddleware } = require("./middleware/tracing");
 
 const app = express();
@@ -28,6 +30,7 @@ app.get("/ops/degradation", (_req, res) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/health", createHealthRouter(buildDefaultPool()));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
