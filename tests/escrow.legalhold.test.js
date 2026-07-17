@@ -446,3 +446,65 @@ describe("Edge cases", () => {
     expect(res.body.legal_hold).toBe(false);
   });
 });
+
+describe("structured OpenTelemetry-style logging", () => {
+  let logSpy;
+  let warnSpy;
+  let errorSpy;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it("emits a structured HTTP request log with semantic convention attributes", async () => {
+    mockGetEscrow(baseRaw);
+    const res = await request(app)
+      .get(`/escrow/${ESCROW_ID}`)
+      .set("x-request-id", "req-test-1")
+      .set("user-agent", "jest-agent");
+
+    expect(res.status).toBe(200);
+    expect(res.headers["x-request-id"]).toBe("req-test-1");
+    expect(logSpy).toHaveBeenCalled();
+
+    const record = JSON.parse(logSpy.mock.calls.at(-1)[0]);
+    expect(record).toMatchObject({
+      severity_text: "INFO",
+      body: "http.server.request",
+      resource: {
+        "service.name": "agritrust-contracts-api",
+        "service.version": "1.0.0",
+        "deployment.environment.name": "test",
+      },
+      attributes: {
+        "http.request.method": "GET",
+        "http.response.status_code": 200,
+        "http.route": "/escrow/:escrowId",
+        "url.path": `/escrow/${ESCROW_ID}`,
+        "user_agent.original": "jest-agent",
+        "request.id": "req-test-1",
+      },
+    });
+    expect(record.attributes["event.duration_ms"]).toBeGreaterThanOrEqual(0);
+  });
+
+  it("logs client errors as WARN and server errors as ERROR", async () => {
+    await request(app).get("/unknown-route");
+    expect(warnSpy).toHaveBeenCalled();
+    expect(JSON.parse(warnSpy.mock.calls.at(-1)[0]).severity_text).toBe("WARN");
+
+    onChainAdapter.getEscrow.mockRejectedValue(new Error("network error"));
+    await request(app).get(`/escrow/${ESCROW_ID}`);
+    expect(errorSpy).toHaveBeenCalled();
+    expect(JSON.parse(errorSpy.mock.calls.at(-1)[0]).severity_text).toBe("ERROR");
+  });
+});
