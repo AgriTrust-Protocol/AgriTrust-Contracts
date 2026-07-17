@@ -506,5 +506,88 @@ describe("cache layer", () => {
     expect(parseTtlSeconds()).toBe(30);
     process.env.CACHE_TTL_SECONDS = "0";
     expect(() => parseTtlSeconds()).toThrow("CACHE_TTL_SECONDS");
+// 8. OpenTelemetry trace context propagation
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("OpenTelemetry trace context propagation", () => {
+  const {
+    buildTraceparent,
+    createTraceContext,
+    parseTraceparent,
+    tracingMiddleware,
+  } = require("../src/middleware/tracing");
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it("parses valid W3C traceparent headers", () => {
+    const parsed = parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    expect(parsed).toMatchObject({
+      traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+      parentSpanId: "00f067aa0ba902b7",
+      traceFlags: "01",
+    });
+  });
+
+  it("rejects malformed or all-zero trace context", () => {
+    expect(parseTraceparent("not-a-traceparent")).toBeNull();
+    expect(parseTraceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01")).toBeNull();
+    expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01")).toBeNull();
+  });
+
+  it("builds response traceparent values with the same trace id", () => {
+    const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const spanId = "00f067aa0ba902b7";
+    expect(buildTraceparent({ traceId, spanId, traceFlags: "01" })).toBe(
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    );
+  });
+
+  it("creates child trace context from incoming headers", () => {
+    const req = {
+      get: (name) => ({
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        tracestate: "vendor=value",
+      }[name.toLowerCase()]),
+    };
+    const context = createTraceContext(req);
+    expect(context.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+    expect(context.parentSpanId).toBe("00f067aa0ba902b7");
+    expect(context.traceparent).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[\da-f]{16}-01$/);
+    expect(context.tracestate).toBe("vendor=value");
+  });
+
+  it("returns trace headers from Express requests", async () => {
+    mockGetEscrow(baseRaw);
+    const res = await request(app)
+      .get(`/escrow/${ESCROW_ID}`)
+      .set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+      .set("tracestate", "vendor=value");
+
+    expect(res.status).toBe(200);
+    expect(res.headers.traceparent).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[\da-f]{16}-01$/);
+    expect(res.headers.tracestate).toBe("vendor=value");
+  });
+
+  it("emits one OpenTelemetry-compatible server span on finish", () => {
+    const logger = { log: jest.fn() };
+    const middleware = tracingMiddleware({ logger, serviceName: "test-api" });
+    const finishHandlers = {};
+    const req = { method: "GET", path: "/health", headers: {}, get: () => undefined };
+    const res = {
+      statusCode: 204,
+      setHeader: jest.fn(),
+      on: (event, handler) => { finishHandlers[event] = handler; },
+    };
+    const next = jest.fn();
+
+    middleware(req, res, next);
+    finishHandlers.finish();
+
+    expect(next).toHaveBeenCalled();
+    expect(res.setHeader).toHaveBeenCalledWith("traceparent", expect.stringMatching(/^00-[\da-f]{32}-[\da-f]{16}-01$/));
+    expect(logger.log).toHaveBeenCalledTimes(1);
+    const event = JSON.parse(logger.log.mock.calls[0][0]);
+    expect(event).toMatchObject({ event: "otel.http.server.span", service_name: "test-api", kind: "SERVER" });
+    expect(event.attributes["http.request.method"]).toBe("GET");
   });
 });
