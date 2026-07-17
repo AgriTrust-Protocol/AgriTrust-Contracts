@@ -10,14 +10,19 @@
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
 const logger = require("./observability/logger");
+const { createHealthRouter } = require("./routes/health");
+const { buildDefaultPool } = require("./services/postgresPoolHealth");
+const { tracingMiddleware } = require("./middleware/tracing");
 
 const app = express();
 
+app.use(tracingMiddleware());
 app.use(express.json());
 app.use(logger.requestLogger);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/health", createHealthRouter(buildDefaultPool()));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
