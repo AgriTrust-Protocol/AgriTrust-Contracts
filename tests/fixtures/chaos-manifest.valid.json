@@ -1,0 +1,26 @@
+{
+  "apiVersion": "agritrust.io/v1",
+  "kind": "ChaosExperiment",
+  "metadata": {
+    "name": "escrow-read-rpc-timeout",
+    "environment": "staging",
+    "owner": "platform-oncall"
+  },
+  "spec": {
+    "target": {
+      "service": "escrow-api"
+    },
+    "fault": {
+      "type": "rpc-timeout",
+      "duration": "5m"
+    },
+    "safeguards": {
+      "maxP99LatencyMs": 100,
+      "minAvailabilityPercent": 99.99,
+      "requireSecurityReview": true
+    },
+    "rollback": {
+      "strategy": "disable-experiment-and-shift-to-blue"
+    }
+  }
+}
