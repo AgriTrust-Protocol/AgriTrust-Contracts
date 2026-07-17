@@ -1,0 +1,159 @@
+# AgriTrust service mesh baseline for Istio-compatible meshes.
+# Apply after sidecar injection is enabled on the target namespace.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: agritrust-mtls-strict
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+    security.agritrust.io/control: mtls
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: agritrust-jwt
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: agritrust
+  jwtRules:
+    - issuer: "https://auth.agritrust.example.com/"
+      jwksUri: "https://auth.agritrust.example.com/.well-known/jwks.json"
+      forwardOriginalToken: true
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: agritrust-default-deny
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec: {}
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: agritrust-api-ingress
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agritrust-contracts-api
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/escrow/*"]
+      when:
+        - key: request.auth.claims[scope]
+          values: ["escrow:read", "escrow:write"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: agritrust-api-egress-onchain
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agritrust-contracts-api
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            hosts: ["stellar-rpc.agritrust.svc.cluster.local"]
+            ports: ["443"]
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: agritrust-api-mtls
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec:
+  host: agritrust-contracts-api.agritrust.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 1024
+      http:
+        http2MaxRequests: 4096
+        maxRequestsPerConnection: 100
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: agritrust-api-blue-green-canary
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec:
+  hosts:
+    - agritrust-contracts-api.agritrust.svc.cluster.local
+  http:
+    - name: canary
+      match:
+        - headers:
+            x-agritrust-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: agritrust-contracts-api.agritrust.svc.cluster.local
+            subset: green
+          weight: 100
+    - name: progressive-shift
+      route:
+        - destination:
+            host: agritrust-contracts-api.agritrust.svc.cluster.local
+            subset: blue
+          weight: 90
+        - destination:
+            host: agritrust-contracts-api.agritrust.svc.cluster.local
+            subset: green
+          weight: 10
+      timeout: 100ms
+      retries:
+        attempts: 2
+        perTryTimeout: 40ms
+        retryOn: connect-failure,refused-stream,unavailable,cancelled,5xx
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: agritrust-api-subsets
+  namespace: agritrust
+  labels:
+    app.kubernetes.io/part-of: agritrust
+spec:
+  host: agritrust-contracts-api.agritrust.svc.cluster.local
+  subsets:
+    - name: blue
+      labels:
+        version: blue
+    - name: green
+      labels:
+        version: green

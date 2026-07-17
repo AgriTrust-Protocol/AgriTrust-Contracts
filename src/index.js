@@ -10,9 +10,11 @@
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
 const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
+const { tracingMiddleware } = require("./middleware/tracing");
 
 const app = express();
 
+app.use(tracingMiddleware());
 app.use(express.json());
 app.use(capacityShedding);
 
