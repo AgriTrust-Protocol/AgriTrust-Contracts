@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "name": "unsafe-production-test",
+    "environment": "production",
+    "owner": "platform-oncall"
+  },
+  "spec": {
+    "target": { "service": "escrow-api" },
+    "fault": { "type": "latency", "duration": "5m" },
+    "safeguards": {
+      "maxP99LatencyMs": 250,
+      "minAvailabilityPercent": 99.9,
+      "requireSecurityReview": false
+    },
+    "rollback": { "strategy": "manual" }
+  }
+}

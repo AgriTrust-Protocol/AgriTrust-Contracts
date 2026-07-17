@@ -351,13 +351,17 @@ fn test_release_amount_exceeds_lock() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_arbitration() {
+fn test_successful_settlement() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
     let funder = Address::generate(&env);
     let grantee = Address::generate(&env);
+    
+    // Generate key pair for the arbitrator
+    let arbitrator_key = signing_key(1);
+    let arbitrator_pub_key = bytesn32(&env, arbitrator_key.verifying_key().to_bytes());
     let arbitrator = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
