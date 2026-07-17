@@ -9,6 +9,7 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
+const { router: secretRoutes } = require("./routes/secrets");
 
 const app = express();
 
@@ -16,6 +17,7 @@ app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/internal/secrets", secretRoutes);
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
