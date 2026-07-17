@@ -22,6 +22,7 @@ const { onChainAdapter } = require("../src/adapters/onChainAdapter");
 
 const app = require("../src/index");
 const { readEscrow, normalise, validateEscrowId } = require("../src/services/escrowRead");
+const { MemoryCacheStore, getCacheStats, parseTtlSeconds, resetCacheForTests } = require("../src/services/cache");
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -41,6 +42,12 @@ const heldRaw = { ...baseRaw, legal_hold: true };
 function mockGetEscrow(raw) {
   onChainAdapter.getEscrow.mockResolvedValue(raw);
 }
+
+beforeEach(() => {
+  resetCacheForTests();
+  delete process.env.CACHE_ENABLED;
+  delete process.env.CACHE_TTL_SECONDS;
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. escrowRead service — unit tests
@@ -444,5 +451,60 @@ describe("Edge cases", () => {
     expect(res.status).toBe(200);
     expect(res.body.balance).toBe("0");
     expect(res.body.legal_hold).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Cache layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("cache layer", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    resetCacheForTests();
+    delete process.env.CACHE_ENABLED;
+    delete process.env.CACHE_TTL_SECONDS;
+  });
+
+  it("caches escrow reads and avoids duplicate adapter calls", async () => {
+    mockGetEscrow(baseRaw);
+    const first = await readEscrow(ESCROW_ID);
+    const second = await readEscrow(ESCROW_ID);
+
+    expect(first).toEqual(second);
+    expect(onChainAdapter.getEscrow).toHaveBeenCalledTimes(1);
+    expect(getCacheStats()).toMatchObject({ hits: 1, misses: 1, sets: 1 });
+  });
+
+  it("refreshes cached values after TTL expiry", async () => {
+    let now = 0;
+    resetCacheForTests(new MemoryCacheStore(() => now));
+    process.env.CACHE_TTL_SECONDS = "1";
+    onChainAdapter.getEscrow
+      .mockResolvedValueOnce(baseRaw)
+      .mockResolvedValueOnce({ ...baseRaw, balance: "42" });
+
+    await expect(readEscrow(ESCROW_ID)).resolves.toMatchObject({ balance: baseRaw.balance });
+    now = 1001;
+    await expect(readEscrow(ESCROW_ID)).resolves.toMatchObject({ balance: "42" });
+
+    expect(onChainAdapter.getEscrow).toHaveBeenCalledTimes(2);
+  });
+
+  it("bypasses cache when CACHE_ENABLED is false", async () => {
+    process.env.CACHE_ENABLED = "false";
+    mockGetEscrow(baseRaw);
+
+    await readEscrow(ESCROW_ID);
+    await readEscrow(ESCROW_ID);
+
+    expect(onChainAdapter.getEscrow).toHaveBeenCalledTimes(2);
+  });
+
+  it("validates configurable TTL bounds", () => {
+    process.env.CACHE_TTL_SECONDS = "30";
+    expect(parseTtlSeconds()).toBe(30);
+    process.env.CACHE_TTL_SECONDS = "0";
+    expect(() => parseTtlSeconds()).toThrow("CACHE_TTL_SECONDS");
   });
 });

@@ -1,6 +1,7 @@
 "use strict";
 
 const { onChainAdapter } = require("../adapters/onChainAdapter");
+const { buildKey, getOrSet } = require("./cache");
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -38,7 +39,10 @@ async function readEscrow(escrowId) {
 
   let raw;
   try {
-    raw = await onChainAdapter.getEscrow(escrowId);
+    raw = await getOrSet(
+      buildKey("escrow", escrowId),
+      () => onChainAdapter.getEscrow(escrowId)
+    );
   } catch (err) {
     // Re-throw validation errors as-is; wrap everything else
     if (err.statusCode) throw err;

@@ -9,6 +9,7 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
+const { configureCacheStore, getCacheStats } = require("./services/cache");
 
 const app = express();
 
@@ -16,6 +17,10 @@ app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+
+app.get("/health/cache", (_req, res) => {
+  res.status(200).json(getCacheStats());
+});
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
@@ -33,8 +38,10 @@ app.use((err, _req, res, _next) => {
 // ── Start (only when run directly) ───────────────────────────────────────────
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Grant Stream API listening on port ${PORT}`);
+  configureCacheStore().finally(() => {
+    app.listen(PORT, () => {
+      console.log(`Grant Stream API listening on port ${PORT}`);
+    });
   });
 }
 
