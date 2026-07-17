@@ -11,6 +11,7 @@ members = [
     "contracts/admin",
     "contracts/treasury",
     "contracts/state",
+    "contracts/did_registry",
 ]
 
 [workspace.dependencies]
