@@ -8,7 +8,9 @@
     "dev": "nodemon src/index.js",
     "test": "jest --runInBand --forceExit",
     "test:coverage": "jest --runInBand --forceExit --coverage",
-    "backup:verify": "node scripts/verify-database-backup.js"
+    "backup:verify": "node scripts/verify-database-backup.js",
+    "precommit:install": "git config core.hooksPath .githooks",
+    "quality:precommit": "node scripts/pre-commit-quality.js"
   },
   "dependencies": {
     "express": "^4.19.2",
