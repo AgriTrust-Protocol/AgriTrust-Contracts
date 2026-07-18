@@ -28,6 +28,9 @@ app.get("/ops/degradation", (_req, res) => {
   res.status(200).json(getDegradationSnapshot());
 });
 
+// Apply a system-wide per-tenant token bucket before all service routes.
+app.use(createTenantRateLimiter());
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
 app.use("/internal/secrets", secretRoutes);
