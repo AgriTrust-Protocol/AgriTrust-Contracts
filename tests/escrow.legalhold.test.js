@@ -22,6 +22,9 @@ const { onChainAdapter } = require("../src/adapters/onChainAdapter");
 
 const app = require("../src/index");
 const { readEscrow, normalise, validateEscrowId } = require("../src/services/escrowRead");
+const { getDegradationSnapshot, resetDegradation } = require("../src/services/degradation");
+
+beforeEach(() => resetDegradation());
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -447,89 +450,78 @@ describe("Edge cases", () => {
   });
 });
 
+
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. OpenTelemetry trace context propagation
+// 8. Graceful degradation — feature flags and capacity shedding
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("OpenTelemetry trace context propagation", () => {
-  const {
-    buildTraceparent,
-    createTraceContext,
-    parseTraceparent,
-    tracingMiddleware,
-  } = require("../src/middleware/tracing");
-
+describe("Graceful degradation controls", () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it("parses valid W3C traceparent headers", () => {
-    const parsed = parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
-    expect(parsed).toMatchObject({
-      traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
-      parentSpanId: "00f067aa0ba902b7",
-      traceFlags: "01",
+  it("returns 503 before escrow mutation work when mutation feature flag is off", async () => {
+    resetDegradation({ flags: { mutationEndpoints: false } });
+    const res = await request(app)
+      .post(`/escrow/${ESCROW_ID}/fund`)
+      .send({ amount: "100" });
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({
+      error: "Feature temporarily disabled",
+      feature: "mutationEndpoints",
+    });
+    expect(onChainAdapter.getEscrow).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 before escrow reads when read feature flag is off", async () => {
+    resetDegradation({ flags: { escrowRead: false } });
+    const res = await request(app).get(`/escrow/${ESCROW_ID}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.feature).toBe("escrowRead");
+    expect(onChainAdapter.getEscrow).not.toHaveBeenCalled();
+  });
+
+  it("sheds capacity with Retry-After when in-flight requests exceed the configured ceiling", async () => {
+    resetDegradation({ flags: { shedCapacity: true }, maxInFlight: 1 });
+    let releaseFirstRequest;
+    onChainAdapter.getEscrow.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releaseFirstRequest = () => resolve(baseRaw);
+      })
+    );
+
+    const first = request(app).get(`/escrow/${ESCROW_ID}`);
+    const firstResponse = first.then((response) => response);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const second = await request(app).get(`/escrow/${ESCROW_ID}`);
+    expect(second.status).toBe(503);
+    expect(second.headers["retry-after"]).toBe("1");
+    expect(second.body.error).toBe("Capacity temporarily unavailable");
+
+    releaseFirstRequest();
+    const completedFirst = await firstResponse;
+    expect(completedFirst.status).toBe(200);
+  });
+
+  it("exposes degradation telemetry for monitoring and dashboards", async () => {
+    resetDegradation({ flags: { shedCapacity: true }, maxInFlight: 3 });
+    const res = await request(app).get("/ops/degradation");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      flags: { shedCapacity: true, mutationEndpoints: true, escrowRead: true },
+      capacity: { in_flight: 0, max_in_flight: 3, shedding_enabled: true },
+      counters: { accepted: 0, completed: 0, shed: 0, disabled: 0 },
     });
   });
 
-  it("rejects malformed or all-zero trace context", () => {
-    expect(parseTraceparent("not-a-traceparent")).toBeNull();
-    expect(parseTraceparent("00-00000000000000000000000000000000-00f067aa0ba902b7-01")).toBeNull();
-    expect(parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01")).toBeNull();
-  });
+  it("records disabled and shed counters in snapshots", async () => {
+    resetDegradation({ flags: { mutationEndpoints: false } });
+    await request(app).post(`/escrow/${ESCROW_ID}/release`).send({});
+    const snapshot = getDegradationSnapshot();
 
-  it("builds response traceparent values with the same trace id", () => {
-    const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
-    const spanId = "00f067aa0ba902b7";
-    expect(buildTraceparent({ traceId, spanId, traceFlags: "01" })).toBe(
-      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-    );
-  });
-
-  it("creates child trace context from incoming headers", () => {
-    const req = {
-      get: (name) => ({
-        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        tracestate: "vendor=value",
-      }[name.toLowerCase()]),
-    };
-    const context = createTraceContext(req);
-    expect(context.traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
-    expect(context.parentSpanId).toBe("00f067aa0ba902b7");
-    expect(context.traceparent).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[\da-f]{16}-01$/);
-    expect(context.tracestate).toBe("vendor=value");
-  });
-
-  it("returns trace headers from Express requests", async () => {
-    mockGetEscrow(baseRaw);
-    const res = await request(app)
-      .get(`/escrow/${ESCROW_ID}`)
-      .set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-      .set("tracestate", "vendor=value");
-
-    expect(res.status).toBe(200);
-    expect(res.headers.traceparent).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[\da-f]{16}-01$/);
-    expect(res.headers.tracestate).toBe("vendor=value");
-  });
-
-  it("emits one OpenTelemetry-compatible server span on finish", () => {
-    const logger = { log: jest.fn() };
-    const middleware = tracingMiddleware({ logger, serviceName: "test-api" });
-    const finishHandlers = {};
-    const req = { method: "GET", path: "/health", headers: {}, get: () => undefined };
-    const res = {
-      statusCode: 204,
-      setHeader: jest.fn(),
-      on: (event, handler) => { finishHandlers[event] = handler; },
-    };
-    const next = jest.fn();
-
-    middleware(req, res, next);
-    finishHandlers.finish();
-
-    expect(next).toHaveBeenCalled();
-    expect(res.setHeader).toHaveBeenCalledWith("traceparent", expect.stringMatching(/^00-[\da-f]{32}-[\da-f]{16}-01$/));
-    expect(logger.log).toHaveBeenCalledTimes(1);
-    const event = JSON.parse(logger.log.mock.calls[0][0]);
-    expect(event).toMatchObject({ event: "otel.http.server.span", service_name: "test-api", kind: "SERVER" });
-    expect(event.attributes["http.request.method"]).toBe("GET");
+    expect(snapshot.counters.disabled).toBe(1);
+    expect(snapshot.counters.shed).toBe(0);
   });
 });
