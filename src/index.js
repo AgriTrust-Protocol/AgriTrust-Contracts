@@ -9,7 +9,7 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
-const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
+const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { tracingMiddleware } = require("./middleware/tracing");
@@ -18,12 +18,22 @@ const app = express();
 
 app.use(tracingMiddleware());
 app.use(express.json());
+app.use(capacityShedding);
+
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.get("/ops/degradation", (_req, res) => {
+  res.status(200).json(getDegradationSnapshot());
+});
 
 // Apply a system-wide per-tenant token bucket before all service routes.
 app.use(createTenantRateLimiter());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/internal/secrets", secretRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool()));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────

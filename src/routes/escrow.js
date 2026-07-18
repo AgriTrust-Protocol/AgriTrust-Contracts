@@ -14,6 +14,7 @@
 const { Router }      = require("express");
 const { readEscrow }  = require("../services/escrowRead");
 const legalHoldGate   = require("../middleware/legalHoldGate");
+const { featureFlagGate } = require("../services/degradation");
 
 const router = Router({ mergeParams: true });
 
@@ -25,7 +26,7 @@ const router = Router({ mergeParams: true });
  *          Clients MUST check `legal_hold` before initiating any funding action.
  * @access  Public
  */
-router.get("/:escrowId", async (req, res, next) => {
+router.get("/:escrowId", featureFlagGate("escrowRead"), async (req, res, next) => {
   try {
     const escrow = await readEscrow(req.params.escrowId);
     return res.status(200).json(escrow);
@@ -45,7 +46,7 @@ router.get("/:escrowId", async (req, res, next) => {
  * @body    { amount: string }
  * @access  Authenticated (auth middleware omitted for brevity)
  */
-router.post("/:escrowId/fund", legalHoldGate, async (req, res, next) => {
+router.post("/:escrowId/fund", featureFlagGate("mutationEndpoints"), legalHoldGate, async (req, res, next) => {
   try {
     const { amount } = req.body;
     if (!amount) {
@@ -70,7 +71,7 @@ router.post("/:escrowId/fund", legalHoldGate, async (req, res, next) => {
  * @desc    Release escrow funds to recipient.  Blocked with 502 if legal_hold.
  * @access  Authenticated
  */
-router.post("/:escrowId/release", legalHoldGate, async (req, res, next) => {
+router.post("/:escrowId/release", featureFlagGate("mutationEndpoints"), legalHoldGate, async (req, res, next) => {
   try {
     // TODO: submit on-chain release transaction
     return res.status(200).json({
@@ -89,7 +90,7 @@ router.post("/:escrowId/release", legalHoldGate, async (req, res, next) => {
  * @desc    Withdraw from escrow.  Blocked with 502 if legal_hold.
  * @access  Authenticated
  */
-router.post("/:escrowId/withdraw", legalHoldGate, async (req, res, next) => {
+router.post("/:escrowId/withdraw", featureFlagGate("mutationEndpoints"), legalHoldGate, async (req, res, next) => {
   try {
     // TODO: submit on-chain withdrawal transaction
     return res.status(200).json({
