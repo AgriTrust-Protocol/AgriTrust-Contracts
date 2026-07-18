@@ -6,8 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "jest --runInBand --forceExit",
-    "test:coverage": "jest --runInBand --forceExit --coverage",
+    "test": "jest --forceExit",
+    "test:coverage": "jest --forceExit --coverage",
     "backup:verify": "node scripts/verify-database-backup.js"
   },
   "dependencies": {
