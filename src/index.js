@@ -9,7 +9,7 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
-const { router: secretRoutes } = require("./routes/secrets");
+const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { tracingMiddleware } = require("./middleware/tracing");
@@ -18,6 +18,15 @@ const app = express();
 
 app.use(tracingMiddleware());
 app.use(express.json());
+app.use(capacityShedding);
+
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.get("/ops/degradation", (_req, res) => {
+  res.status(200).json(getDegradationSnapshot());
+});
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
