@@ -1,12 +1,16 @@
 "use strict";
 
 const { Router } = require("express");
-const { snapshotMetrics, verifySignature } = require("../services/webhookDelivery");
+const { snapshotMetrics, verifySignature, webhookDeadLetterQueue } = require("../services/webhookDelivery");
 
 const router = Router();
 
 router.get("/metrics", (_req, res) => {
   res.status(200).json(snapshotMetrics());
+});
+
+router.get("/dead-letter", (req, res) => {
+  res.status(200).json({ entries: webhookDeadLetterQueue.list({ service: req.query.service }) });
 });
 
 router.post("/verify", (req, res) => {

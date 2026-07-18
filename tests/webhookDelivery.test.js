@@ -10,6 +10,7 @@ const {
   resetMetrics,
   snapshotMetrics,
   verifySignature,
+  webhookDeadLetterQueue,
 } = require("../src/services/webhookDelivery");
 
 const endpoint = { url: "https://partner.example/webhook", secret: "super-secret-value" };
@@ -57,8 +58,11 @@ describe("webhookDelivery service", () => {
 
   it("returns failure after exhausting retry attempts", async () => {
     const fetchImpl = jest.fn().mockRejectedValue(new Error("network down"));
-    await expect(deliverWebhook(endpoint, event, { fetchImpl, disableDelay: true, maxAttempts: 2 })).resolves.toEqual({ ok: false, attempts: 2 });
-    expect(snapshotMetrics()).toMatchObject({ enqueued: 1, delivered: 0, failed: 1, attempts: 2 });
+    const result = await deliverWebhook(endpoint, event, { fetchImpl, disableDelay: true, maxAttempts: 2 });
+    expect(result).toMatchObject({ ok: false, attempts: 2 });
+    expect(result.deadLetterId).toMatch(/^[a-f0-9]{64}$/);
+    expect(webhookDeadLetterQueue.get(result.deadLetterId)).toMatchObject({ service: "webhook-delivery", messageId: event.id, reason: "max_attempts_exhausted" });
+    expect(snapshotMetrics()).toMatchObject({ enqueued: 1, delivered: 0, failed: 1, attempts: 2, deadLettered: 1 });
   });
 
   it("rejects weak endpoint secrets", async () => {
@@ -78,6 +82,17 @@ describe("webhook routes", () => {
     const res = await request(app).get("/webhooks/metrics");
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty("p99DeliveryLatencyMs");
+    expect(res.body).toHaveProperty("deadLetterQueue.pending");
+  });
+
+  it("lists dead-lettered webhook messages", async () => {
+    const fetchImpl = jest.fn().mockRejectedValue(new Error("network down"));
+    const result = await deliverWebhook(endpoint, event, { fetchImpl, disableDelay: true, maxAttempts: 1 });
+
+    const res = await request(app).get("/webhooks/dead-letter");
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toHaveLength(1);
+    expect(res.body.entries[0].id).toBe(result.deadLetterId);
   });
 
   it("verifies signed inbound webhook payloads", async () => {
