@@ -30,6 +30,7 @@ app.get("/ops/degradation", (_req, res) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/internal/secrets", secretRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool()));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
