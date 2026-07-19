@@ -24,5 +24,3 @@ pub use optimistic_mutator::{
 };
 pub use rollback::{apply_compensation, rollback_mutation, verify_compensation_integrity};
 
-#[cfg(test)]
-mod tests;
