@@ -1,0 +1,70 @@
+name: Docker layer cache
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/docker-layer-cache.yml"
+      - ".dockerignore"
+      - "docker/**"
+      - "src/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-layer-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-build:
+    name: Build ${{ matrix.service }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api
+            dockerfile: docker/api.Dockerfile
+            context: .
+            target: runtime
+          - service: contracts
+            dockerfile: docker/contracts.Dockerfile
+            context: .
+            target: artifact
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with GitHub Actions cache
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          tags: agritrust/${{ matrix.service }}:${{ github.sha }}
+          provenance: false
+
+      - name: Emit cache summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## Docker layer cache
+          * Service: `${{ matrix.service }}`
+          * Cache backend: GitHub Actions cache (`type=gha`)
+          * Cache scope: `${{ matrix.service }}`
+          * Dockerfile: `${{ matrix.dockerfile }}`
+          SUMMARY
