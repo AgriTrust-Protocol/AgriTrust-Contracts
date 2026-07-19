@@ -9,10 +9,14 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
+const incidentRoutes = require("./routes/incidents");
+const secretRoutes = require("./routes/secrets").router;
+const webhookRoutes = require("./routes/webhooks");
 const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { tracingMiddleware } = require("./middleware/tracing");
+const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 
 const app = express();
 
@@ -33,7 +37,9 @@ app.use(createTenantRateLimiter());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/incidents", incidentRoutes);
 app.use("/internal/secrets", secretRoutes);
+app.use("/webhooks", webhookRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool()));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
