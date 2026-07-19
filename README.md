@@ -23,6 +23,13 @@ Ensure you have the required toolchains installed:
 ```bash
 # Clone the repository (if running manually)
 git clone https://github.com/AgriTrust-Protocol/AgriTrust-Contracts
+cd AgriTrust-Contracts
+
+# Check local prerequisites for API, Soroban, and Foundry development
+npm run setup:local
+
+# Optionally install Node dependencies and run the JavaScript test suite
+npm run setup:local -- --install --verify
 
 # Build Soroban contracts
 stellar contract build
@@ -36,6 +43,8 @@ forge build
 # Run foundry tests
 forge test
 ```
+
+The onboarding script performs fast, read-only checks for required Node.js/npm tooling and optional Rust, Stellar CLI, and Foundry tooling. It prints remediation guidance for missing tools and exits non-zero only when required tools are missing. Use `--json` for machine-readable output in CI or support runbooks.
 
 ## 🤝 Contributing
 Contributions are highly welcome. Please ensure your commits are cryptographically signed using GPG or SSH keys. For major structural changes, please open an issue first to discuss your proposal.
