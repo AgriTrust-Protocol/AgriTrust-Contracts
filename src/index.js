@@ -9,7 +9,6 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
-const secretRoutes = require("./routes/secrets").router;
 const webhookRoutes = require("./routes/webhooks");
 const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 const { createHealthRouter } = require("./routes/health");
@@ -17,6 +16,8 @@ const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { CapacityPlanner, createCapacityRecorder } = require("./services/capacityPlanning");
 const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 const { tracingMiddleware } = require("./middleware/tracing");
+const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
+const { router: secretRoutes } = require("./routes/secrets");
 
 const app = express();
 const capacityPlanner = new CapacityPlanner();
@@ -39,6 +40,7 @@ app.use(createTenantRateLimiter());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
+app.use("/webhooks", webhookRoutes);
 app.use("/internal/secrets", secretRoutes);
 app.use("/webhooks", webhookRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool(), capacityPlanner));
