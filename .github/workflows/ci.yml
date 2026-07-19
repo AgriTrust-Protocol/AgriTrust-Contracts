@@ -1,0 +1,133 @@
+name: Optimized CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  node-tests:
+    name: Node.js tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run Jest tests
+        run: npm test -- --maxWorkers=50%
+
+  rust-tests:
+    name: Rust tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: core
+            packages: agritrust_common state admin provenance
+          - shard: protocols
+            packages: grant_stream vesting_contracts arbitration compliance
+          - shard: identity-risk
+            packages: zk_kyc treasury did_registry crop_insurance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.shard }}
+      - name: Test package shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for package in ${{ matrix.packages }}; do
+            args+=("-p" "$package")
+          done
+          cargo test "${args[@]}" --locked
+
+  security-review:
+    name: Security review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install Node.js dependencies
+        run: npm ci
+      - name: Audit Node.js dependencies
+        run: npm audit --audit-level=high
+      - name: Check Rust lockfile consistency
+        run: cargo metadata --locked --format-version 1 > /tmp/cargo-metadata.json
+
+  build-wasm:
+    name: WASM release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - rust-tests
+      - security-review
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-release
+      - name: Build optimized WASM contracts
+        run: cargo build --target wasm32-unknown-unknown --release --locked
+
+  ci-summary:
+    name: CI summary gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - node-tests
+      - rust-tests
+      - security-review
+      - build-wasm
+    steps:
+      - name: Validate required jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in \
+            '${{ needs.node-tests.result }}' \
+            '${{ needs.rust-tests.result }}' \
+            '${{ needs.security-review.result }}' \
+            '${{ needs.build-wasm.result }}'; do
+            if [[ "$result" != "success" ]]; then
+              echo "Required CI job failed or was cancelled: $result" >&2
+              exit 1
+            fi
+          done
