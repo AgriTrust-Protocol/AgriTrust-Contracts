@@ -1,11 +1,41 @@
 use soroban_sdk::{Env, Address, panic, Symbol, IntoVal, Val};
 use std::collections::HashMap;
 
+/// Simulation precision used by the pro-rata share cross-multiplication to
+/// minimize intermediate rounding before the final truncation back to whole units.
+const SIMULATION_PRECISION: i128 = 1_000_000_000_000; // 1e12
+
 #[derive(Clone)]
 pub struct GrantPool {
     pub pool_id: String,
     pub balances: HashMap<Address, i128>, // Map of asset address → balance
     pub oracle: Address,                  // Oracle for price conversions
+}
+
+/// Banker's rounding: round to nearest, ties to even.
+pub fn round_half_even(numerator: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        panic!("round_half_even: division by zero");
+    }
+    let q = numerator / denominator;
+    let r = numerator % denominator;
+    let twice = r * 2;
+    if twice < denominator {
+        q // round down
+    } else if twice > denominator {
+        q + 1 // round up
+    } else {
+        // tie: round to even
+        if q % 2 == 0 { q } else { q + 1 }
+    }
+}
+
+/// Pro-rata share of `amount` for an asset holding `balance`, given pool `total_value`.
+/// Uses cross-multiplication with SIMULATION_PRECISION to minimize intermediate rounding.
+pub fn pro_rata_share(balance: i128, amount: i128, total_value: i128) -> i128 {
+    let scaled = balance * amount * SIMULATION_PRECISION;
+    let divided = round_half_even(scaled, total_value);
+    divided / SIMULATION_PRECISION
 }
 
 pub fn emit_deposit_event(env: &Env, pool_id: String, asset: Address, operator: Address, amount: i128) {
@@ -87,7 +117,7 @@ pub fn withdraw(env: &Env, pool_id: String, grantee: Address, amount: i128, pref
         }
 
         for (asset, bal) in pool.balances.iter_mut() {
-            let share = (*bal as i128 * amount) / total_value;
+            let share = pro_rata_share(*bal, amount, total_value);
             *bal -= share;
             emit_withdrawal_event(env, pool_id.clone(), asset.clone(), grantee.clone(), share);
         }
@@ -134,5 +164,21 @@ mod test {
         for event in events.iter() {
             assert!(event.topics.len() <= 4);
         }
+    }
+
+    #[test]
+    fn test_pro_rata_symmetry() {
+        // Two-asset pool, pro-rata split of amount 1500.
+        let total_value = 3000i128;
+        let bal_a = 1000i128;
+        let bal_b = 2000i128;
+        let amt = 1500i128;
+        let share_a = pro_rata_share(bal_a, amt, total_value);
+        let share_b = pro_rata_share(bal_b, amt, total_value);
+        assert_eq!(share_a + share_b, amt, "pro-rata shares must sum to the withdrawn amount");
+        // round_half_even tie-to-even: 5/2 = 2 (even), 7/2 = 4 (even? 3 is odd -> 4)
+        assert_eq!(round_half_even(5, 2), 2);
+        assert_eq!(round_half_even(7, 2), 4);
+        assert_eq!(round_half_even(6, 2), 3);
     }
 }
