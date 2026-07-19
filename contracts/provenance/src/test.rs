@@ -1,10 +1,10 @@
 extern crate std;
-use soroban_sdk::{vec, BytesN, Env};
 use crate::{
     errors::Error,
     resolver::{get_provenance_result, resolve_provenance, write_hop_state},
-    types::{HopState, Score, SCORE_PRECISION, STORAGE_BUDGET, STORAGE_WARN_THRESHOLD, MAX_HOPS},
+    types::{HopState, Score, MAX_HOPS, SCORE_PRECISION, STORAGE_BUDGET, STORAGE_WARN_THRESHOLD},
 };
+use soroban_sdk::{vec, BytesN, Env};
 
 fn make_hop(env: &Env, index: u32) -> (BytesN<32>, HopState) {
     let mut cred = [0u8; 32];
@@ -21,7 +21,9 @@ fn make_hop(env: &Env, index: u32) -> (BytesN<32>, HopState) {
         signature: BytesN::from_array(env, &sig),
         policy_ref: BytesN::from_array(env, &policy),
         recorded_at: 1_700_000_000u64 + index as u64,
-        score: Score { raw: SCORE_PRECISION },
+        score: Score {
+            raw: SCORE_PRECISION,
+        },
         credential_verified: true,
     };
     (BytesN::from_array(env, &cred), state)
@@ -114,15 +116,17 @@ fn test_invalid_signature_rejected() {
             signature: BytesN::from_array(&env, &[0u8; 64]),
             policy_ref: BytesN::from_array(&env, &[0xB0u8; 32]),
             recorded_at: 1_700_000_001,
-            score: Score { raw: SCORE_PRECISION },
+            score: Score {
+                raw: SCORE_PRECISION,
+            },
             credential_verified: true,
         };
         let hop_id = BytesN::from_array(&env, &cred);
         write_hop_state(&env, &hop_id, &state);
         let mut ids: soroban_sdk::Vec<BytesN<32>> = vec![&env];
         ids.push_back(hop_id);
-        let err = resolve_provenance(&env, chain_id(&env, 5), ids)
-            .expect_err("zeroed sig must fail");
+        let err =
+            resolve_provenance(&env, chain_id(&env, 5), ids).expect_err("zeroed sig must fail");
         assert_eq!(err, Error::InvalidHopSignature);
     });
 }
@@ -140,7 +144,9 @@ fn test_invalid_credential_rejected() {
             signature: BytesN::from_array(&env, &sig),
             policy_ref: BytesN::from_array(&env, &[0xD0u8; 32]),
             recorded_at: 0,
-            score: Score { raw: SCORE_PRECISION },
+            score: Score {
+                raw: SCORE_PRECISION,
+            },
             credential_verified: true,
         };
         let hop_id = BytesN::from_array(&env, &cred);
@@ -192,7 +198,10 @@ fn test_result_persisted_and_retrievable() {
         assert_eq!(result.storage_accesses_used, 6);
         let persisted = get_provenance_result(&env, &cid).expect("result must be stored");
         assert_eq!(persisted.hops_resolved, result.hops_resolved);
-        assert_eq!(persisted.storage_accesses_used, result.storage_accesses_used);
+        assert_eq!(
+            persisted.storage_accesses_used,
+            result.storage_accesses_used
+        );
         assert_eq!(persisted.final_score.raw, result.final_score.raw);
     });
 }
@@ -217,8 +226,175 @@ fn test_storage_budget_exceeded_error() {
     with_contract(&env, |env| {
         let too_many_hops = populate_chain(&env, MAX_HOPS + 1);
         let cid = chain_id(&env, 99);
-        let err = resolve_provenance(&env, cid, too_many_hops)
-            .expect_err("oversized chain must fail");
+        let err =
+            resolve_provenance(&env, cid, too_many_hops).expect_err("oversized chain must fail");
         assert_eq!(err, Error::ChainTooLong);
+    });
+}
+
+fn b32(env: &Env, seed: u8) -> BytesN<32> {
+    let mut raw = [0u8; 32];
+    raw[0] = seed;
+    BytesN::from_array(env, &raw)
+}
+
+#[test]
+fn test_supply_chain_token_events_split_and_compliance() {
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_800_000_000);
+    with_contract(&env, |env| {
+        let admin = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        let farm = soroban_sdk::Address::generate(&env);
+        let transporter = soroban_sdk::Address::generate(&env);
+        let processor = soroban_sdk::Address::generate(&env);
+        let issuer = soroban_sdk::Address::generate(&env);
+        let issuer2 = soroban_sdk::Address::generate(&env);
+
+        crate::supply_chain::initialize(&env, admin.clone());
+        crate::supply_chain::set_authorized_custodian(&env, farm.clone(), true).unwrap();
+        crate::supply_chain::set_authorized_custodian(&env, transporter.clone(), true).unwrap();
+        crate::supply_chain::set_authorized_custodian(&env, processor.clone(), true).unwrap();
+
+        let organic = b32(&env, 10);
+        let fair_trade = b32(&env, 11);
+        let standard = b32(&env, 12);
+        let required = vec![&env, organic.clone(), fair_trade.clone()];
+        crate::supply_chain::register_certificate_type(&env, organic.clone(), true).unwrap();
+        crate::supply_chain::register_certificate_type(&env, fair_trade.clone(), true).unwrap();
+        crate::supply_chain::set_compliance_standard(&env, standard.clone(), required).unwrap();
+
+        let token_id = crate::supply_chain::mint_batch(
+            &env,
+            owner.clone(),
+            b32(&env, 1),
+            b32(&env, 2),
+            100,
+            farm.clone(),
+            1_799_000_000,
+            b32(&env, 3),
+            1_900_000_000,
+        )
+        .unwrap();
+
+        crate::supply_chain::add_custody_event(&env, token_id, farm, b32(&env, 20), b32(&env, 30))
+            .unwrap();
+        crate::supply_chain::add_custody_event(
+            &env,
+            token_id,
+            transporter,
+            b32(&env, 21),
+            b32(&env, 31),
+        )
+        .unwrap();
+        crate::supply_chain::add_custody_event(
+            &env,
+            token_id,
+            processor,
+            b32(&env, 22),
+            b32(&env, 32),
+        )
+        .unwrap();
+        crate::supply_chain::attach_certificate(
+            &env,
+            token_id,
+            organic,
+            issuer.clone(),
+            b32(&env, 40),
+            1_850_000_000,
+        )
+        .unwrap();
+        crate::supply_chain::attach_certificate(
+            &env,
+            token_id,
+            fair_trade,
+            issuer2,
+            b32(&env, 41),
+            1_850_000_000,
+        )
+        .unwrap();
+
+        assert!(crate::supply_chain::verify_compliance(&env, token_id, standard).unwrap());
+        let children =
+            crate::supply_chain::split(&env, owner, token_id, vec![&env, 40i128, 60i128]).unwrap();
+        assert_eq!(children.len(), 2);
+        let left = crate::supply_chain::token(&env, children.get_unchecked(0)).unwrap();
+        let right = crate::supply_chain::token(&env, children.get_unchecked(1)).unwrap();
+        assert_eq!(left.quantity, 40);
+        assert_eq!(right.quantity, 60);
+        assert_eq!(left.event_ids.len(), 3);
+        assert_eq!(right.event_ids.len(), 3);
+        assert_eq!(left.certificate_ids.len(), 2);
+        assert_eq!(
+            crate::supply_chain::token(&env, token_id).expect_err("source burned"),
+            Error::TokenBurned
+        );
+    });
+}
+
+#[test]
+fn test_soulbound_events_cannot_transfer_and_expired_certificates_are_omitted() {
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 2_000);
+    with_contract(&env, |env| {
+        let admin = soroban_sdk::Address::generate(&env);
+        let owner = soroban_sdk::Address::generate(&env);
+        let farm = soroban_sdk::Address::generate(&env);
+        let issuer = soroban_sdk::Address::generate(&env);
+        crate::supply_chain::initialize(&env, admin);
+        crate::supply_chain::set_authorized_custodian(&env, farm.clone(), true).unwrap();
+        let cert_type = b32(&env, 50);
+        crate::supply_chain::register_certificate_type(&env, cert_type.clone(), true).unwrap();
+        let token_id = crate::supply_chain::mint_batch(
+            &env,
+            owner.clone(),
+            b32(&env, 51),
+            b32(&env, 52),
+            10,
+            farm.clone(),
+            1_900,
+            b32(&env, 53),
+            0,
+        )
+        .unwrap();
+        let event_id = crate::supply_chain::add_custody_event(
+            &env,
+            token_id,
+            farm,
+            b32(&env, 54),
+            b32(&env, 55),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::supply_chain::transfer_event(&env, owner.clone(), issuer.clone(), event_id)
+                .expect_err("soulbound"),
+            Error::SoulboundTransfer
+        );
+        crate::supply_chain::attach_certificate(
+            &env,
+            token_id,
+            cert_type,
+            issuer,
+            b32(&env, 56),
+            2_010,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::supply_chain::active_certificates(&env, token_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        env.ledger().with_mut(|li| li.timestamp = 2_011);
+        assert_eq!(
+            crate::supply_chain::active_certificates(&env, token_id)
+                .unwrap()
+                .len(),
+            0
+        );
     });
 }

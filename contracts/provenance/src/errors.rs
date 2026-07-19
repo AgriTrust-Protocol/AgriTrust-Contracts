@@ -29,4 +29,17 @@ pub enum Error {
     /// Emitted when STORAGE_WARN_THRESHOLD is crossed (non-fatal; used in
     /// events, not as a return error).
     StorageAccessWarning = 8,
+
+    NotInitialized = 9,
+    Unauthorized = 10,
+    InvalidQuantity = 11,
+    TokenNotFound = 12,
+    TokenBurned = 13,
+    SoulboundTransfer = 14,
+    UnknownCertificateType = 15,
+    CertificateExpired = 16,
+    CertificateNotFound = 17,
+    UnknownComplianceStandard = 18,
+    EventNotFound = 19,
+    IncompatibleBatch = 20,
 }
