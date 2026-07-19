@@ -31,7 +31,9 @@ pub struct Score {
 
 impl Score {
     pub const ZERO: Score = Score { raw: 0 };
-    pub const MAX: Score = Score { raw: SCORE_PRECISION };
+    pub const MAX: Score = Score {
+        raw: SCORE_PRECISION,
+    };
 
     pub fn is_valid(&self) -> bool {
         self.raw >= 0 && self.raw <= SCORE_PRECISION
