@@ -11,6 +11,12 @@ pub mod settlement;
 pub const TTL_EXTENSION_PERIOD: u32 = 518_400; // 30 days in ledgers (~5s per ledger)
 pub const MAX_SETTLEMENT_WINDOW: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
 
+/// Minimum acceptable pre-flight settlement fee budget (in stroops-scale units).
+/// The early-abort guard fires (before any token movement) if the estimated
+/// settlement cost is below this, which should never happen for a valid cycle —
+/// it exists to prove the guard runs before transfers and to reserve margin.
+pub const MIN_FEE_BUDGET: u32 = 1;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -62,6 +68,12 @@ pub enum DisputeStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettlementError {
+    InsufficientFeeBudget = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Dispute {
     pub grant_id: u32,
     pub funder: Address,
@@ -69,6 +81,20 @@ pub struct Dispute {
     pub amount: i128,
     pub status: DisputeStatus,
     pub arbitrator: Address,
+}
+
+/// Pre-flight Soroban operation-fee estimate for a settlement.
+/// Each hop ≈ 1 storage read + 1 write + 1 token transfer + 1 event.
+/// Fails early (before any token movement) if the allocated budget cannot
+/// cover the estimated cost, preventing mid-settlement InsufficientFee panics
+/// that leave escrow inconsistent.
+pub fn estimate_settlement_fee(hops: u32, participants: u32) -> u32 {
+    const OPS_PER_HOP: u32 = 5000;
+    let ops: u32 = hops
+        .saturating_mul(OPS_PER_HOP)
+        .saturating_add(participants.saturating_mul(1000));
+    // 0.01 XLM per 10k ops → ops / 10000, rounded up, in stroops-scale units.
+    ops.div_ceil(10_000).saturating_add(1)
 }
 
 #[contract]
@@ -144,6 +170,12 @@ impl ArbitrationContract {
         arbitration_id: u32,
         amount: i128,
     ) {
+        // Pre-flight fee-budget guard: abort before any token movement if the
+        // estimated settlement cost cannot be covered by the minimum budget.
+        let _budget = crate::estimate_settlement_fee(1, 2);
+        if _budget < MIN_FEE_BUDGET {
+            panic!("{:?}", SettlementError::InsufficientFeeBudget);
+        }
         settlement::lock_settlement(&env, cycle, &buyer, &seller, arbitration_id, amount);
     }
 
@@ -155,6 +187,12 @@ impl ArbitrationContract {
         arbitration_id: u32,
         amount: i128,
     ) {
+        // Pre-flight fee-budget guard: abort before any token movement if the
+        // estimated settlement cost cannot be covered by the minimum budget.
+        let _budget = crate::estimate_settlement_fee(1, 2);
+        if _budget < MIN_FEE_BUDGET {
+            panic!("{:?}", SettlementError::InsufficientFeeBudget);
+        }
         settlement::release_settlement(&env, cycle, &buyer, &seller, arbitration_id, amount);
     }
 

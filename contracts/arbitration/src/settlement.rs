@@ -43,6 +43,10 @@ pub fn lock_settlement(
     arbitration_id: u32,
     amount: i128,
 ) {
+    // Synchronize TTL first so escrow survives even a partial/failed settlement
+    // (before any token movement or auth).
+    synchronize_escrow_ttl(env, cycle);
+
     buyer.require_auth();
 
     let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -107,6 +111,7 @@ pub fn release_settlement(
     amount: i128,
 ) {
     // Synchronize TTLs before accessing lock entry — ensures lock hasn't expired
+    // and escrow survives even a partial/failed settlement (before transfer).
     synchronize_escrow_ttl(env, cycle);
 
     let lock: EscrowLockData = env
