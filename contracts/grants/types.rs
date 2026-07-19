@@ -23,3 +23,11 @@ pub enum GrantError {
     InvalidStatus = 2,
     NonZeroBalance = 3,
 }
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GrantTombstone {
+    pub original_grant: Grant,
+    pub archived_at_ledger: u32,
+    pub archive_version: u32,
+}
