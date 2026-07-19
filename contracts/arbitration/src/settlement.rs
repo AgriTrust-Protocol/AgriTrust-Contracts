@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, token, Address, Env};
+use soroban_sdk::{contracterror, contracttype, symbol_short, token, Address, Env};
 
 use crate::{
     DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,
@@ -147,6 +147,72 @@ pub fn release_settlement(
         (symbol_short!("release"), cycle),
         (lock.amount, amount),
     );
+}
+
+/// Safety margin applied to the estimated settlement cost. If the estimated
+/// cost exceeds `available_fee * FEE_SAFETY_MARGIN`, the settlement aborts
+/// before any token movement to avoid mid-execution `InsufficientFee` panics
+/// that leave the escrow in an inconsistent state.
+pub const FEE_SAFETY_MARGIN: i128 = 8; // 0.8 as 8/10 fixed-point-style factor
+
+/// Per-hop operation estimate (storage reads/writes, transfer, event, auth).
+const OPS_PER_HOP: u32 = 5_000;
+/// Flat overhead for cross-contract auth + dispute lookup.
+const OPS_BASELINE: u32 = 5_000;
+
+/// Estimate the total Soroban operations a settlement will consume based on
+/// the number of hops, participants, and token-conversion hops.
+pub fn estimate_operation_cost(hop_count: u32, participant_count: u32, token_conversion_hops: u32) -> u32 {
+    let hops = hop_count.saturating_mul(OPS_PER_HOP);
+    let conversions = token_conversion_hops.saturating_mul(OPS_PER_HOP); // conversions cost a full extra hop each
+    let participants = participant_count.saturating_mul(1_000); // small per-participant overhead
+    OPS_BASELINE
+        .saturating_add(hops)
+        .saturating_add(conversions)
+        .saturating_add(participants)
+}
+
+/// Pre-flight guard: returns Err(SettlementErrorBudget) if the estimated cost
+/// exceeds the available fee budget scaled by the safety margin. This must run
+/// BEFORE any token transfer so a depleted margin aborts cleanly.
+pub fn check_fee_budget(estimated_ops: u32, available_fee_stroops: i128) -> Result<(), SettlementBudgetError> {
+    // Convert ops -> stroops at ~0.01 XLM / 10k ops (1 XLM = 10_000_000 stroops).
+    // cost_stroops = estimated_ops * (10_000_000 / 10_000) = estimated_ops * 1000
+    let cost_stroops: i128 = (estimated_ops as i128).saturating_mul(1_000);
+    let budget_with_margin = available_fee_stroops.saturating_mul(FEE_SAFETY_MARGIN) / 10;
+    if cost_stroops > budget_with_margin {
+        return Err(SettlementBudgetError::InsufficientSettlementBudget);
+    }
+    Ok(())
+}
+
+/// Error returned when the settlement fee budget is insufficient up front.
+#[contracterror]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettlementBudgetError {
+    InsufficientSettlementBudget = 1,
+}
+
+/// Settlement entry point with pre-flight fee-budget guard.
+/// `available_fee_stroops` is the `max_fee` the caller submitted with (in stroops).
+pub fn settle_dispute(
+    env: &Env,
+    cycle: u32,
+    buyer: &Address,
+    seller: &Address,
+    arbitration_id: u32,
+    amount: i128,
+    available_fee_stroops: i128,
+) -> Result<(), SettlementBudgetError> {
+    // Estimate cost: 3 logical hops (lock-fee deduction, payout, refund) +
+    // 2 participants + 0 token-conversion hops for the simple path.
+    let estimated_ops = estimate_operation_cost(3, 2, 0);
+    check_fee_budget(estimated_ops, available_fee_stroops)?;
+
+    // Fee budget verified — proceed with the real settlement flow.
+    lock_settlement(env, cycle, buyer, seller, arbitration_id, amount);
+    release_settlement(env, cycle, buyer, seller, arbitration_id, amount);
+    Ok(())
 }
 
 /// Permissionless maintenance function to clean up expired escrow cycles
