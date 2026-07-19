@@ -1,11 +1,8 @@
 use soroban_sdk::{symbol_short, token, Address, Env};
 
-use crate::{
-    DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,
-    TTL_EXTENSION_PERIOD,
-};
+use crate::{DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline, TTL_EXTENSION_PERIOD};
 
-const BUMP_THRESHOLD: u32 = 86_400;   // 10 days in ledgers — extend when below this
+const BUMP_THRESHOLD: u32 = 86_400; // 10 days in ledgers — extend when below this
 const EXPIRY_BUMP_AMOUNT: u32 = 518_400; // 30 days in ledgers — extend to this
 
 /// Synchronize TTLs of escrow lock and release entries so both remain live
@@ -19,7 +16,9 @@ pub fn synchronize_escrow_ttl(env: &Env, cycle: u32) {
     let release_key = DataKey::EscrowRelease(cycle);
 
     // Extend contract instance TTL so the contract itself stays alive
-    env.storage().instance().extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    env.storage()
+        .instance()
+        .extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
 
     if env.storage().persistent().has(&lock_key) {
         env.storage()
@@ -62,10 +61,14 @@ pub fn lock_settlement(
         .set(&DataKey::EscrowLock(cycle), &lock);
 
     // Extend TTL on the lock entry and instance right after creation
-    env.storage().instance().extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
     env.storage()
-        .persistent()
-        .extend_ttl(&DataKey::EscrowLock(cycle), BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+        .instance()
+        .extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &DataKey::EscrowLock(cycle),
+        BUMP_THRESHOLD,
+        EXPIRY_BUMP_AMOUNT,
+    );
 
     // Track cycle count for garbage collection
     let mut counter: u32 = env
@@ -86,14 +89,14 @@ pub fn lock_settlement(
     env.storage()
         .persistent()
         .set(&DataKey::EscrowTtlDeadline(cycle), &deadline);
-    env.storage()
-        .persistent()
-        .extend_ttl(&DataKey::EscrowTtlDeadline(cycle), BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
-
-    env.events().publish(
-        (symbol_short!("ttl_dead"), cycle),
-        deadline,
+    env.storage().persistent().extend_ttl(
+        &DataKey::EscrowTtlDeadline(cycle),
+        BUMP_THRESHOLD,
+        EXPIRY_BUMP_AMOUNT,
     );
+
+    env.events()
+        .publish((symbol_short!("ttl_dead"), cycle), deadline);
 }
 
 /// Release settlement funds from escrow after resolution.
@@ -143,10 +146,8 @@ pub fn release_settlement(
     let token_client = token::Client::new(env, &token_addr);
     token_client.transfer(&env.current_contract_address(), seller, &amount);
 
-    env.events().publish(
-        (symbol_short!("release"), cycle),
-        (lock.amount, amount),
-    );
+    env.events()
+        .publish((symbol_short!("release"), cycle), (lock.amount, amount));
 }
 
 /// Permissionless maintenance function to clean up expired escrow cycles
@@ -165,12 +166,19 @@ pub fn garbage_collect_expired_escrows(env: &Env, max_cycles: u32) -> u32 {
             break;
         }
 
-        if !env.storage().persistent().has(&DataKey::EscrowTtlDeadline(cycle)) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::EscrowTtlDeadline(cycle))
+        {
             continue;
         }
 
         let lock_expired = !env.storage().persistent().has(&DataKey::EscrowLock(cycle));
-        let release_expired = !env.storage().persistent().has(&DataKey::EscrowRelease(cycle));
+        let release_expired = !env
+            .storage()
+            .persistent()
+            .has(&DataKey::EscrowRelease(cycle));
 
         if lock_expired && release_expired {
             env.storage()
@@ -180,10 +188,7 @@ pub fn garbage_collect_expired_escrows(env: &Env, max_cycles: u32) -> u32 {
         }
     }
 
-    env.events().publish(
-        (symbol_short!("gc_escrow"),),
-        cleaned,
-    );
+    env.events().publish((symbol_short!("gc_escrow"),), cleaned);
 
     cleaned
 }
