@@ -1,19 +1,20 @@
 #![cfg(test)]
 
 use crate::{
-    ArbitrationContract, ArbitrationContractClient, DataKey,
-    TTL_EXTENSION_PERIOD,
+    ArbitrationContract, ArbitrationContractClient, DataKey, Ruling, APPEAL_WINDOW_SECONDS,
+    TTL_EXTENSION_PERIOD, VOTING_PERIOD_SECONDS,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    testutils::storage::Persistent as _,
-    token, Address, Env,
+    token,
+    xdr::ToXdr,
+    Address, Env,
 };
 
 /// Number of ledgers to extend contract instances to by default.
 const INSTANCE_TTL: u32 = 1_000_000;
 
-fn setup_test(env: &Env) -> (Address, Address, Address, ArbitrationContractClient) {
+fn setup_test(env: &Env) -> (Address, Address, Address, ArbitrationContractClient<'_>) {
     let admin = Address::generate(env);
     let token_admin = Address::generate(env);
     let token_addr = env.register_stellar_asset_contract(token_admin.clone());
@@ -47,6 +48,101 @@ fn advance_ledgers(env: &Env, count: u32, seconds_per_ledger: u64) {
         li.sequence_number = cur_seq + count;
         li.timestamp = cur_ts + count as u64 * seconds_per_ledger;
     });
+}
+
+#[test]
+fn test_token_weighted_jury_dispute_flow_rewards_and_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger(&env, 1000, 1_700_000_000);
+
+    let (_admin, token_addr, contract_id, client) = setup_test(&env);
+    let plaintiff = Address::generate(&env);
+    let defendant = Address::generate(&env);
+    let arbitrator = Address::generate(&env);
+    let pub_key = soroban_sdk::BytesN::from_array(&env, &[9u8; 32]);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
+    token_admin_client.mint(&plaintiff, &1_000);
+
+    let mut jurors = soroban_sdk::Vec::new(&env);
+    for i in 0..11u8 {
+        let juror = Address::generate(&env);
+        token_admin_client.mint(&juror, &100);
+        client.opt_in_juror(&juror, &100);
+        assert_eq!(client.juror_stake(&juror), 100);
+        if i < 11 {
+            jurors.push_back(juror);
+        }
+    }
+
+    let dispute_id =
+        client.raise_dispute(&77, &plaintiff, &defendant, &1_000, &arbitrator, &pub_key);
+    let evidence_hash = soroban_sdk::BytesN::from_array(&env, &[3u8; 32]);
+    client.submit_evidence(&dispute_id, &plaintiff, &evidence_hash);
+    client.select_jury(&dispute_id, &0);
+    assert_eq!(client.get_selected_jurors(&dispute_id, &0).len(), 11);
+
+    let salt = soroban_sdk::BytesN::from_array(&env, &[4u8; 32]);
+    for i in 0..11u32 {
+        let juror = jurors.get(i).unwrap();
+        let ruling = if i < 7 {
+            Ruling::PlaintiffWin
+        } else {
+            Ruling::DefendantWin
+        };
+        let commitment = env
+            .crypto()
+            .keccak256(&(ruling.clone(), salt.clone()).to_xdr(&env))
+            .to_bytes();
+        client.commit_vote(&dispute_id, &juror, &commitment);
+        client.reveal_vote(&dispute_id, &juror, &ruling, &salt);
+    }
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    });
+    env.as_contract(&token_addr, || {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    });
+    env.ledger().with_mut(|li| {
+        li.timestamp += VOTING_PERIOD_SECONDS + 1;
+    });
+    assert_eq!(client.tally_ruling(&dispute_id), Ruling::PlaintiffWin);
+
+    for i in 0..11u32 {
+        let juror = jurors.get(i).unwrap();
+        if i < 7 {
+            assert_eq!(client.juror_stake(&juror), 101);
+        } else {
+            assert_eq!(client.juror_stake(&juror), 98);
+        }
+    }
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    });
+    env.as_contract(&token_addr, || {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    });
+    env.ledger().with_mut(|li| {
+        li.timestamp += APPEAL_WINDOW_SECONDS + 1;
+    });
+    client.finalize(&dispute_id);
+    let real_token = token::Client::new(&env, &token_addr);
+    assert_eq!(real_token.balance(&plaintiff), 1_000);
+    assert_eq!(real_token.balance(&defendant), 0);
+    assert_eq!(
+        client.get_dispute(&dispute_id).status,
+        crate::DisputeStatus::Final
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,7 +315,10 @@ fn test_delayed_release_ttl_extension() {
 
     // Both lock and release entries should exist after 7 days
     let lock = client.get_escrow_lock(&cycle);
-    assert!(lock.is_some(), "lock should exist after 7 day delay + release");
+    assert!(
+        lock.is_some(),
+        "lock should exist after 7 day delay + release"
+    );
 
     let release = client.get_escrow_release(&cycle).unwrap();
     assert_eq!(release.amount, amount);
@@ -316,7 +415,10 @@ fn test_release_arbitration_id_mismatch() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.release_settlement(&1u32, &buyer, &seller, &99u32, &100_000_000_000);
     }));
-    assert!(result.is_err(), "release with mismatched arbitration_id should panic");
+    assert!(
+        result.is_err(),
+        "release with mismatched arbitration_id should panic"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -343,7 +445,10 @@ fn test_release_amount_exceeds_lock() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.release_settlement(&1u32, &buyer, &seller, &42u32, &200_000_000_000);
     }));
-    assert!(result.is_err(), "release with amount > lock amount should panic");
+    assert!(
+        result.is_err(),
+        "release with amount > lock amount should panic"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -358,10 +463,8 @@ fn test_successful_settlement() {
     let admin = Address::generate(&env);
     let funder = Address::generate(&env);
     let grantee = Address::generate(&env);
-    
-    // Generate key pair for the arbitrator
-    let arbitrator_key = signing_key(1);
-    let arbitrator_pub_key = bytesn32(&env, arbitrator_key.verifying_key().to_bytes());
+
+    let arbitrator_pub_key = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
     let arbitrator = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
@@ -373,7 +476,14 @@ fn test_successful_settlement() {
     let client = ArbitrationContractClient::new(&env, &contract_id);
 
     client.init(&admin, &token_addr);
-    let dispute_id = client.raise_dispute(&1, &funder, &grantee, &1000, &arbitrator);
+    let dispute_id = client.raise_dispute(
+        &1,
+        &funder,
+        &grantee,
+        &1000,
+        &arbitrator,
+        &arbitrator_pub_key,
+    );
 
     client.resolve_dispute(&dispute_id, &500, &500);
 
