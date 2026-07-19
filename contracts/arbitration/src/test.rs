@@ -10,6 +10,39 @@ use soroban_sdk::{
     token, Address, Env,
 };
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
+
+/// Generate a deterministic ed25519 signing key from a seed (test helper).
+fn signing_key(seed: u8) -> SigningKey {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    // Derive remaining bytes via repeated hashing for determinism
+    let mut state = bytes;
+    for i in 1..32 {
+        let h = env_crypto_hash(&state);
+        state[i] = h[i % 32];
+    }
+    bytes = state;
+    SigningKey::from_bytes(&bytes)
+}
+
+/// Hash helper used by signing_key (kept local to avoid extra deps).
+fn env_crypto_hash(input: &[u8; 32]) -> [u8; 32] {
+    // Simple deterministic expansion: XOR-walk
+    let mut out = [0u8; 32];
+    let mut acc = 0u8;
+    for i in 0..32 {
+        acc = acc.wrapping_add(input[i]).wrapping_mul(31);
+        out[i] = acc;
+    }
+    out
+}
+
+/// Convert a verifying key into a Soroban BytesN<32>.
+fn bytesn32(env: &Env, bytes: [u8; 32]) -> soroban_sdk::BytesN<32> {
+    soroban_sdk::BytesN::from_array(env, &bytes)
+}
+
 /// Number of ledgers to extend contract instances to by default.
 const INSTANCE_TTL: u32 = 1_000_000;
 
@@ -373,11 +406,51 @@ fn test_successful_settlement() {
     let client = ArbitrationContractClient::new(&env, &contract_id);
 
     client.init(&admin, &token_addr);
-    let dispute_id = client.raise_dispute(&1, &funder, &grantee, &1000, &arbitrator);
+    let dispute_id = client.raise_dispute(&1, &funder, &grantee, &1000, &arbitrator, &arbitrator_pub_key);
 
     client.resolve_dispute(&dispute_id, &500, &500);
 
     let real_token = token::Client::new(&env, &token_addr);
     assert_eq!(real_token.balance(&funder), 500);
     assert_eq!(real_token.balance(&grantee), 500);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #15: pre-flight fee-budget guard aborts cleanly on low max_fee
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_settle_dispute_low_fee_budget_aborts() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let arbitration_id = 7u32;
+    let amount = 1_000i128;
+
+    let token_admin = Address::generate(&env);
+    let token_addr = env.register_stellar_asset_contract(token_admin);
+    let token_client = token::StellarAssetClient::new(&env, &token_addr);
+    token_client.mint(&buyer, &100_000);
+
+    let contract_id = env.register_contract(None, ArbitrationContract);
+    let client = ArbitrationContractClient::new(&env, &contract_id);
+    client.init(&admin, &token_addr);
+
+    // Lock funds first so the escrow exists
+    client.lock_settlement(&1u32, &buyer, &seller, &arbitration_id, &amount);
+
+    // Submit with a fee budget far too low (0.001 XLM = 10_000 stroops) to
+    // cover the ~20k-op estimated settlement cost. Must abort BEFORE any
+    // token transfer, returning SettlementBudgetError rather than panicking
+    // mid-execution with InsufficientFee.
+    let low_fee = 10_000i128;
+    let result = client.try_settle_dispute(&1u32, &buyer, &seller, &arbitration_id, &amount, &low_fee);
+    assert!(result.is_err(), "settle_dispute must abort on low fee budget");
+
+    // Buyer funds must remain untouched (no partial movement)
+    let real_token = token::Client::new(&env, &token_addr);
+    assert_eq!(real_token.balance(&buyer), 100_000);
 }
