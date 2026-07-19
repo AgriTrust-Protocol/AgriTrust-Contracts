@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+target
+artifacts
+cache
+*.log
+.env
+Dockerfile*
+docker-compose*.yml
+npm-debug.log*
+coverage
