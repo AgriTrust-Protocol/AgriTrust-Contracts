@@ -86,10 +86,23 @@ pub fn withdraw(env: &Env, pool_id: String, grantee: Address, amount: i128, pref
             panic!("Insufficient pool value");
         }
 
-        for (asset, bal) in pool.balances.iter_mut() {
-            let share = (*bal as i128 * amount) / total_value;
-            *bal -= share;
-            emit_withdrawal_event(env, pool_id.clone(), asset.clone(), grantee.clone(), share);
+        // Split `amount` across assets proportional to each balance. A naive
+        // `(*bal * amount) / total_value` truncation per asset destroys value
+        // (sum of truncated shares < amount), which is the integer-division
+        // asymmetry this issue fixes. Distribute the lost remainder to the
+        // largest-fraction assets so the sum of shares equals `amount` exactly
+        // and deposit/withdraw is symmetric.
+        let balances: Vec<(Address, i128)> = pool
+            .balances
+            .iter()
+            .map(|(a, b)| (a.clone(), *b))
+            .collect();
+        let shares = split_pro_rata(&balances, total_value, amount);
+
+        for ((asset, bal), share) in balances.iter().zip(shares.iter()) {
+            let mut entry = pool.balances.get_mut(asset).unwrap();
+            *entry -= *share;
+            emit_withdrawal_event(env, pool_id.clone(), asset.clone(), grantee.clone(), *share);
         }
     }
 
@@ -109,6 +122,47 @@ fn total_pool_value(env: &Env, pool: &GrantPool) -> i128 {
         total += bal * rate;
     }
     total
+}
+
+/// Split `amount` across `weights` proportional to each weight, using
+/// `total_weight` as the denominator. Uses truncating division per bucket, then
+/// distributes the leftover (the sum of truncated fractions) to the buckets with
+/// the largest remainders, so the returned shares sum to exactly `amount`.
+///
+/// This is pure (no `Env`) so it can be unit-tested and verified in isolation
+/// without the Soroban toolchain. It eliminates the truncation asymmetry where a
+/// naive per-asset `weight * amount / total` loses value on every withdrawal.
+pub fn split_pro_rata(weights: &[(Address, i128)], total_weight: i128, amount: i128) -> Vec<i128> {
+    let n = weights.len();
+    let mut shares: Vec<i128> = vec![0; n];
+    if total_weight <= 0 || n == 0 {
+        return shares;
+    }
+
+    let mut distributed: i128 = 0;
+    // (remainder, index) so we can hand out the leftover to largest remainders.
+    let mut remainders: Vec<(i128, usize)> = Vec::with_capacity(n);
+    for (i, (_, w)) in weights.iter().enumerate() {
+        let prod = w * amount;
+        let q = prod / total_weight;
+        let r = prod - q * total_weight; // = prod % total_weight (non-negative)
+        shares[i] = q;
+        distributed += q;
+        remainders.push((r, i));
+    }
+
+    // Hand the leftover (amount - sum of truncated shares) to the largest
+    // remainders, one share unit each, until the full `amount` is allocated.
+    let mut leftover = amount - distributed;
+    remainders.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut idx = 0;
+    while leftover > 0 {
+        let (_, i) = remainders[idx % n];
+        shares[i] += 1;
+        leftover -= 1;
+        idx += 1;
+    }
+    shares
 }
 
 #[cfg(test)]
