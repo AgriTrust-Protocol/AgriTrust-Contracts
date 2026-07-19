@@ -13,6 +13,7 @@ members = [
     "contracts/state",
     "contracts/did_registry",
     "contracts/crop_insurance",
+    "contracts/security",
 ]
 
 [workspace.dependencies]
