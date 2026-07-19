@@ -13,6 +13,9 @@ const { capacityShedding, getDegradationSnapshot } = require("./services/degrada
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { tracingMiddleware } = require("./middleware/tracing");
+const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
+const { router: secretRoutes } = require("./routes/secrets");
+const webhookRoutes = require("./routes/webhooks");
 
 const app = express();
 
@@ -34,6 +37,7 @@ app.use(createTenantRateLimiter());
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/escrow", escrowRoutes);
 app.use("/internal/secrets", secretRoutes);
+app.use("/webhooks", webhookRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool()));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
