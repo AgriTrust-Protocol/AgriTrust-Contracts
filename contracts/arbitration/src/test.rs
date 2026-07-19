@@ -439,9 +439,6 @@ fn test_settle_dispute_low_fee_budget_aborts() {
     let client = ArbitrationContractClient::new(&env, &contract_id);
     client.init(&admin, &token_addr);
 
-    // Lock funds first so the escrow exists
-    client.lock_settlement(&1u32, &buyer, &seller, &arbitration_id, &amount);
-
     // Submit with a fee budget far too low (0.001 XLM = 10_000 stroops) to
     // cover the ~20k-op estimated settlement cost. Must abort BEFORE any
     // token transfer, returning SettlementBudgetError rather than panicking

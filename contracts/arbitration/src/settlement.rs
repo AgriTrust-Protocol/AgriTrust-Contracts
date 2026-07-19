@@ -1,4 +1,4 @@
-use soroban_sdk::{symbol_short, token, Address, Env};
+use soroban_sdk::{contracterror, contracttype, symbol_short, token, Address, Env};
 
 use crate::{
     DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,
@@ -181,15 +181,17 @@ pub fn check_fee_budget(estimated_ops: u32, available_fee_stroops: i128) -> Resu
     let cost_stroops: i128 = (estimated_ops as i128).saturating_mul(1_000);
     let budget_with_margin = available_fee_stroops.saturating_mul(FEE_SAFETY_MARGIN) / 10;
     if cost_stroops > budget_with_margin {
-        return Err(SettlementBudgetError);
+        return Err(SettlementBudgetError::InsufficientSettlementBudget);
     }
     Ok(())
 }
 
 /// Error returned when the settlement fee budget is insufficient up front.
-#[contracttype]
+#[contracterror]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SettlementBudgetError;
+pub enum SettlementBudgetError {
+    InsufficientSettlementBudget = 1,
+}
 
 /// Settlement entry point with pre-flight fee-budget guard.
 /// `available_fee_stroops` is the `max_fee` the caller submitted with (in stroops).
