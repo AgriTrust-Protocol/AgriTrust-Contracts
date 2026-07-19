@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { InMemoryDeadLetterQueue } = require("./deadLetterQueue");
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_INITIAL_DELAY_MS = 100;
@@ -16,7 +17,10 @@ const metrics = {
   attempts: 0,
   signatureVerificationFailed: 0,
   deliveryLatencyMs: [],
+  deadLettered: 0,
 };
+
+const webhookDeadLetterQueue = new InMemoryDeadLetterQueue();
 
 function stableStringify(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -136,18 +140,29 @@ async function deliverWebhook(endpoint, event, options = {}) {
     if (attempt < maxAttempts) await delay(options.disableDelay ? 0 : nextDelayMs(attempt, options));
   }
   metrics.failed += 1;
+  metrics.deadLettered += 1;
   metrics.deliveryLatencyMs.push(Date.now() - started);
-  return { ok: false, attempts: maxAttempts };
+  const dlqEntry = webhookDeadLetterQueue.enqueue({
+    service: "webhook-delivery",
+    queue: endpoint.id || endpoint.url,
+    messageId: event.id,
+    payload: { type: event.type, created_at: event.created_at, data: event.data },
+    reason: "max_attempts_exhausted",
+    attempts: maxAttempts,
+    metadata: { endpointUrl: endpoint.url },
+  });
+  return { ok: false, attempts: maxAttempts, deadLetterId: dlqEntry.id };
 }
 
 function snapshotMetrics() {
   const samples = [...metrics.deliveryLatencyMs].sort((a, b) => a - b);
   const p99Index = samples.length ? Math.min(samples.length - 1, Math.ceil(samples.length * 0.99) - 1) : 0;
-  return { ...metrics, p99DeliveryLatencyMs: samples[p99Index] || 0 };
+  return { ...metrics, p99DeliveryLatencyMs: samples[p99Index] || 0, deadLetterQueue: webhookDeadLetterQueue.snapshotMetrics() };
 }
 
 function resetMetrics() {
-  Object.assign(metrics, { enqueued: 0, delivered: 0, failed: 0, attempts: 0, signatureVerificationFailed: 0, deliveryLatencyMs: [] });
+  Object.assign(metrics, { enqueued: 0, delivered: 0, failed: 0, attempts: 0, signatureVerificationFailed: 0, deliveryLatencyMs: [], deadLettered: 0 });
+  webhookDeadLetterQueue.reset();
 }
 
-module.exports = { buildSignatureHeaders, computeSignature, deliverWebhook, nextDelayMs, resetMetrics, snapshotMetrics, verifySignature };
+module.exports = { buildSignatureHeaders, computeSignature, deliverWebhook, nextDelayMs, resetMetrics, snapshotMetrics, verifySignature, webhookDeadLetterQueue };
