@@ -1,0 +1,54 @@
+groups:
+  - name: performance-regression
+    rules:
+      - alert: PerformanceRegressionGateFailed
+        expr: agritrust_perf_regression_gate_passed == 0
+        for: 0m
+        labels:
+          severity: critical
+          service: performance-ci
+        annotations:
+          summary: Performance regression gate failed
+          description: >
+            One or more benchmarks have regressed beyond the allowed threshold
+            or exceeded the 100 ms P99 critical-path ceiling.
+
+      - alert: CriticalPathP99LatencyBreach
+        expr: agritrust_perf_benchmark_p99_ms >= 100
+        for: 0m
+        labels:
+          severity: critical
+          service: performance-ci
+        annotations:
+          summary: "Critical-path P99 latency breach: {{ $labels.benchmark }}"
+          description: >
+            Benchmark "{{ $labels.benchmark }}" has a P99 latency of {{ $value }} ms,
+            which meets or exceeds the 100 ms critical-path ceiling.
+
+      - alert: PerformanceBenchmarkRegression
+        expr: |
+          (agritrust_perf_benchmark_p99_ms - agritrust_perf_benchmark_baseline_p99_ms)
+            / agritrust_perf_benchmark_baseline_p99_ms > 0.10
+        for: 0m
+        labels:
+          severity: warning
+          service: performance-ci
+        annotations:
+          summary: "Performance regression detected: {{ $labels.benchmark }}"
+          description: >
+            Benchmark "{{ $labels.benchmark }}" P99 latency has regressed by more than 10%
+            relative to the stored baseline.
+
+      - alert: ThroughputDegradationWarning
+        expr: |
+          (agritrust_perf_benchmark_throughput_rps offset 1d - agritrust_perf_benchmark_throughput_rps)
+            / agritrust_perf_benchmark_throughput_rps offset 1d > 0.20
+        for: 5m
+        labels:
+          severity: warning
+          service: performance-ci
+        annotations:
+          summary: "Throughput degradation: {{ $labels.benchmark }}"
+          description: >
+            Benchmark "{{ $labels.benchmark }}" throughput has dropped by more than 20%
+            compared to the previous day's measurement.
