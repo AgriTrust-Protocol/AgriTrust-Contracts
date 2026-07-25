@@ -9,11 +9,18 @@
 
 const express = require("express");
 const escrowRoutes = require("./routes/escrow");
+const webhookRoutes = require("./routes/webhooks");
+const { router: secretRoutes } = require("./routes/secrets");
+const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { tracingMiddleware } = require("./middleware/tracing");
+const { ConfigManager } = require("./services/configManager");
+const { createConfigRouter } = require("./routes/config");
 
+const configManager = new ConfigManager();
+configManager.start();
 const app = express();
 
 app.use(tracingMiddleware());
@@ -29,9 +36,14 @@ app.get("/ops/degradation", (_req, res) => {
 });
 
 // Apply a system-wide per-tenant token bucket before all service routes.
-app.use(createTenantRateLimiter());
+app.use(createTenantRateLimiter({
+  capacity: configManager.current().rateLimit.capacity,
+  refillPerSecond: configManager.current().rateLimit.refillPerSecond,
+}));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+app.use("/ops/config", createConfigRouter(configManager));
+app.use("/webhooks", webhookRoutes);
 app.use("/escrow", escrowRoutes);
 app.use("/internal/secrets", secretRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool()));
@@ -58,3 +70,4 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.configManager = configManager;

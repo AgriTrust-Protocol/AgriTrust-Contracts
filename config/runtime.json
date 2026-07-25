@@ -1,0 +1,6 @@
+{
+  "rateLimit": { "capacity": 60, "refillPerSecond": 30 },
+  "features": { "shedCapacity": false, "mutationEndpoints": true, "escrowRead": true },
+  "capacity": { "maxInFlight": null },
+  "observability": { "hotReloadEnabled": true }
+}
