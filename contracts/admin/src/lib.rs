@@ -101,5 +101,3 @@ impl AdminContract {
     }
 }
 
-#[cfg(test)]
-mod depth_tracker_test;

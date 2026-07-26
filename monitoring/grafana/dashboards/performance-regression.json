@@ -1,0 +1,148 @@
+{
+  "title": "Performance Regression Detection",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Gate Status",
+      "description": "1 = PASSED, 0 = FAILED",
+      "targets": [
+        {
+          "expr": "agritrust_perf_regression_gate_passed",
+          "legendFormat": "Gate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "FAILED", "color": "red" }, "1": { "text": "PASSED", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "P99 Ceiling (ms)",
+      "description": "Hard ceiling for all critical-path benchmarks per issue #71",
+      "targets": [],
+      "options": {
+        "reduceOptions": { "values": false },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "color": { "mode": "fixed", "fixedColor": "blue" } },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "P99 Latency per Benchmark (ms)",
+      "description": "Current P99 latency vs the 100 ms critical-path ceiling",
+      "targets": [
+        {
+          "expr": "agritrust_perf_benchmark_p99_ms",
+          "legendFormat": "{{ benchmark }}"
+        },
+        {
+          "expr": "agritrust_perf_benchmark_baseline_p99_ms",
+          "legendFormat": "{{ benchmark }} (baseline)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 80 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom" }
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput per Benchmark (rps)",
+      "targets": [
+        {
+          "expr": "agritrust_perf_benchmark_throughput_rps",
+          "legendFormat": "{{ benchmark }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" }
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 }
+    },
+    {
+      "type": "table",
+      "title": "Benchmark Status (latest)",
+      "targets": [
+        {
+          "expr": "agritrust_perf_benchmark_passed",
+          "legendFormat": "{{ benchmark }}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "FAILED", "color": "red" }, "1": { "text": "PASSED", "color": "green" } } }
+          ]
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 }
+    },
+    {
+      "type": "timeseries",
+      "title": "P99 Regression Ratio vs Baseline",
+      "description": "Values > 0.10 trigger a regression alert",
+      "targets": [
+        {
+          "expr": "(agritrust_perf_benchmark_p99_ms - agritrust_perf_benchmark_baseline_p99_ms) / agritrust_perf_benchmark_baseline_p99_ms",
+          "legendFormat": "{{ benchmark }} regression ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "lineWidth": 2 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 0.05 },
+              { "color": "red", "value": 0.10 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 }
+    }
+  ]
+}

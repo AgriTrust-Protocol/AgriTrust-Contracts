@@ -1,0 +1,250 @@
+name: Performance Regression Detection
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Unit tests for the gate script itself ────────────────────────────────────
+  performance-gate-tests:
+    name: Performance gate unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run performance regression gate tests
+        run: npm test -- --testPathPattern=performanceRegressionGate --forceExit
+
+  # ── Rust benchmark execution ─────────────────────────────────────────────────
+  benchmark-rust:
+    name: Rust benchmark (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: core
+            packages: agritrust_common state admin provenance
+          - shard: protocols
+            packages: grant_stream vesting_contracts arbitration compliance
+          - shard: identity-risk
+            packages: zk_kyc treasury did_registry crop_insurance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-${{ matrix.shard }}
+
+      - name: Run benchmarks and emit timing report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results
+
+          # Collect wall-clock timing for each package test suite.
+          # These timings approximate critical-path P99 latency under CI load.
+          benchmarks=()
+          for package in ${{ matrix.packages }}; do
+            start_ns=$(date +%s%N)
+            cargo test -p "$package" --locked --release 2>&1 | tail -5
+            end_ns=$(date +%s%N)
+            elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+            benchmarks+=("{\"name\":\"${package}_test_suite\",\"p99Ms\":${elapsed_ms},\"throughputRps\":null}")
+          done
+
+          # Build the JSON report
+          json="{\"benchmarks\":[$(IFS=','; echo "${benchmarks[*]}")]}"
+          echo "$json" > benchmark-results/${{ matrix.shard }}.json
+          echo "Benchmark report for shard ${{ matrix.shard }}:"
+          cat benchmark-results/${{ matrix.shard }}.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.shard }}
+          path: benchmark-results/${{ matrix.shard }}.json
+          if-no-files-found: warn
+
+  # ── Regression gate ──────────────────────────────────────────────────────────
+  performance-regression-gate:
+    name: Performance regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - performance-gate-tests
+      - benchmark-rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-results-*
+          merge-multiple: true
+          path: benchmark-results/
+
+      - name: Merge shard reports into a single file
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'EOF'
+          const fs = require("fs");
+          const dir = "benchmark-results";
+          const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+          const all = [];
+          for (const f of files) {
+            const report = JSON.parse(fs.readFileSync(`${dir}/${f}`, "utf8"));
+            all.push(...(report.benchmarks || []));
+          }
+          fs.writeFileSync("current-benchmarks.json", JSON.stringify({ benchmarks: all }, null, 2));
+          console.log(`Merged ${all.length} benchmarks from ${files.length} shard(s).`);
+          EOF
+
+      - name: Restore cached baseline
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: baseline-benchmarks.json
+          key: perf-baseline-${{ github.base_ref || github.ref_name }}
+          restore-keys: perf-baseline-
+
+      - name: Run performance regression gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f baseline-benchmarks.json ]; then
+            echo "Comparing against stored baseline..."
+            node scripts/performance-regression-gate.js current-benchmarks.json baseline-benchmarks.json
+          else
+            echo "No baseline found — running ceiling-only gate for first-time establishment..."
+            node scripts/performance-regression-gate.js current-benchmarks.json
+          fi
+
+      - name: Update baseline on main branch
+        if: github.ref == 'refs/heads/main' && success()
+        shell: bash
+        run: cp current-benchmarks.json baseline-benchmarks.json
+
+      - name: Save new baseline
+        if: github.ref == 'refs/heads/main' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: baseline-benchmarks.json
+          key: perf-baseline-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-gate-report
+          path: |
+            current-benchmarks.json
+            baseline-benchmarks.json
+          if-no-files-found: ignore
+
+      - name: Emit CI step summary
+        if: always()
+        shell: bash
+        run: |
+          node - <<'EOF'
+          const fs = require("fs");
+          const {
+            evaluate,
+            parseReport,
+            prometheusMetrics,
+          } = require("./scripts/performance-regression-gate");
+
+          const current = parseReport(JSON.parse(fs.readFileSync("current-benchmarks.json", "utf8")));
+          let baseline = null;
+          if (fs.existsSync("baseline-benchmarks.json")) {
+            baseline = parseReport(JSON.parse(fs.readFileSync("baseline-benchmarks.json", "utf8")));
+          }
+          const result = evaluate(current, baseline);
+
+          const lines = ["## Performance Regression Gate\n"];
+          lines.push(`**Status:** ${result.passed ? "✅ PASSED" : "❌ FAILED"}`);
+          lines.push(`**Benchmarks evaluated:** ${result.summary.total}`);
+          lines.push(`**Passed:** ${result.summary.passed} | **Failed:** ${result.summary.failed} | **Warnings:** ${result.summary.warnings}\n`);
+
+          lines.push("| Benchmark | P99 (ms) | Baseline P99 (ms) | Status |");
+          lines.push("|-----------|----------|-------------------|--------|");
+          for (const r of result.results) {
+            const status = r.passed ? "✅" : "❌";
+            const base = r.baselineP99Ms !== null ? r.baselineP99Ms : "—";
+            lines.push(`| ${r.name} | ${r.p99Ms} | ${base} | ${status} |`);
+          }
+
+          if (!result.passed) {
+            lines.push("\n### Failures");
+            for (const r of result.results.filter(r => !r.passed)) {
+              for (const f of r.failures) lines.push(`- **${r.name}**: ${f}`);
+            }
+          }
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || "/dev/null", lines.join("\n") + "\n");
+          console.log(lines.join("\n"));
+          EOF
+
+  # ── CI summary gate (mirrors pattern from ci.yml) ────────────────────────────
+  performance-ci-summary:
+    name: Performance CI summary gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - performance-gate-tests
+      - benchmark-rust
+      - performance-regression-gate
+    steps:
+      - name: Validate required jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in \
+            '${{ needs.performance-gate-tests.result }}' \
+            '${{ needs.benchmark-rust.result }}' \
+            '${{ needs.performance-regression-gate.result }}'; do
+            if [[ "$result" != "success" ]]; then
+              echo "Required performance CI job failed or was cancelled: $result" >&2
+              exit 1
+            fi
+          done

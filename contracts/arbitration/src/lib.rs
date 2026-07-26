@@ -21,6 +21,7 @@ pub enum DataKey {
     EscrowLock(u32),
     EscrowRelease(u32),
     EscrowTtlDeadline(u32),
+    EscrowState(u32),
     EscrowCycleCounter,
     ExpiredEscrows,
 }
@@ -70,6 +71,21 @@ pub struct Dispute {
     pub status: DisputeStatus,
     pub arbitrator: Address,
     pub arbitrator_public_key: soroban_sdk::BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    Locked,
+    Released,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowState {
+    pub sequence: u32,
+    pub status: EscrowStatus,
 }
 
 #[contract]
@@ -181,6 +197,29 @@ impl ArbitrationContract {
 
     pub fn garbage_collect_expired_escrows(env: Env, max_cycles: u32) -> u32 {
         settlement::garbage_collect_expired_escrows(&env, max_cycles)
+    }
+
+    /// Settle a dispute with a pre-flight fee-budget guard. Aborts cleanly
+    /// (without moving tokens) if the submitted `max_fee` is too low to cover
+    /// the estimated settlement cost, preventing mid-execution `InsufficientFee`.
+    pub fn settle_dispute(
+        env: Env,
+        cycle: u32,
+        buyer: Address,
+        seller: Address,
+        arbitration_id: u32,
+        amount: i128,
+        available_fee_stroops: i128,
+    ) -> Result<(), settlement::SettlementBudgetError> {
+        settlement::settle_dispute(
+            &env,
+            cycle,
+            &buyer,
+            &seller,
+            arbitration_id,
+            amount,
+            available_fee_stroops,
+        )
     }
 
     pub fn get_escrow_lock(env: Env, cycle: u32) -> Option<EscrowLockData> {

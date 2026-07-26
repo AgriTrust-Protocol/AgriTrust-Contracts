@@ -15,6 +15,8 @@ const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 const { capacityShedding, getDegradationSnapshot } = require("./services/degradation");
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
+const { CapacityPlanner, createCapacityRecorder } = require("./services/capacityPlanning");
+const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 const { tracingMiddleware } = require("./middleware/tracing");
 const { ConfigManager } = require("./services/configManager");
 const { createConfigRouter } = require("./routes/config");
@@ -22,10 +24,12 @@ const { createConfigRouter } = require("./routes/config");
 const configManager = new ConfigManager();
 configManager.start();
 const app = express();
+const capacityPlanner = new CapacityPlanner();
 
 app.use(tracingMiddleware());
 app.use(express.json());
 app.use(capacityShedding);
+app.use(createCapacityRecorder(capacityPlanner));
 
 app.get("/healthz", (_req, res) => {
   res.status(200).json({ status: "ok" });
@@ -45,8 +49,10 @@ app.use(createTenantRateLimiter({
 app.use("/ops/config", createConfigRouter(configManager));
 app.use("/webhooks", webhookRoutes);
 app.use("/escrow", escrowRoutes);
+app.use("/webhooks", webhookRoutes);
 app.use("/internal/secrets", secretRoutes);
-app.use("/health", createHealthRouter(buildDefaultPool()));
+app.use("/webhooks", webhookRoutes);
+app.use("/health", createHealthRouter(buildDefaultPool(), capacityPlanner));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
