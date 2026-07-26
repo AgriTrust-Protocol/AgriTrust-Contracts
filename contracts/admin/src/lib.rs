@@ -18,7 +18,7 @@ pub mod governance_activity_monitor;
 pub use dead_mans_switch::DeadMansSwitchModule;
 pub use depth_tracker::{
     flush_depth, get_current_depth, get_max_depth, initialize_depth_tracking,
-    is_approaching_limit, is_depth_tracking_enabled, pop_depth, push_depth,
+    is_approaching_limit, pop_depth, push_depth,
     set_max_depth, DepthError, DepthKey, DEFAULT_MAX_ADMIN_CHAIN_DEPTH,
 };
 pub use governance_activity_monitor::GovernanceActivityMonitorModule;
