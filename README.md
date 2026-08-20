@@ -2,6 +2,8 @@
 
 Smart contracts for managing trust streams with milestone completion proof hashing and integrated dispute resolution system on Stellar (Soroban WASM) and Ethereum/L2s (Solidity).
 
+**📚 Documentation:** For detailed information on the contract architecture, function references, and security model, please see [CONTRACTS.md](./CONTRACTS.md).
+
 ## 🚀 Key Features
 * **Per-Second Streaming Accrual:** High-precision streaming logic using scaling factors on Soroban.
 * **Legal Anchoring & Escrow:** Restricts fund streaming until legal documents are cryptographically signed on-chain, alongside an integrated arbitration escrow.
