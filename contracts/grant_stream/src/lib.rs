@@ -581,7 +581,8 @@ fn verify_confidential_claim_proof(
 fn total_allocated_funds(env: &Env) -> Result<i128, Error> {
     let mut total = 0_i128;
     let ids = read_grant_ids(env);
-    for i in 0..ids.len() {
+    let len = ids.len();
+    for i in 0..len {
         let grant_id = ids.get(i).unwrap();
         if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
             if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
@@ -604,7 +605,8 @@ fn preview_grant_at_now(grant: &Grant, now: u64) -> Result<Grant, Error> {
 fn count_active_grants(env: &Env) -> u32 {
     let mut count = 0_u32;
     let ids = read_grant_ids(env);
-    for i in 0..ids.len() {
+    let len = ids.len();
+    for i in 0..len {
         let grant_id = ids.get(i).unwrap();
         if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
             if grant.status == GrantStatus::Active || grant.status == GrantStatus::Paused {
@@ -771,7 +773,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             // ── Auth ─────────────────────────────────────────────────────
             let grant: Grant = env
                 .storage()
-                .persistent()
+                .instance()
                 .get(&StorageKey::Grant(grant_id))
                 .expect("grant not found");
  
@@ -782,7 +784,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let milestone_key = StorageKey::Milestone(grant_id, milestone_index);
             let milestone_proof: Symbol = env
                 .storage()
-                .persistent()
+                .instance()
                 .get(&milestone_key)
                 .expect("milestone not found or not yet submitted");
  
@@ -806,7 +808,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let mut updated_grant = grant.clone();
             updated_grant.streamed_amount += claimable;
             env.storage()
-                .persistent()
+                .instance()
                 .set(&StorageKey::Grant(grant_id), &updated_grant);
  
             // ── Emit event ────────────────────────────────────────────────
@@ -837,7 +839,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             // ── Fetch grant ───────────────────────────────────────────────
             let grant: Grant = env
                 .storage()
-                .persistent()
+                .instance()
                 .get(&StorageKey::Grant(grant_id))
                 .expect("grant not found");
  
@@ -858,7 +860,7 @@ fn settle_grant(grant: &mut Grant, now: u64) -> Result<(), Error> {
             let mut updated_grant = grant.clone();
             updated_grant.streamed_amount = updated_grant.total_amount;
             env.storage()
-                .persistent()
+                .instance()
                 .set(&StorageKey::Grant(grant_id), &updated_grant);
  
             // ── Emit emergency event ──────────────────────────────────────
@@ -2642,7 +2644,8 @@ impl GrantStreamContract {
             }
             
             // Check each grant for active status
-            for i in 0..user_grants.len() {
+            let len = user_grants.len();
+            for i in 0..len {
                 let grant_id = user_grants.get(i).unwrap();
                 if let Some(grant) = env.storage().instance().get::<_, Grant>(&StorageKey::Grant(grant_id)) {
                     // Only consider Active or Paused grants as "active grantees"

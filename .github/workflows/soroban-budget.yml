@@ -1,0 +1,36 @@
+name: Soroban Gas (Budget) Report
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  gas-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Soroban CLI
+        run: cargo install --locked soroban-cli
+
+      - name: Run Tests & Benchmarks
+        run: |
+          # Run tests and capture output
+          cargo test > test_output.txt 2>&1 || true
+          
+          # Extract benchmark prints
+          echo '## 📊 Soroban Gas (Budget) Report' > gas_report.md
+          echo '```text' >> gas_report.md
+          grep -E "(Average CPU instructions|Gas Consumed|Storage Cost|CPU Cost)" test_output.txt >> gas_report.md || echo "No benchmark metrics found." >> gas_report.md
+          echo '```' >> gas_report.md
+
+      - name: Post PR Comment
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          filePath: gas_report.md
