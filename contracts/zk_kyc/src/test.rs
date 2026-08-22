@@ -1,4 +1,4 @@
-use crate::{DataKey, ZKKYCContract, ZKKYCContractClient};
+use crate::{ZKKYCContract, ZKKYCContractClient};
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _},
     Address, Env,
@@ -36,7 +36,7 @@ fn test_zk_kyc() {
 use crate::nullifier;
 
 /// Helper: register the contract and a compliance domain, return (env, client, domain_id).
-fn setup_with_domain(env: &Env) -> (Env, ZKKYCContractClient, soroban_sdk::BytesN<32>) {
+fn setup_with_domain(env: &Env) -> (Env, ZKKYCContractClient<'_>, soroban_sdk::BytesN<32>) {
     let verifier = Address::generate(env);
     let contract_id = env.register_contract(None, ZKKYCContract);
     let client = ZKKYCContractClient::new(env, &contract_id);

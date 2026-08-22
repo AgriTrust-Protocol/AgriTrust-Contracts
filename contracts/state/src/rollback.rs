@@ -4,7 +4,7 @@
 //! Ensures every rollback entry corresponds to a reverted state change
 //! (invariant: ∀ rollback_entry: ∃ reverted_mutation).
 
-use soroban_sdk::{contracttype, symbol_short, Bytes, Env, Map, Symbol, Vec};
+use soroban_sdk::{symbol_short, Bytes, Env, Vec};
 
 use crate::optimistic_mutator::StateKey;
 use crate::{

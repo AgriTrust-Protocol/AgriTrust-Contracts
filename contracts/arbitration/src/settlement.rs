@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{contracterror, symbol_short, token, Address, Env};
 
 use crate::{
     DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,

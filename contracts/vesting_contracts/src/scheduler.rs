@@ -6,7 +6,7 @@
 //! `start_time`. This prevents grantees from receiving cliff-accrued tokens
 //! when the conversion was delayed beyond the cliff period.
 
-use crate::{DataKey, VestingSchedule, VESTING_TTL_LEDGERS};
+use crate::{VestingSchedule, VESTING_TTL_LEDGERS};
 use agritrust_common::storage_keys::derive_storage_key;
 use soroban_sdk::{contracttype, BytesN, Env, Symbol};
 

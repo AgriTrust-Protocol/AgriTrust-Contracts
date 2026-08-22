@@ -18,6 +18,12 @@ members = [
 [workspace.dependencies]
 soroban-sdk = "27.0.6"
 
+[workspace.lints.rust]
+unused_imports = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
