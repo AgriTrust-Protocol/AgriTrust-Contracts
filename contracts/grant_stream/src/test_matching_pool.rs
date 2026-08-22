@@ -308,7 +308,7 @@ fn test_mathematical_precision_large_numbers() {
     let expected = 4i128 * FIXED_POINT_SCALE / (FIXED_POINT_SCALE / 1_000_000_000); // ~4
     
     // Allow reasonable margin of error for fixed-point math
-    let error_margin = FIXED_POINT_SCALE / 10_000; // 0.01% error margin
+    let _error_margin = FIXED_POINT_SCALE / 10_000; // 0.01% error margin
     println!("sqrt(16 * precision) = {} (expected ~4 * precision)", sqrt_16);
     assert!(sqrt_16 > 0, "Square root should be positive");
 }
@@ -349,14 +349,14 @@ fn test_incentive_mathematica_invariant() {
     // Project A: 5 donors × 100M = 500M (concentrated)
     // Project B: 50 donors × 10M = 500M (distributed)
 
-    for i in 0..5 {
+    for _i in 0..5 {
         let donor = Address::generate(&env);
         token_admin.mint(&donor, &100_000_000i128);
         client
             .donate(&pool_id, &1u64, &donor, &100_000_000i128);
     }
 
-    for i in 0..50 {
+    for _i in 0..50 {
         let donor = Address::generate(&env);
         token_admin.mint(&donor, &10_000_000i128);
         client
@@ -364,7 +364,7 @@ fn test_incentive_mathematica_invariant() {
     }
 
     // Advance time
-    env.ledger().with_mut(|mut ledger| {
+    env.ledger().with_mut(|ledger| {
         ledger.timestamp += 604_800 + 1;
     });
 

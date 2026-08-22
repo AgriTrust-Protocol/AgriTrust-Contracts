@@ -6,11 +6,10 @@ use crate::{
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    testutils::storage::Persistent as _,
     token, Address, Env,
 };
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 
 /// Generate a deterministic ed25519 signing key from a seed (test helper).
 fn signing_key(seed: u8) -> SigningKey {
@@ -46,7 +45,7 @@ fn bytesn32(env: &Env, bytes: [u8; 32]) -> soroban_sdk::BytesN<32> {
 /// Number of ledgers to extend contract instances to by default.
 const INSTANCE_TTL: u32 = 1_000_000;
 
-fn setup_test(env: &Env) -> (Address, Address, Address, ArbitrationContractClient) {
+fn setup_test(env: &Env) -> (Address, Address, Address, ArbitrationContractClient<'_>) {
     let admin = Address::generate(env);
     let token_admin = Address::generate(env);
     let token_addr = env.register_stellar_asset_contract(token_admin.clone());

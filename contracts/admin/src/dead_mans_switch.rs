@@ -1,4 +1,3 @@
-use crate::depth_tracker;
 use soroban_sdk::{contracttype, Address, Env};
 
 const INACTIVITY_PERIOD: u64 = 180 * 24 * 60 * 60; // 180 days in seconds

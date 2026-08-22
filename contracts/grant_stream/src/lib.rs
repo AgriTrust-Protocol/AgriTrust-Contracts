@@ -1696,8 +1696,7 @@ impl GrantStreamContract {
         }
         
         // Ensure grantee can claim any funds already vested up to this exact second
-        let vested_amount = grant.claimable;
-        let validator_vested = grant.validator_claimable;
+        
         
         // Transfer unearned balance based on contest status
         let token_addr = read_grant_token(&env)?;
