@@ -29,4 +29,16 @@ pub enum Error {
     /// Emitted when STORAGE_WARN_THRESHOLD is crossed (non-fatal; used in
     /// events, not as a return error).
     StorageAccessWarning = 8,
+
+    /// Max metadata entries per batch exceeded (limit: 100).
+    BatchMetadataLimitExceeded = 9,
+
+    /// Requested metadata entry not found or expired.
+    MetadataNotFound = 10,
+
+    /// Metadata entry with the same staggered key already exists in this batch.
+    DuplicateMetadataEntry = 11,
+
+    /// Metadata has passed its valid_until expiration.
+    MetadataExpired = 12,
 }

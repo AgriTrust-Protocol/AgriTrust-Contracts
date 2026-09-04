@@ -26,3 +26,4 @@ node_modules/
 artifacts/
 cache/
 .env
+test_snapshots/
