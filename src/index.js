@@ -16,10 +16,11 @@ const { capacityShedding, getDegradationSnapshot } = require("./services/degrada
 const { createHealthRouter } = require("./routes/health");
 const { buildDefaultPool } = require("./services/postgresPoolHealth");
 const { CapacityPlanner, createCapacityRecorder } = require("./services/capacityPlanning");
-const { createTenantRateLimiter } = require("./middleware/tenantRateLimiter");
 const { tracingMiddleware } = require("./middleware/tracing");
 const { ConfigManager } = require("./services/configManager");
 const { createConfigRouter } = require("./routes/config");
+const { createJobsRouter } = require("./routes/jobs");
+const incidentRoutes = require("./routes/incidents");
 
 const configManager = new ConfigManager();
 configManager.start();
@@ -49,9 +50,9 @@ app.use(createTenantRateLimiter({
 app.use("/ops/config", createConfigRouter(configManager));
 app.use("/webhooks", webhookRoutes);
 app.use("/escrow", escrowRoutes);
-app.use("/webhooks", webhookRoutes);
+app.use("/jobs", createJobsRouter());
+app.use("/incidents", incidentRoutes);
 app.use("/internal/secrets", secretRoutes);
-app.use("/webhooks", webhookRoutes);
 app.use("/health", createHealthRouter(buildDefaultPool(), capacityPlanner));
 
 // ── 404 catch-all ─────────────────────────────────────────────────────────────

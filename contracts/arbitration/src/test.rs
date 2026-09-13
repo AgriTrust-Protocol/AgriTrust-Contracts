@@ -1,9 +1,6 @@
 #![cfg(test)]
 
-use crate::{
-    ArbitrationContract, ArbitrationContractClient, DataKey,
-    TTL_EXTENSION_PERIOD,
-};
+use crate::{ArbitrationContract, ArbitrationContractClient, DataKey, TTL_EXTENSION_PERIOD};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env,
@@ -251,7 +248,10 @@ fn test_delayed_release_ttl_extension() {
 
     // Both lock and release entries should exist after 7 days
     let lock = client.get_escrow_lock(&cycle);
-    assert!(lock.is_some(), "lock should exist after 7 day delay + release");
+    assert!(
+        lock.is_some(),
+        "lock should exist after 7 day delay + release"
+    );
 
     let release = client.get_escrow_release(&cycle).unwrap();
     assert_eq!(release.amount, amount);
@@ -348,7 +348,10 @@ fn test_release_arbitration_id_mismatch() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.release_settlement(&1u32, &buyer, &seller, &99u32, &100_000_000_000);
     }));
-    assert!(result.is_err(), "release with mismatched arbitration_id should panic");
+    assert!(
+        result.is_err(),
+        "release with mismatched arbitration_id should panic"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -375,7 +378,10 @@ fn test_release_amount_exceeds_lock() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.release_settlement(&1u32, &buyer, &seller, &42u32, &200_000_000_000);
     }));
-    assert!(result.is_err(), "release with amount > lock amount should panic");
+    assert!(
+        result.is_err(),
+        "release with amount > lock amount should panic"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,7 +396,7 @@ fn test_successful_settlement() {
     let admin = Address::generate(&env);
     let funder = Address::generate(&env);
     let grantee = Address::generate(&env);
-    
+
     // Generate key pair for the arbitrator
     let arbitrator_key = signing_key(1);
     let arbitrator_pub_key = bytesn32(&env, arbitrator_key.verifying_key().to_bytes());
@@ -405,7 +411,14 @@ fn test_successful_settlement() {
     let client = ArbitrationContractClient::new(&env, &contract_id);
 
     client.init(&admin, &token_addr);
-    let dispute_id = client.raise_dispute(&1, &funder, &grantee, &1000, &arbitrator, &arbitrator_pub_key);
+    let dispute_id = client.raise_dispute(
+        &1,
+        &funder,
+        &grantee,
+        &1000,
+        &arbitrator,
+        &arbitrator_pub_key,
+    );
 
     client.resolve_dispute(&dispute_id, &500, &500);
 
@@ -443,10 +456,211 @@ fn test_settle_dispute_low_fee_budget_aborts() {
     // token transfer, returning SettlementBudgetError rather than panicking
     // mid-execution with InsufficientFee.
     let low_fee = 10_000i128;
-    let result = client.try_settle_dispute(&1u32, &buyer, &seller, &arbitration_id, &amount, &low_fee);
-    assert!(result.is_err(), "settle_dispute must abort on low fee budget");
+    let result =
+        client.try_settle_dispute(&1u32, &buyer, &seller, &arbitration_id, &amount, &low_fee);
+    assert!(
+        result.is_err(),
+        "settle_dispute must abort on low fee budget"
+    );
 
     // Buyer funds must remain untouched (no partial movement)
     let real_token = token::Client::new(&env, &token_addr);
     assert_eq!(real_token.balance(&buyer), 100_000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nested Cross-Contract Speed-Bump Tests (Issue #155)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_nested_arbitration_payout_with_treasury_speed_bump_sub_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger(&env, 100, 1000);
+
+    let (admin, token_addr, contract_id, arb_client) = setup_test(&env);
+    let token = token::Client::new(&env, &token_addr);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
+
+    // Setup SpeedBumpContract
+    let treasury_id = env.register(treasury::SpeedBumpContract, ());
+    let treasury_client = treasury::SpeedBumpContractClient::new(&env, &treasury_id);
+    let treasury_escrow = treasury_id.clone();
+    treasury_client.initialize(&admin, &token_addr, &treasury_escrow);
+
+    // Whitelist arbitration contract in treasury
+    treasury_client.add_allowed_caller(&admin, &contract_id);
+    assert!(treasury_client.is_allowed_caller(&contract_id));
+
+    // Configure treasury escrow in arbitration contract
+    arb_client.set_treasury_escrow(&admin, &treasury_id, &treasury_escrow);
+    assert_eq!(arb_client.get_treasury(), Some(treasury_id.clone()));
+    assert_eq!(
+        arb_client.get_treasury_escrow(),
+        Some(treasury_escrow.clone())
+    );
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    // 500 XLM (below 1,000 XLM threshold)
+    let amount = 5_000_000_000i128;
+    token_admin_client.mint(&buyer, &amount);
+
+    arb_client.lock_settlement(&1u32, &buyer, &seller, &101u32, &amount);
+    assert_eq!(token.balance(&contract_id), amount);
+
+    // Release settlement -> executes nested payout through treasury speed-bump
+    let executed = arb_client.payout(&1u32, &buyer, &seller, &101u32, &amount);
+    assert!(executed, "Sub-threshold payout should execute immediately");
+
+    // Seller received funds immediately
+    assert_eq!(token.balance(&seller), amount);
+    assert_eq!(treasury_client.get_cumulative_released(), amount);
+    assert_eq!(treasury_client.get_pending_releases().len(), 0);
+}
+
+#[test]
+fn test_nested_arbitration_payout_with_treasury_speed_bump_above_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger(&env, 100, 1000);
+
+    let (admin, token_addr, contract_id, arb_client) = setup_test(&env);
+    let token = token::Client::new(&env, &token_addr);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
+
+    let treasury_id = env.register(treasury::SpeedBumpContract, ());
+    let treasury_client = treasury::SpeedBumpContractClient::new(&env, &treasury_id);
+    let treasury_escrow = treasury_id.clone();
+    treasury_client.initialize(&admin, &token_addr, &treasury_escrow);
+    treasury_client.add_allowed_caller(&admin, &contract_id);
+
+    arb_client.set_treasury_escrow(&admin, &treasury_id, &treasury_escrow);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    // 2,500 XLM (> 1,000 XLM threshold)
+    let amount = 25_000_000_000i128;
+    token_admin_client.mint(&buyer, &amount);
+
+    arb_client.lock_settlement(&1u32, &buyer, &seller, &102u32, &amount);
+
+    // Release settlement -> speed-bump triggers delay!
+    let executed = arb_client.payout(&1u32, &buyer, &seller, &102u32, &amount);
+    assert!(
+        !executed,
+        "Above-threshold payout must be delayed by speed-bump"
+    );
+
+    // Funds are in treasury escrow, not yet delivered to seller
+    assert_eq!(token.balance(&seller), 0);
+    assert_eq!(token.balance(&treasury_escrow), amount);
+
+    let pending = treasury_client.get_pending_releases();
+    assert_eq!(pending.len(), 1);
+    let rel = pending.get(0).unwrap();
+    assert_eq!(rel.amount, amount);
+    assert_eq!(rel.release_at, 100 + treasury::SPEED_BUMP_DELAY);
+
+    // Advance ledgers past delay
+    advance_ledgers(&env, treasury::SPEED_BUMP_DELAY + 1, 5);
+
+    // Execute pending release
+    treasury_client.execute_pending_release(&contract_id, &rel.id);
+    assert_eq!(token.balance(&seller), amount);
+}
+
+#[test]
+fn test_nested_arbitration_payout_sub_threshold_items_aggregate_and_trigger_speed_bump() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger(&env, 100, 1000);
+
+    let (admin, token_addr, contract_id, arb_client) = setup_test(&env);
+    let token = token::Client::new(&env, &token_addr);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
+
+    let treasury_id = env.register(treasury::SpeedBumpContract, ());
+    let treasury_client = treasury::SpeedBumpContractClient::new(&env, &treasury_id);
+    let treasury_escrow = treasury_id.clone();
+    treasury_client.initialize(&admin, &token_addr, &treasury_escrow);
+    treasury_client.add_allowed_caller(&admin, &contract_id);
+
+    arb_client.set_treasury_escrow(&admin, &treasury_id, &treasury_escrow);
+
+    let buyer = Address::generate(&env);
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+
+    // Three items of 400 XLM each (4_000_000_000 stroops). Total = 1,200 XLM (> 1,000 threshold).
+    let item_amount = 4_000_000_000i128;
+    token_admin_client.mint(&buyer, &(item_amount * 3));
+
+    // Cycle 1: 400 XLM (cumulative = 400 <= 1000) -> immediate release!
+    arb_client.lock_settlement(&1u32, &buyer, &s1, &201u32, &item_amount);
+    let exec1 = arb_client.payout(&1u32, &buyer, &s1, &201u32, &item_amount);
+    assert!(exec1);
+    assert_eq!(token.balance(&s1), item_amount);
+
+    // Cycle 2: 400 XLM (cumulative = 800 <= 1000) -> immediate release!
+    arb_client.lock_settlement(&2u32, &buyer, &s2, &202u32, &item_amount);
+    let exec2 = arb_client.payout(&2u32, &buyer, &s2, &202u32, &item_amount);
+    assert!(exec2);
+    assert_eq!(token.balance(&s2), item_amount);
+
+    // Cycle 3: 400 XLM (cumulative = 1200 > 1000) -> SPEED BUMP FIRES! Held for delay!
+    arb_client.lock_settlement(&3u32, &buyer, &s3, &203u32, &item_amount);
+    let exec3 = arb_client.payout(&3u32, &buyer, &s3, &203u32, &item_amount);
+    assert!(
+        !exec3,
+        "Aggregated sub-threshold releases must trigger speed-bump delay"
+    );
+
+    // s3 does not get funds yet
+    assert_eq!(token.balance(&s3), 0);
+    let pending = treasury_client.get_pending_releases();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.get(0).unwrap().recipient, s3);
+}
+
+#[test]
+fn test_nested_arbitration_unauthorized_caller_triggers_bypass_detection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_ledger(&env, 100, 1000);
+
+    let (admin, token_addr, _contract_id, arb_client) = setup_test(&env);
+    let token = token::Client::new(&env, &token_addr);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
+
+    let treasury_id = env.register(treasury::SpeedBumpContract, ());
+    let treasury_client = treasury::SpeedBumpContractClient::new(&env, &treasury_id);
+    let treasury_escrow = treasury_id.clone();
+    treasury_client.initialize(&admin, &token_addr, &treasury_escrow);
+
+    // Intentionally DO NOT whitelist arbitration contract in treasury!
+    // Caller is unauthorized.
+    arb_client.set_treasury_escrow(&admin, &treasury_id, &treasury_escrow);
+
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+
+    // Small sub-threshold amount (10 XLM)
+    let tiny_amount = 100_000_000i128;
+    token_admin_client.mint(&buyer, &tiny_amount);
+
+    arb_client.lock_settlement(&1u32, &buyer, &seller, &301u32, &tiny_amount);
+
+    // Payout attempted by non-whitelisted contract -> bypass detection enforces delay!
+    let executed = arb_client.payout(&1u32, &buyer, &seller, &301u32, &tiny_amount);
+    assert!(
+        !executed,
+        "Non-whitelisted calling contract must trigger speed-bump delay"
+    );
+
+    assert_eq!(token.balance(&seller), 0);
+    assert_eq!(treasury_client.get_pending_releases().len(), 1);
 }

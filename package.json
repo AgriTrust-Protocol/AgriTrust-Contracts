@@ -6,8 +6,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "jest --runInBand --forceExit",
-    "test:coverage": "jest --runInBand --forceExit --coverage",
+    "test": "jest --forceExit",
+    "test:coverage": "jest --forceExit --coverage",
+    "ci:coverage": "jest --forceExit --coverage",
     "backup:verify": "node scripts/verify-database-backup.js",
     "setup:local": "node scripts/onboard.js"
   },
@@ -22,6 +23,10 @@
   },
   "jest": {
     "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^@stellar/stellar-sdk$": "<rootDir>/src/shims/stellar-sdk.js",
+      "^uint8array-extras$": "<rootDir>/src/shims/uint8array-extras.js"
+    },
     "collectCoverageFrom": [
       "src/**/*.js",
       "!src/index.js"

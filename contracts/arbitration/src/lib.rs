@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(deprecated)]
+#![allow(clippy::needless_borrows_for_generic_args)]
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
@@ -24,6 +26,8 @@ pub enum DataKey {
     EscrowState(u32),
     EscrowCycleCounter,
     ExpiredEscrows,
+    TreasuryContract,
+    TreasuryEscrow,
 }
 
 #[contracttype]
@@ -100,7 +104,9 @@ impl ArbitrationContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
-        env.storage().instance().set(&DataKey::DisputeCounter, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeCounter, &0u32);
         // Extend instance TTL so the contract survives the max settlement window
         env.storage().instance().extend_ttl(0, 518_400);
     }
@@ -120,9 +126,15 @@ impl ArbitrationContract {
         let token_client = token::Client::new(&env, &token_addr);
         token_client.transfer(&funder, &env.current_contract_address(), &amount);
 
-        let mut counter: u32 = env.storage().instance().get(&DataKey::DisputeCounter).unwrap();
+        let mut counter: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeCounter)
+            .unwrap();
         counter += 1;
-        env.storage().instance().set(&DataKey::DisputeCounter, &counter);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeCounter, &counter);
 
         let dispute = Dispute {
             grant_id,
@@ -134,23 +146,35 @@ impl ArbitrationContract {
             arbitrator_public_key,
         };
 
-        env.storage().persistent().set(&DataKey::Dispute(counter), &dispute);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(counter), &dispute);
 
         let escrow_state = EscrowState {
             sequence: 0,
             status: EscrowStatus::Locked,
         };
-        env.storage().persistent().set(&DataKey::EscrowState(counter), &escrow_state);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowState(counter), &escrow_state);
 
         counter
     }
 
     pub fn resolve_dispute(env: Env, dispute_id: u32, funder_award: i128, grantee_award: i128) {
-        let mut dispute: Dispute = env.storage().persistent().get(&DataKey::Dispute(dispute_id)).unwrap();
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .unwrap();
         dispute.arbitrator.require_auth();
 
-        if dispute.status == DisputeStatus::Resolved { panic!("Already resolved"); }
-        if funder_award + grantee_award > dispute.amount { panic!("Awards exceed amount"); }
+        if dispute.status == DisputeStatus::Resolved {
+            panic!("Already resolved");
+        }
+        if funder_award + grantee_award > dispute.amount {
+            panic!("Awards exceed amount");
+        }
 
         dispute.status = DisputeStatus::Resolved;
 
@@ -158,13 +182,23 @@ impl ArbitrationContract {
         let token_client = token::Client::new(&env, &token_addr);
 
         if funder_award > 0 {
-            token_client.transfer(&env.current_contract_address(), &dispute.funder, &funder_award);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &dispute.funder,
+                &funder_award,
+            );
         }
         if grantee_award > 0 {
-            token_client.transfer(&env.current_contract_address(), &dispute.grantee, &grantee_award);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &dispute.grantee,
+                &grantee_award,
+            );
         }
 
-        env.storage().persistent().set(&DataKey::Dispute(dispute_id), &dispute);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id), &dispute);
     }
 
     // ── Escrow Settlement Functions ──────────────────────────────────────────
@@ -227,11 +261,54 @@ impl ArbitrationContract {
     }
 
     pub fn get_escrow_release(env: Env, cycle: u32) -> Option<EscrowReleaseData> {
-        env.storage().persistent().get(&DataKey::EscrowRelease(cycle))
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowRelease(cycle))
     }
 
     pub fn get_escrow_ttl_deadline(env: Env, cycle: u32) -> Option<TtlDeadline> {
-        env.storage().persistent().get(&DataKey::EscrowTtlDeadline(cycle))
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowTtlDeadline(cycle))
+    }
+
+    /// Configure intermediate treasury escrow and treasury contract for speed-bump enforcement.
+    pub fn set_treasury_escrow(
+        env: Env,
+        admin: Address,
+        treasury: Address,
+        treasury_escrow: Address,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            panic!("Unauthorized: not admin");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryContract, &treasury);
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryEscrow, &treasury_escrow);
+    }
+
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryContract)
+    }
+
+    pub fn get_treasury_escrow(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryEscrow)
+    }
+
+    /// Explicit payout entrypoint routing through treasury speed-bump enforcement.
+    pub fn payout(
+        env: Env,
+        cycle: u32,
+        buyer: Address,
+        seller: Address,
+        arbitration_id: u32,
+        amount: i128,
+    ) -> bool {
+        settlement::payout(&env, cycle, &buyer, &seller, arbitration_id, amount)
     }
 }
-

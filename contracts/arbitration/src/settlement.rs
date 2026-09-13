@@ -1,11 +1,8 @@
 use soroban_sdk::{contracterror, symbol_short, token, Address, Env};
 
-use crate::{
-    DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline,
-    TTL_EXTENSION_PERIOD,
-};
+use crate::{DataKey, EscrowLockData, EscrowReleaseData, TtlDeadline, TTL_EXTENSION_PERIOD};
 
-const BUMP_THRESHOLD: u32 = 86_400;   // 10 days in ledgers — extend when below this
+const BUMP_THRESHOLD: u32 = 86_400; // 10 days in ledgers — extend when below this
 const EXPIRY_BUMP_AMOUNT: u32 = 518_400; // 30 days in ledgers — extend to this
 
 /// Synchronize TTLs of escrow lock and release entries so both remain live
@@ -19,7 +16,9 @@ pub fn synchronize_escrow_ttl(env: &Env, cycle: u32) {
     let release_key = DataKey::EscrowRelease(cycle);
 
     // Extend contract instance TTL so the contract itself stays alive
-    env.storage().instance().extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    env.storage()
+        .instance()
+        .extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
 
     if env.storage().persistent().has(&lock_key) {
         env.storage()
@@ -62,10 +61,14 @@ pub fn lock_settlement(
         .set(&DataKey::EscrowLock(cycle), &lock);
 
     // Extend TTL on the lock entry and instance right after creation
-    env.storage().instance().extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
     env.storage()
-        .persistent()
-        .extend_ttl(&DataKey::EscrowLock(cycle), BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+        .instance()
+        .extend_ttl(BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
+    env.storage().persistent().extend_ttl(
+        &DataKey::EscrowLock(cycle),
+        BUMP_THRESHOLD,
+        EXPIRY_BUMP_AMOUNT,
+    );
 
     // Track cycle count for garbage collection
     let mut counter: u32 = env
@@ -86,14 +89,14 @@ pub fn lock_settlement(
     env.storage()
         .persistent()
         .set(&DataKey::EscrowTtlDeadline(cycle), &deadline);
-    env.storage()
-        .persistent()
-        .extend_ttl(&DataKey::EscrowTtlDeadline(cycle), BUMP_THRESHOLD, EXPIRY_BUMP_AMOUNT);
-
-    env.events().publish(
-        (symbol_short!("ttl_dead"), cycle),
-        deadline,
+    env.storage().persistent().extend_ttl(
+        &DataKey::EscrowTtlDeadline(cycle),
+        BUMP_THRESHOLD,
+        EXPIRY_BUMP_AMOUNT,
     );
+
+    env.events()
+        .publish((symbol_short!("ttl_dead"), cycle), deadline);
 }
 
 /// Release settlement funds from escrow after resolution.
@@ -139,14 +142,45 @@ pub fn release_settlement(
     // Extend TTL on both lock and release to survive settlement finalization
     synchronize_escrow_ttl(env, cycle);
 
-    let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-    let token_client = token::Client::new(env, &token_addr);
-    token_client.transfer(&env.current_contract_address(), seller, &amount);
+    // Route payout through intermediate TREASURY_ESCROW with speed-bump enforcement
+    payout(env, cycle, buyer, seller, arbitration_id, amount);
 
-    env.events().publish(
-        (symbol_short!("release"), cycle),
-        (lock.amount, amount),
-    );
+    env.events()
+        .publish((symbol_short!("release"), cycle), (lock.amount, amount));
+}
+
+/// Payout settlement funds:
+/// If intermediate TREASURY_ESCROW and treasury contract are configured,
+/// routes funds to TREASURY_ESCROW first, then calls `treasury::release_with_speedbump(amount)`
+/// to enforce the speed-bump security gate.
+/// Otherwise falls back to direct transfer for backwards compatibility.
+pub fn payout(
+    env: &Env,
+    _cycle: u32,
+    _buyer: &Address,
+    seller: &Address,
+    _arbitration_id: u32,
+    amount: i128,
+) -> bool {
+    let maybe_treasury: Option<Address> = env.storage().instance().get(&DataKey::TreasuryContract);
+    let maybe_escrow: Option<Address> = env.storage().instance().get(&DataKey::TreasuryEscrow);
+
+    if let (Some(treasury_addr), Some(escrow_addr)) = (maybe_treasury, maybe_escrow) {
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(env, &token_addr);
+
+        // 1. Move funds into intermediate TREASURY_ESCROW
+        token_client.transfer(&env.current_contract_address(), &escrow_addr, &amount);
+
+        // 2. Route release through speed-bump contract
+        let treasury_client = treasury::SpeedBumpContractClient::new(env, &treasury_addr);
+        treasury_client.release_with_speedbump(&env.current_contract_address(), seller, &amount)
+    } else {
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(env, &token_addr);
+        token_client.transfer(&env.current_contract_address(), seller, &amount);
+        true
+    }
 }
 
 /// Safety margin applied to the estimated settlement cost. If the estimated
@@ -162,7 +196,11 @@ const OPS_BASELINE: u32 = 5_000;
 
 /// Estimate the total Soroban operations a settlement will consume based on
 /// the number of hops, participants, and token-conversion hops.
-pub fn estimate_operation_cost(hop_count: u32, participant_count: u32, token_conversion_hops: u32) -> u32 {
+pub fn estimate_operation_cost(
+    hop_count: u32,
+    participant_count: u32,
+    token_conversion_hops: u32,
+) -> u32 {
     let hops = hop_count.saturating_mul(OPS_PER_HOP);
     let conversions = token_conversion_hops.saturating_mul(OPS_PER_HOP); // conversions cost a full extra hop each
     let participants = participant_count.saturating_mul(1_000); // small per-participant overhead
@@ -175,7 +213,10 @@ pub fn estimate_operation_cost(hop_count: u32, participant_count: u32, token_con
 /// Pre-flight guard: returns Err(SettlementErrorBudget) if the estimated cost
 /// exceeds the available fee budget scaled by the safety margin. This must run
 /// BEFORE any token transfer so a depleted margin aborts cleanly.
-pub fn check_fee_budget(estimated_ops: u32, available_fee_stroops: i128) -> Result<(), SettlementBudgetError> {
+pub fn check_fee_budget(
+    estimated_ops: u32,
+    available_fee_stroops: i128,
+) -> Result<(), SettlementBudgetError> {
     // Convert ops -> stroops at ~0.01 XLM / 10k ops (1 XLM = 10_000_000 stroops).
     // cost_stroops = estimated_ops * (10_000_000 / 10_000) = estimated_ops * 1000
     let cost_stroops: i128 = (estimated_ops as i128).saturating_mul(1_000);
@@ -231,12 +272,19 @@ pub fn garbage_collect_expired_escrows(env: &Env, max_cycles: u32) -> u32 {
             break;
         }
 
-        if !env.storage().persistent().has(&DataKey::EscrowTtlDeadline(cycle)) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::EscrowTtlDeadline(cycle))
+        {
             continue;
         }
 
         let lock_expired = !env.storage().persistent().has(&DataKey::EscrowLock(cycle));
-        let release_expired = !env.storage().persistent().has(&DataKey::EscrowRelease(cycle));
+        let release_expired = !env
+            .storage()
+            .persistent()
+            .has(&DataKey::EscrowRelease(cycle));
 
         if lock_expired && release_expired {
             env.storage()
@@ -246,10 +294,7 @@ pub fn garbage_collect_expired_escrows(env: &Env, max_cycles: u32) -> u32 {
         }
     }
 
-    env.events().publish(
-        (symbol_short!("gc_escrow"),),
-        cleaned,
-    );
+    env.events().publish((symbol_short!("gc_escrow"),), cleaned);
 
     cleaned
 }

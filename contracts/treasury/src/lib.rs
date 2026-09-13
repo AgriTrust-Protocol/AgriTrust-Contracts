@@ -1,11 +1,16 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, Env};
+#![allow(deprecated)]
+#[cfg(test)]
+extern crate std;
 
-#[contract]
-pub struct Treasury;
+#[path = "../speed_bump.rs"]
+pub mod speed_bump;
 
-#[contractimpl]
-impl Treasury {
-    /// Terminal hop: value release.
-    pub fn initialize(_env: Env) {}
-}
+#[cfg(test)]
+#[path = "../speed_bump_test.rs"]
+mod speed_bump_test;
+
+pub use speed_bump::{
+    BatchReleaseResult, PendingRelease, ReleaseItem, SpeedBumpContract, SpeedBumpContractClient,
+    SpeedBumpError, SPEED_BUMP_DELAY, SPEED_BUMP_THRESHOLD,
+};
