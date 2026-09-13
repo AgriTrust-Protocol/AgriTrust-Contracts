@@ -43,7 +43,7 @@ jobs:
           - shard: core
             packages: agritrust_common state admin provenance
           - shard: protocols
-            packages: grant_stream vesting_contracts arbitration compliance
+            packages: grant_stream vesting_contracts arbitration compliance bidding
           - shard: identity-risk
             packages: zk_kyc treasury did_registry crop_insurance
     steps:
@@ -99,13 +99,13 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
       - name: Cache Cargo registry and build output
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm-release
       - name: Build optimized WASM contracts
-        run: cargo build --target wasm32-unknown-unknown --release --locked
+        run: cargo build --target wasm32v1-none --release --locked
 
   ci-summary:
     name: CI summary gate

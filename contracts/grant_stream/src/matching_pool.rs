@@ -119,14 +119,14 @@ pub enum MatchingError {
 
 fn read_pool(env: &Env, pool_id: u64) -> Result<MatchingPool, MatchingError> {
     env.storage()
-        .instance()
+        .persistent()
         .get(&StorageKey::MatchingPool(pool_id))
         .ok_or(MatchingError::PoolNotFound)
 }
 
 fn write_pool(env: &Env, pool: &MatchingPool) {
     env.storage()
-        .instance()
+        .persistent()
         .set(&StorageKey::MatchingPool(pool.pool_id), pool);
 }
 
@@ -191,7 +191,7 @@ fn check_sep12_verification(
     if pool.requires_sep12 {
         let verified: bool = env
             .storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::Sep12Identity(address.clone()))
             .unwrap_or(false);
 
@@ -258,15 +258,15 @@ impl MatchingPoolContract {
         };
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::MatchingRound(pool_id), &round);
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::PoolDonors(pool_id), &Vec::<Address>::new(&env));
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::PoolProjects(pool_id), &Vec::<u64>::new(&env));
 
         env.events().publish(
@@ -286,7 +286,7 @@ impl MatchingPoolContract {
         admin.require_auth();
         
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::Sep12Identity(donor.clone()), &true);
 
         env.events().publish(
@@ -351,7 +351,7 @@ impl MatchingPoolContract {
         // Check if this is a new donor BEFORE recording the donation
         let is_new_donor = !env
             .storage()
-            .instance()
+            .persistent()
             .has(&StorageKey::Donation(pool_id, project_id, donor.clone()));
 
         // Record donation with reputation-influenced amount for matching calculations
@@ -365,13 +365,13 @@ impl MatchingPoolContract {
         };
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::Donation(pool_id, project_id, donor.clone()), &donation);
 
         // Update project contributions
         let mut contributions: ProjectContribution = env
             .storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::ProjectContributions(pool_id, project_id))
             .unwrap_or(ProjectContribution {
                 pool_id,
@@ -395,13 +395,13 @@ impl MatchingPoolContract {
         }
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::ProjectContributions(pool_id, project_id), &contributions);
 
         // Track unique projects and donors
         let mut donors: Vec<Address> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::PoolDonors(pool_id))
             .unwrap_or_else(|| Vec::new(&env));
 
@@ -416,7 +416,7 @@ impl MatchingPoolContract {
         if !donor_exists {
             donors.push_back(donor.clone());
             env.storage()
-                .instance()
+                .persistent()
                 .set(&StorageKey::PoolDonors(pool_id), &donors);
         }
 
@@ -445,7 +445,7 @@ impl MatchingPoolContract {
 
         let mut round: MatchingRound = env
             .storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::MatchingRound(pool_id))
             .ok_or(MatchingError::PoolNotFound)?;
 
@@ -463,7 +463,7 @@ impl MatchingPoolContract {
 
             let mut contribs: ProjectContribution = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&StorageKey::ProjectContributions(pool_id, project_id))
                 .ok_or(MatchingError::ProjectNotFound)?;
 
@@ -487,7 +487,7 @@ impl MatchingPoolContract {
             contribs.sqrt_sum_of_sqrt_donations = project_sqrt_sum;
 
             env.storage()
-                .instance()
+                .persistent()
                 .set(&StorageKey::ProjectContributions(pool_id, project_id), &contribs);
         }
 
@@ -501,7 +501,7 @@ impl MatchingPoolContract {
 
             let mut contribs: ProjectContribution = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&StorageKey::ProjectContributions(pool_id, project_id))
                 .ok_or(MatchingError::ProjectNotFound)?;
 
@@ -531,11 +531,11 @@ impl MatchingPoolContract {
                 .ok_or(MatchingError::MathOverflow)?;
 
             env.storage()
-                .instance()
+                .persistent()
                 .set(&StorageKey::ProjectMatched(pool_id, project_id), &matched_amount);
 
             env.storage()
-                .instance()
+                .persistent()
                 .set(&StorageKey::ProjectContributions(pool_id, project_id), &contribs);
         }
 
@@ -557,7 +557,7 @@ impl MatchingPoolContract {
         round.project_count = projects.len() as u32;
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&StorageKey::MatchingRound(pool_id), &round);
 
         env.events().publish(
@@ -580,7 +580,7 @@ impl MatchingPoolContract {
 
         let matched_amount: i128 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::ProjectMatched(pool_id, project_id))
             .ok_or(MatchingError::ProjectNotFound)?;
 
@@ -613,7 +613,7 @@ impl MatchingPoolContract {
         project_id: u64,
     ) -> Result<i128, MatchingError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::ProjectMatched(pool_id, project_id))
             .ok_or(MatchingError::ProjectNotFound)
     }
@@ -625,7 +625,7 @@ impl MatchingPoolContract {
         project_id: u64,
     ) -> Result<ProjectContribution, MatchingError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::ProjectContributions(pool_id, project_id))
             .ok_or(MatchingError::ProjectNotFound)
     }
@@ -636,7 +636,7 @@ impl MatchingPoolContract {
         pool_id: u64,
     ) -> Result<MatchingRound, MatchingError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::MatchingRound(pool_id))
             .ok_or(MatchingError::PoolNotFound)
     }
@@ -655,7 +655,7 @@ impl MatchingPoolContract {
         address: Address,
     ) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .get(&StorageKey::Sep12Identity(address))
             .unwrap_or(false)
     }

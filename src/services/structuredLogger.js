@@ -103,7 +103,7 @@ function createLogEntry({ severityText, body, traceId, spanId, traceFlags, resou
   if (exception) {
     entry.attributes = {
       ...(entry.attributes || {}),
-      "exception.type": exception.type || typeof exception,
+      "exception.type": exception.type || exception.name || exception.constructor?.name || typeof exception,
       "exception.message": truncate(exception.message || String(exception), 2048),
       "exception.stacktrace": truncate(exception.stack || "", 8192),
       "exception.escaped": exception.escaped ?? false,
@@ -115,8 +115,8 @@ function createLogEntry({ severityText, body, traceId, spanId, traceFlags, resou
 
 class StructuredLogger {
   constructor(options = {}) {
-    this._writer = options.writer || ((entry) => process.stdout.write(JSON.stringify(entry) + "\n"));
-    this._errorWriter = options.errorWriter || ((entry) => process.stderr.write(JSON.stringify(entry) + "\n"));
+    this._writer = options.writer || ((entry) => process.stdout.write(entry + "\n"));
+    this._errorWriter = options.errorWriter || (options.writer ? options.writer : ((entry) => process.stderr.write(entry + "\n")));
     this._minLevel = options.level ? (LOG_LEVELS[options.level] || _minLevel) : _minLevel;
     this._ctx = { traceId: null, spanId: null, traceFlags: null, resource: null };
   }
@@ -125,14 +125,15 @@ class StructuredLogger {
     if (!shouldLog(severityText)) return;
     const entry = createLogEntry({ severityText, body, ...this._ctx, ...extra });
     const writer = severityText === "ERROR" || severityText === "FATAL" ? this._errorWriter : this._writer;
-    writer(entry);
+    writer(JSON.stringify(entry));
   }
 
   withContext(ctx) {
-    const child = new StructuredLogger({ level: Object.keys(LOG_LEVELS).find((k) => LOG_LEVELS[k] === this._minLevel) });
-    child._writer = this._writer;
-    child._errorWriter = this._errorWriter;
-    child._minLevel = this._minLevel;
+    const child = new StructuredLogger({
+      level: Object.keys(LOG_LEVELS).find((k) => LOG_LEVELS[k] === this._minLevel),
+      writer: this._writer,
+      errorWriter: this._errorWriter,
+    });
     child._ctx = { ...this._ctx, ...ctx };
     return child;
   }

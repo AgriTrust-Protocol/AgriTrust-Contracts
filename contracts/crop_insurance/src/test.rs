@@ -19,6 +19,7 @@ fn risk(env: &Env, farmer: &Address, coverage: i128, nonce: u64) -> RiskScore {
 #[test]
 fn deposit_100k_write_50_policies_and_drought_pays_claims() {
     let env = Env::default();
+    env.cost_estimate().budget().reset_unlimited();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
