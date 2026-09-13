@@ -8,6 +8,7 @@
     "dev": "nodemon src/index.js",
     "test": "jest --forceExit",
     "test:coverage": "jest --forceExit --coverage",
+    "ci:coverage": "jest --forceExit --coverage",
     "backup:verify": "node scripts/verify-database-backup.js",
     "setup:local": "node scripts/onboard.js"
   },
