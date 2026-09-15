@@ -7,6 +7,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 mod test;
 
 pub mod settlement;
+pub mod jury_dispute;
 
 pub const TTL_EXTENSION_PERIOD: u32 = 518_400; // 30 days in ledgers (~5s per ledger)
 pub const MAX_SETTLEMENT_WINDOW: u64 = 30 * 24 * 60 * 60; // 30 days in seconds

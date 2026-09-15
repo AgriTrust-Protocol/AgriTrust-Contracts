@@ -450,3 +450,118 @@ fn test_settle_dispute_low_fee_budget_aborts() {
     let real_token = token::Client::new(&env, &token_addr);
     assert_eq!(real_token.balance(&buyer), 100_000);
 }
+
+#[test]
+fn test_jury_dispute_panel_sizing() {
+    use crate::jury_dispute::jury_panel_size_for_level;
+
+    // Initial dispute (level 0) requires 11 jurors
+    assert_eq!(jury_panel_size_for_level(0), 11);
+    // First appeal (level 1) escalates to 21 jurors
+    assert_eq!(jury_panel_size_for_level(1), 21);
+    // Final appeal (level 2) escalates to 41 jurors
+    assert_eq!(jury_panel_size_for_level(2), 41);
+}
+
+#[test]
+fn test_jury_dispute_seven_four_ruling_and_rewards() {
+    use crate::jury_dispute::{
+        calculate_juror_payout, tally_jury_votes, JuryVoteChoice, JuryVoteRecord,
+        JURY_VOTE_STAKE, MAJORITY_REWARD, MINORITY_PENALTY,
+    };
+    use soroban_sdk::Vec;
+
+    let env = Env::default();
+    let mut votes: Vec<JuryVoteRecord> = Vec::new(&env);
+
+    // Simulate 7 jurors voting PlaintiffWin
+    for _ in 0..7 {
+        votes.push_back(JuryVoteRecord {
+            juror: Address::generate(&env),
+            choice: JuryVoteChoice::PlaintiffWin,
+            stake: JURY_VOTE_STAKE,
+        });
+    }
+
+    // Simulate 4 jurors voting DefendantWin
+    for _ in 0..4 {
+        votes.push_back(JuryVoteRecord {
+            juror: Address::generate(&env),
+            choice: JuryVoteChoice::DefendantWin,
+            stake: JURY_VOTE_STAKE,
+        });
+    }
+
+    // Tally votes
+    let (winner, majority_votes, minority_votes) = tally_jury_votes(&votes);
+    assert_eq!(winner, JuryVoteChoice::PlaintiffWin);
+    assert_eq!(majority_votes, 7);
+    assert_eq!(minority_votes, 4);
+
+    // Verify rewards for majority voter (+1 net gain)
+    let (majority_payout, majority_net) = calculate_juror_payout(JuryVoteChoice::PlaintiffWin, winner.clone());
+    assert_eq!(majority_payout, JURY_VOTE_STAKE + MAJORITY_REWARD); // 10 + 1 = 11
+    assert_eq!(majority_net, MAJORITY_REWARD); // +1
+
+    // Verify penalty for minority voter (-2 net loss)
+    let (minority_payout, minority_net) = calculate_juror_payout(JuryVoteChoice::DefendantWin, winner);
+    assert_eq!(minority_payout, JURY_VOTE_STAKE - MINORITY_PENALTY); // 10 - 2 = 8
+    assert_eq!(minority_net, -MINORITY_PENALTY); // -2
+}
+
+#[test]
+fn test_jury_selection_pool_uniqueness() {
+    use crate::jury_dispute::select_panel_from_pool;
+    use soroban_sdk::Vec;
+
+    let env = Env::default();
+    let mut pool: Vec<Address> = Vec::new(&env);
+
+    // 15 pool members
+    for _ in 0..15 {
+        pool.push_back(Address::generate(&env));
+    }
+
+    // Select panel of 11 jurors
+    let panel = select_panel_from_pool(&env, &pool, 11, 123456789);
+    assert_eq!(panel.len(), 11);
+
+    // Check all 11 jurors are unique
+    for i in 0..panel.len() {
+        for j in (i + 1)..panel.len() {
+            assert_ne!(panel.get(i).unwrap(), panel.get(j).unwrap(), "Duplicate juror selected");
+        }
+    }
+}
+
+#[test]
+fn test_jury_dispute_tie_outcome() {
+    use crate::jury_dispute::{
+        calculate_juror_payout, tally_jury_votes, JuryVoteChoice, JuryVoteRecord, JURY_VOTE_STAKE,
+    };
+    use soroban_sdk::Vec;
+
+    let env = Env::default();
+    let mut votes: Vec<JuryVoteRecord> = Vec::new(&env);
+
+    for _ in 0..5 {
+        votes.push_back(JuryVoteRecord {
+            juror: Address::generate(&env),
+            choice: JuryVoteChoice::PlaintiffWin,
+            stake: JURY_VOTE_STAKE,
+        });
+        votes.push_back(JuryVoteRecord {
+            juror: Address::generate(&env),
+            choice: JuryVoteChoice::DefendantWin,
+            stake: JURY_VOTE_STAKE,
+        });
+    }
+
+    let (winner, _, _) = tally_jury_votes(&votes);
+    assert_eq!(winner, JuryVoteChoice::None);
+
+    let (tie_payout, tie_net) = calculate_juror_payout(JuryVoteChoice::PlaintiffWin, winner);
+    assert_eq!(tie_payout, JURY_VOTE_STAKE);
+    assert_eq!(tie_net, 0);
+}
+
