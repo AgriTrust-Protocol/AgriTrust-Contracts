@@ -1,15 +1,20 @@
 #![no_std]
 
+pub mod chain;
 mod errors;
 mod resolver;
 mod types;
 mod verifier;
 
+pub use chain::{
+    compute_hop_hash, get_chain, submit_hop, verify_chain, BatchProvenanceChain, Hop,
+    ProvenanceLock, GENESIS_PREV_HASH, LOCK_TIMEOUT_LEDGERS, MAX_CHAIN_HOPS,
+};
 pub use errors::Error;
 pub use resolver::{get_provenance_result, resolve_provenance, write_hop_state};
 pub use types::{
     HopState, ProvenanceAccessSet, ProvenanceResult, Score, StorageBudget,
-    SCORE_PRECISION, STORAGE_BUDGET, STORAGE_WARN_THRESHOLD, MAX_HOPS,
+    MAX_HOPS, SCORE_PRECISION, STORAGE_BUDGET, STORAGE_WARN_THRESHOLD,
 };
 
 // Re-export verifier functions for external testing / integration.
@@ -46,6 +51,21 @@ impl ProvenanceContract {
     /// Retrieve a previously resolved ProvenanceResult by chain_id.
     pub fn get_result(env: Env, chain_id: BytesN<32>) -> Option<ProvenanceResult> {
         get_provenance_result(&env, &chain_id)
+    }
+
+    /// Atomically submit and append a provenance hop to a batch chain (Issue #160).
+    pub fn submit_hop(env: Env, batch_id: BytesN<32>, hop: Hop) -> Result<BytesN<32>, Error> {
+        chain::submit_hop(&env, &batch_id, &hop)
+    }
+
+    /// Retrieve the append-only multi-hop provenance chain for a batch (Issue #160).
+    pub fn get_chain(env: Env, batch_id: BytesN<32>) -> Option<BatchProvenanceChain> {
+        chain::get_chain(&env, &batch_id)
+    }
+
+    /// Verify cryptographic integrity and unbroken sequence of a batch chain (Issue #160).
+    pub fn verify_chain(env: Env, batch_id: BytesN<32>) -> Result<bool, Error> {
+        chain::verify_chain(&env, &batch_id)
     }
 }
 

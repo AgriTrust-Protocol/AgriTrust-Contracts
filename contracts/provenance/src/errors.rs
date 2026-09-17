@@ -29,4 +29,16 @@ pub enum Error {
     /// Emitted when STORAGE_WARN_THRESHOLD is crossed (non-fatal; used in
     /// events, not as a return error).
     StorageAccessWarning = 8,
+
+    /// Hop sequence number does not match expected append position.
+    SequenceMismatch = 9,
+
+    /// Provenance batch is locked by another concurrent transaction.
+    BatchLocked = 10,
+
+    /// Merkle hash link or prev_hash is invalid, breaking the cryptographic chain.
+    ChainBroken = 11,
+
+    /// Total hops for batch chain exceed maximum stage limit (32).
+    MaxChainHopsExceeded = 12,
 }

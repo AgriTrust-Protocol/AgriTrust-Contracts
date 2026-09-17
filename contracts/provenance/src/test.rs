@@ -1,4 +1,5 @@
 extern crate std;
+use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, BytesN, Env};
 use crate::{
     errors::Error,
@@ -220,5 +221,180 @@ fn test_storage_budget_exceeded_error() {
         let err = resolve_provenance(&env, cid, too_many_hops)
             .expect_err("oversized chain must fail");
         assert_eq!(err, Error::ChainTooLong);
+    });
+}
+
+#[test]
+fn test_atomic_provenance_chain_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    with_contract(&env, |env| {
+        let batch_id = chain_id(&env, 42);
+        let farm_signer = soroban_sdk::Address::generate(&env);
+        let proc_signer = soroban_sdk::Address::generate(&env);
+
+        let meta1 = chain_id(&env, 101);
+        let prev0 = soroban_sdk::BytesN::from_array(&env, &crate::chain::GENESIS_PREV_HASH);
+        let hop1_hash = crate::chain::compute_hop_hash(&env, &prev0, &meta1);
+
+        let hop1 = crate::chain::Hop {
+            sequence: 0,
+            stage: soroban_sdk::symbol_short!("farm"),
+            signer: farm_signer.clone(),
+            prev_hash: prev0,
+            metadata_hash: meta1,
+            hop_hash: hop1_hash.clone(),
+            signature: soroban_sdk::BytesN::from_array(&env, &[1u8; 64]),
+            ledger: env.ledger().sequence(),
+            timestamp: env.ledger().timestamp(),
+        };
+
+        let tip1 = crate::chain::submit_hop(&env, &batch_id, &hop1).expect("farm hop should succeed");
+        assert_eq!(tip1, hop1_hash);
+
+        let meta2 = chain_id(&env, 102);
+        let hop2_hash = crate::chain::compute_hop_hash(&env, &hop1_hash, &meta2);
+        let hop2 = crate::chain::Hop {
+            sequence: 1,
+            stage: soroban_sdk::symbol_short!("process"),
+            signer: proc_signer.clone(),
+            prev_hash: hop1_hash,
+            metadata_hash: meta2,
+            hop_hash: hop2_hash.clone(),
+            signature: soroban_sdk::BytesN::from_array(&env, &[2u8; 64]),
+            ledger: env.ledger().sequence(),
+            timestamp: env.ledger().timestamp(),
+        };
+
+        let tip2 = crate::chain::submit_hop(&env, &batch_id, &hop2).expect("processor hop should succeed");
+        assert_eq!(tip2, hop2_hash);
+
+        let chain = crate::chain::get_chain(&env, &batch_id).expect("chain should exist");
+        assert_eq!(chain.hops.len(), 2);
+        assert_eq!(chain.tip_hash, hop2_hash);
+
+        let verified = crate::chain::verify_chain(&env, &batch_id).expect("verify should pass");
+        assert!(verified);
+    });
+}
+
+#[test]
+fn test_sequence_guard_rejects_out_of_order() {
+    let env = Env::default();
+    env.mock_all_auths();
+    with_contract(&env, |env| {
+        let batch_id = chain_id(&env, 43);
+        let signer = soroban_sdk::Address::generate(&env);
+        let meta = chain_id(&env, 1);
+        let prev0 = soroban_sdk::BytesN::from_array(&env, &crate::chain::GENESIS_PREV_HASH);
+        let hop_hash = crate::chain::compute_hop_hash(&env, &prev0, &meta);
+
+        let hop_wrong_seq = crate::chain::Hop {
+            sequence: 1, // expected 0
+            stage: soroban_sdk::symbol_short!("farm"),
+            signer,
+            prev_hash: prev0,
+            metadata_hash: meta,
+            hop_hash,
+            signature: soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
+            ledger: 1,
+            timestamp: 100,
+        };
+
+        let err = crate::chain::submit_hop(&env, &batch_id, &hop_wrong_seq).expect_err("out of order must fail");
+        assert_eq!(err, Error::SequenceMismatch);
+    });
+}
+
+#[test]
+fn test_broken_chain_hash_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    with_contract(&env, |env| {
+        let batch_id = chain_id(&env, 44);
+        let signer = soroban_sdk::Address::generate(&env);
+        let meta = chain_id(&env, 1);
+        let prev0 = soroban_sdk::BytesN::from_array(&env, &crate::chain::GENESIS_PREV_HASH);
+        let corrupted_hash = chain_id(&env, 99);
+
+        let hop_bad_hash = crate::chain::Hop {
+            sequence: 0,
+            stage: soroban_sdk::symbol_short!("farm"),
+            signer,
+            prev_hash: prev0,
+            metadata_hash: meta,
+            hop_hash: corrupted_hash,
+            signature: soroban_sdk::BytesN::from_array(&env, &[0u8; 64]),
+            ledger: 1,
+            timestamp: 100,
+        };
+
+        let err = crate::chain::submit_hop(&env, &batch_id, &hop_bad_hash).expect_err("corrupted hash must fail");
+        assert_eq!(err, Error::ChainBroken);
+    });
+}
+
+#[test]
+fn test_lock_prevents_concurrent_write_and_recovers_on_timeout() {
+    let env = Env::default();
+    env.mock_all_auths();
+    with_contract(&env, |env| {
+        let batch_id = chain_id(&env, 45);
+        let signer1 = soroban_sdk::Address::generate(&env);
+        let signer2 = soroban_sdk::Address::generate(&env);
+
+        crate::chain::acquire_lock(&env, &batch_id, &signer1).expect("lock 1 should acquire");
+
+        // Concurrent acquisition by signer2 fails
+        let err = crate::chain::acquire_lock(&env, &batch_id, &signer2).expect_err("lock 2 should fail");
+        assert_eq!(err, Error::BatchLocked);
+
+        // Signer 1 can re-acquire (idempotent for holder)
+        crate::chain::acquire_lock(&env, &batch_id, &signer1).expect("same signer can re-acquire");
+
+        // Release lock
+        crate::chain::release_lock(&env, &batch_id);
+
+        // Signer 2 can now acquire
+        crate::chain::acquire_lock(&env, &batch_id, &signer2).expect("lock 2 should succeed after release");
+    });
+}
+
+#[test]
+fn test_concurrent_chain_construction_10_hops() {
+    let env = Env::default();
+    env.mock_all_auths();
+    with_contract(&env, |env| {
+        let batch_id = chain_id(&env, 50);
+        let mut prev_hash = soroban_sdk::BytesN::from_array(&env, &crate::chain::GENESIS_PREV_HASH);
+
+        for i in 0..10u32 {
+            let signer = soroban_sdk::Address::generate(&env);
+            let meta = chain_id(&env, (i + 1) as u8);
+            let hop_hash = crate::chain::compute_hop_hash(&env, &prev_hash, &meta);
+
+            let hop = crate::chain::Hop {
+                sequence: i,
+                stage: soroban_sdk::symbol_short!("step"),
+                signer,
+                prev_hash: prev_hash.clone(),
+                metadata_hash: meta,
+                hop_hash: hop_hash.clone(),
+                signature: soroban_sdk::BytesN::from_array(&env, &[i as u8; 64]),
+                ledger: env.ledger().sequence(),
+                timestamp: env.ledger().timestamp(),
+            };
+
+            let tip = crate::chain::submit_hop(&env, &batch_id, &hop).expect("hop should append");
+            assert_eq!(tip, hop_hash);
+            prev_hash = hop_hash;
+        }
+
+        let chain = crate::chain::get_chain(&env, &batch_id).expect("chain must exist");
+        assert_eq!(chain.hops.len(), 10);
+        assert_eq!(chain.tip_hash, prev_hash);
+
+        let is_valid = crate::chain::verify_chain(&env, &batch_id).expect("full chain must verify");
+        assert!(is_valid);
     });
 }
