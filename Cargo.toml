@@ -1,0 +1,23 @@
+[package]
+name = "agritrust-contracts"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "AgriTrust Protocol Soroban contracts: farmer data sovereignty, asset twins, ODRL policy enforcement"
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "22"
+
+[dev-dependencies]
+soroban-sdk = { version = "22", features = ["testutils"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
